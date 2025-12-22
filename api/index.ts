@@ -1,4 +1,4 @@
-import express from "express";
+import express, { Request, Response } from "express";
 import cors from "cors";
 import { threeDRouter } from "../src/routes/threeD.js";
 import { logger } from "../src/logger.js";
@@ -54,5 +54,7 @@ app.use((_req, res) => {
 });
 
 // Vercel serverless function handler
+
+// For Vercel with @vercel/node, exporting the Express app directly works
 export default app;
 
