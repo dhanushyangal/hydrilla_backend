@@ -444,17 +444,50 @@ threeDRouter.post("/webhook/job-update", async (req, res) => {
 });
 
 // Proxy endpoint to fetch GLB files (bypasses CORS)
+// Accepts either jobId (preferred - fetches fresh URL from API) or url (direct URL)
 threeDRouter.get("/glb-proxy", async (req, res) => {
   try {
-    const url = req.query.url as string;
-    if (!url) {
-      return res.status(400).json({ error: "URL parameter is required" });
+    const jobId = req.query.jobId as string;
+    const urlParam = req.query.url as string;
+    
+    let glbUrl: string;
+
+    // If jobId is provided, fetch fresh URL from Hunyuan3D API
+    if (jobId) {
+      try {
+        logger.info({ jobId }, "Fetching fresh GLB URL from API for job");
+        const apiResponse = await makeApiRequest(`${API_BASE}/status/${jobId}`);
+        
+        if (!apiResponse.ok) {
+          logger.error({ jobId, status: apiResponse.status }, "Failed to fetch job status from API");
+          return res.status(apiResponse.status).json({ error: "Failed to fetch job status from API" });
+        }
+
+        const apiJob = await apiResponse.json();
+        
+        // Get GLB URL from API response (fresh presigned URL)
+        glbUrl = apiJob.result?.mesh_url || apiJob.result?.output;
+        
+        if (!glbUrl) {
+          logger.warn({ jobId }, "No GLB URL found in API response");
+          return res.status(404).json({ error: "GLB URL not found for this job" });
+        }
+
+        logger.info({ jobId, glbUrl: glbUrl.substring(0, 100) + "..." }, "Got fresh GLB URL from API");
+      } catch (apiErr: any) {
+        logger.error({ err: apiErr, jobId }, "Failed to fetch from Hunyuan3D API");
+        return res.status(500).json({ error: "Failed to fetch job status from API" });
+      }
+    } else if (urlParam) {
+      // Use provided URL (fallback for direct URLs)
+      glbUrl = urlParam;
+    } else {
+      return res.status(400).json({ error: "Either jobId or url parameter is required" });
     }
 
-    // Validate URL (allow S3 URLs and other valid URLs)
+    // Validate URL
     try {
-      const urlObj = new URL(url);
-      // Allow S3 URLs, Tencent CDN, or any HTTPS URL
+      const urlObj = new URL(glbUrl);
       if (!["https:", "http:"].includes(urlObj.protocol)) {
         return res.status(400).json({ error: "Invalid URL protocol" });
       }
@@ -467,7 +500,7 @@ threeDRouter.get("/glb-proxy", async (req, res) => {
     const timeoutId = setTimeout(() => controller.abort(), 60000); // 60 seconds
     
     try {
-      const response = await fetch(url, {
+      const response = await fetch(glbUrl, {
         headers: {
           "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
           "Accept": "*/*",
@@ -478,7 +511,7 @@ threeDRouter.get("/glb-proxy", async (req, res) => {
       clearTimeout(timeoutId);
 
       if (!response.ok) {
-        logger.error({ url, status: response.status, statusText: response.statusText }, "Failed to fetch GLB from URL");
+        logger.error({ glbUrl: glbUrl.substring(0, 100) + "...", status: response.status, statusText: response.statusText }, "Failed to fetch GLB from URL");
         return res.status(response.status).json({ error: `Failed to fetch GLB: ${response.statusText}` });
       }
 
@@ -488,7 +521,7 @@ threeDRouter.get("/glb-proxy", async (req, res) => {
       res.setHeader("Access-Control-Allow-Origin", "*");
       res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
       res.setHeader("Access-Control-Allow-Headers", "Content-Type");
-      res.setHeader("Cache-Control", "public, max-age=3600");
+      res.setHeader("Cache-Control", "no-cache"); // Don't cache since URLs expire
 
       // Stream the file
       const buffer = await response.arrayBuffer();
@@ -496,13 +529,13 @@ threeDRouter.get("/glb-proxy", async (req, res) => {
     } catch (fetchErr: any) {
       clearTimeout(timeoutId);
       if (fetchErr.name === "AbortError") {
-        logger.error({ url }, "GLB fetch timeout");
+        logger.error({ glbUrl: glbUrl.substring(0, 100) + "..." }, "GLB fetch timeout");
         return res.status(504).json({ error: "Request timeout - file too large or network issue" });
       }
       throw fetchErr;
     }
   } catch (err: any) {
-    logger.error({ err, url: req.query.url }, "failed to proxy GLB");
+    logger.error({ err, jobId: req.query.jobId, url: req.query.url }, "failed to proxy GLB");
     if (err.name === "AbortError" || err.name === "TimeoutError") {
       return res.status(504).json({ error: "Request timeout - file too large or network issue" });
     }

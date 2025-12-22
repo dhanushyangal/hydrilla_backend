@@ -17,7 +17,13 @@ async function ensureDb() {
 const app = express();
 
 // Middleware
-app.use(cors());
+// Configure CORS to allow all origins (for development and production)
+app.use(cors({
+  origin: '*',
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+  credentials: false
+}));
 app.use(express.json({ limit: "10mb" }));
 app.use(express.urlencoded({ extended: true, limit: "10mb" }));
 app.use(pinoHttp({ logger }));
