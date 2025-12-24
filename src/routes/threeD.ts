@@ -137,39 +137,73 @@ function convertFromApiStatus(apiStatus: string): "pending" | "processing" | "co
 
 threeDRouter.post("/generate", async (req, res) => {
   try {
-    const body = req.body as { prompt?: string; imageUrl?: string; imageBase64?: string };
+    const body = req.body as { prompt?: string; imageUrl?: string; imageBase64?: string; imageOnly?: boolean };
 
     let jobId: string;
-    let mode: "text-to-3d" | "image-to-3d";
+    let mode: "text-to-3d" | "image-to-3d" | "text-to-image";
 
     // Determine mode and submit to API
     if (body.prompt) {
-      // Text-to-3D - use URLSearchParams for form data
-      const formData = new URLSearchParams();
-      formData.append("prompt", body.prompt);
+      // Check if this is image-only generation (for preview)
+      if (body.imageOnly) {
+        // Text-to-Image only - use URLSearchParams for form data
+        const formData = new URLSearchParams();
+        formData.append("prompt", body.prompt);
 
-      const response = await makeApiRequest(`${API_BASE}/text-to-3d`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/x-www-form-urlencoded",
-        },
-        body: formData.toString(),
-      });
+        const response = await makeApiRequest(`${API_BASE}/text-to-image`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/x-www-form-urlencoded",
+          },
+          body: formData.toString(),
+        });
 
-      if (!response.ok) {
-        let errorText: string;
-        try {
-          const errorData = await response.json();
-          errorText = errorData.error || "Failed to submit text-to-3d job";
-        } catch {
-          errorText = await response.text() || "Failed to submit text-to-3d job";
+        if (!response.ok) {
+          let errorText: string;
+          try {
+            const errorData = await response.json();
+            errorText = errorData.error || "Failed to generate image";
+          } catch {
+            errorText = await response.text() || "Failed to generate image";
+          }
+          throw new Error(errorText);
         }
-        throw new Error(errorText);
-      }
 
-      const data = await response.json();
-      jobId = data.job_id;
-      mode = "text-to-3d";
+        const data = await response.json();
+        jobId = data.job_id;
+        mode = "text-to-image";
+      } else {
+        // Text-to-3D - use URLSearchParams for form data
+        const formData = new URLSearchParams();
+        formData.append("prompt", body.prompt);
+        // If imageUrl is provided, use it (for 3D generation from pre-generated image)
+        if (body.imageUrl) {
+          formData.append("image_url", body.imageUrl);
+        }
+
+        const response = await makeApiRequest(`${API_BASE}/text-to-3d`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/x-www-form-urlencoded",
+          },
+          body: formData.toString(),
+        });
+
+        if (!response.ok) {
+          let errorText: string;
+          try {
+            const errorData = await response.json();
+            errorText = errorData.error || "Failed to submit text-to-3d job";
+          } catch {
+            errorText = await response.text() || "Failed to submit text-to-3d job";
+          }
+          throw new Error(errorText);
+        }
+
+        const data = await response.json();
+        jobId = data.job_id;
+        mode = "text-to-3d";
+      }
     } else if (body.imageUrl || body.imageBase64) {
       // Image-to-3D - use URLSearchParams for form data
       const formData = new URLSearchParams();
