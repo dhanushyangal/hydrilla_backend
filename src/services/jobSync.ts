@@ -2,6 +2,7 @@ import { config } from "../config.js";
 import { logger } from "../logger.js";
 import { getJob, listJobs, updateJobStatus, updateJobResult } from "../repository/jobs.js";
 import { JobStatus } from "../types.js";
+import { normalizeGlbUrl, normalizePreviewUrl } from "../utils/s3Urls.js";
 
 const API_BASE = config.hunyuanApi.url;
 
@@ -61,18 +62,22 @@ export async function syncJobFromApi(jobId: string): Promise<boolean> {
 
     // Update result if completed
     if (apiJob.status === "completed" && apiJob.result) {
-      const glbUrl = apiJob.result.mesh_url || apiJob.result.output;
-      const previewUrl =
+      const apiGlbUrl = apiJob.result.mesh_url || apiJob.result.output;
+      const apiPreviewUrl =
         apiJob.result.processed_image_url ||
         apiJob.result.generated_image_url ||
         apiJob.result.processed_image ||
         apiJob.result.generated_image;
 
+      // Use direct S3 URLs (public bucket, no expiration)
+      const glbUrl = normalizeGlbUrl(jobId, apiGlbUrl);
+      const previewUrl = normalizePreviewUrl(jobId, apiPreviewUrl);
+
       // Only update if URLs are different
       if (dbJob.resultGlbUrl !== glbUrl || dbJob.previewImageUrl !== previewUrl) {
         await updateJobResult(jobId, {
-          resultGlbUrl: glbUrl || null,
-          previewImageUrl: previewUrl || null,
+          resultGlbUrl: glbUrl,
+          previewImageUrl: previewUrl,
         });
         logger.info({ jobId, glbUrl, previewUrl }, "Job result updated");
       }

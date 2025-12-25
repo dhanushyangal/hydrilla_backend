@@ -8,6 +8,7 @@ import { config } from "../config.js";
 import { supabase } from "../db.js";
 import { createJob, getJob, listJobs, listJobsForUser, updateJobResult, updateJobStatus, deleteJob, getJobForUser } from "../repository/jobs.js";
 import { optionalAuth, requireAuth, syncUserToDatabase } from "../middleware/auth.js";
+import { normalizeGlbUrl, normalizePreviewUrl } from "../utils/s3Urls.js";
 
 export const threeDRouter = Router();
 
@@ -275,14 +276,19 @@ threeDRouter.get("/status/:jobId", optionalAuth, async (req, res) => {
     await updateJobStatus(jobId, { status });
 
     if (apiJob.status === "completed" && apiJob.result) {
-      const glbUrl = apiJob.result.mesh_url || apiJob.result.output;
-      const previewUrl = apiJob.result.processed_image_url || apiJob.result.generated_image_url || apiJob.result.processed_image || apiJob.result.generated_image;
+      const apiGlbUrl = apiJob.result.mesh_url || apiJob.result.output;
+      const apiPreviewUrl = apiJob.result.processed_image_url || apiJob.result.generated_image_url || apiJob.result.processed_image || apiJob.result.generated_image;
+      
+      // Use direct S3 URLs (public bucket, no expiration)
+      const glbUrl = normalizeGlbUrl(jobId, apiGlbUrl);
+      const previewUrl = normalizePreviewUrl(jobId, apiPreviewUrl);
+      
       await updateJobResult(jobId, {
-        resultGlbUrl: glbUrl || null,
-        previewImageUrl: previewUrl || null,
+        resultGlbUrl: glbUrl,
+        previewImageUrl: previewUrl,
       });
-      job.resultGlbUrl = glbUrl || null;
-      job.previewImageUrl = previewUrl || null;
+      job.resultGlbUrl = glbUrl;
+      job.previewImageUrl = previewUrl;
     }
 
     if (apiJob.status === "failed" || apiJob.status === "cancelled") {
@@ -324,15 +330,20 @@ threeDRouter.get("/result/:jobId", optionalAuth, async (req, res) => {
       if (response.ok) {
         const apiJob = await response.json();
         if (apiJob.status === "completed" && apiJob.result) {
-          const glbUrl = apiJob.result.mesh_url || apiJob.result.output;
-          const previewUrl = apiJob.result.processed_image_url || apiJob.result.generated_image_url || apiJob.result.processed_image || apiJob.result.generated_image;
+          const apiGlbUrl = apiJob.result.mesh_url || apiJob.result.output;
+          const apiPreviewUrl = apiJob.result.processed_image_url || apiJob.result.generated_image_url || apiJob.result.processed_image || apiJob.result.generated_image;
+          
+          // Use direct S3 URLs (public bucket, no expiration)
+          const glbUrl = normalizeGlbUrl(jobId, apiGlbUrl);
+          const previewUrl = normalizePreviewUrl(jobId, apiPreviewUrl);
+          
           if (glbUrl || previewUrl) {
             await updateJobResult(jobId, {
-              resultGlbUrl: glbUrl || null,
-              previewImageUrl: previewUrl || null,
+              resultGlbUrl: glbUrl,
+              previewImageUrl: previewUrl,
             });
-            job.resultGlbUrl = glbUrl || null;
-            job.previewImageUrl = previewUrl || null;
+            job.resultGlbUrl = glbUrl;
+            job.previewImageUrl = previewUrl;
           }
         }
       }
@@ -358,6 +369,17 @@ threeDRouter.get("/history", optionalAuth, async (req, res) => {
     if (userId) {
       try {
         const jobs = await listJobsForUser(userId, 100);
+        
+        // Log first job for debugging
+        if (jobs && jobs.length > 0) {
+          logger.info({ 
+            jobId: jobs[0].id, 
+            glbUrl: jobs[0].resultGlbUrl, 
+            previewUrl: jobs[0].previewImageUrl,
+            status: jobs[0].status
+          }, "Sample job from history");
+        }
+        
         res.json({ jobs: jobs || [] });
       } catch (dbErr: any) {
         logger.error({ err: dbErr, userId }, "Database error fetching jobs");
@@ -506,11 +528,16 @@ threeDRouter.post("/webhook/job-update", async (req, res) => {
     });
 
     if (status === "completed" && result) {
-      const glbUrl = result.mesh_url || result.output;
-      const previewUrl = result.processed_image_url || result.generated_image_url || result.processed_image || result.generated_image;
+      const apiGlbUrl = result.mesh_url || result.output;
+      const apiPreviewUrl = result.processed_image_url || result.generated_image_url || result.processed_image || result.generated_image;
+      
+      // Use direct S3 URLs (public bucket, no expiration)
+      const glbUrl = normalizeGlbUrl(job_id, apiGlbUrl);
+      const previewUrl = normalizePreviewUrl(job_id, apiPreviewUrl);
+      
       await updateJobResult(job_id, {
-        resultGlbUrl: glbUrl || null,
-        previewImageUrl: previewUrl || null,
+        resultGlbUrl: glbUrl,
+        previewImageUrl: previewUrl,
       });
     }
 
@@ -519,73 +546,6 @@ threeDRouter.post("/webhook/job-update", async (req, res) => {
     logger.error(err, "webhook job update failed");
     res.status(500).json({ error: err.message || "Failed to update job" });
   }
-});
-
-// ============================================
-// GLB Proxy (no auth - for public access)
-// ============================================
-threeDRouter.get("/glb-proxy", async (req, res) => {
-  try {
-    const url = req.query.url as string;
-    if (!url) {
-      return res.status(400).json({ error: "URL parameter is required" });
-    }
-
-    try {
-      const urlObj = new URL(url);
-      if (!["https:", "http:"].includes(urlObj.protocol)) {
-        return res.status(400).json({ error: "Invalid URL protocol" });
-      }
-    } catch {
-      return res.status(400).json({ error: "Invalid URL format" });
-    }
-
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 60000);
-
-    try {
-      const response = await fetch(url, {
-        headers: {
-          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-          "Accept": "*/*",
-        },
-        signal: controller.signal,
-      });
-
-      clearTimeout(timeoutId);
-
-      if (!response.ok) {
-        logger.error({ url, status: response.status }, "Failed to fetch GLB");
-        return res.status(response.status).json({ error: `Failed to fetch GLB: ${response.statusText}` });
-      }
-
-      res.setHeader("Content-Type", "model/gltf-binary");
-      res.setHeader("Content-Disposition", `attachment; filename="model.glb"`);
-      res.setHeader("Access-Control-Allow-Origin", "*");
-      res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
-      res.setHeader("Access-Control-Allow-Headers", "Content-Type");
-      res.setHeader("Cache-Control", "public, max-age=3600");
-
-      const buffer = await response.arrayBuffer();
-      res.send(Buffer.from(buffer));
-    } catch (fetchErr: any) {
-      clearTimeout(timeoutId);
-      if (fetchErr.name === "AbortError") {
-        return res.status(504).json({ error: "Request timeout" });
-      }
-      throw fetchErr;
-    }
-  } catch (err: any) {
-    logger.error({ err, url: req.query.url }, "failed to proxy GLB");
-    res.status(500).json({ error: err.message || "Failed to proxy GLB file" });
-  }
-});
-
-threeDRouter.options("/glb-proxy", (_req, res) => {
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
-  res.sendStatus(200);
 });
 
 // ============================================
