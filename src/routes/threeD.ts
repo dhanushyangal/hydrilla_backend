@@ -11,6 +11,22 @@ import { optionalAuth, requireAuth, syncUserToDatabase } from "../middleware/aut
 
 export const threeDRouter = Router();
 
+// Global CORS middleware for all routes in this router
+threeDRouter.use((req, res, next) => {
+  // Set CORS headers for all requests
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  
+  // Handle preflight requests
+  if (req.method === "OPTIONS") {
+    res.sendStatus(200);
+    return;
+  }
+  
+  next();
+});
+
 // Configure multer for file uploads
 // In Vercel/serverless, use /tmp which is writable, otherwise use local uploads directory
 // Detect Vercel/serverless environment more reliably
@@ -331,23 +347,10 @@ threeDRouter.get("/result/:jobId", optionalAuth, async (req, res) => {
 });
 
 // ============================================
-// Get User's Job History (requires auth)
+// Get User's Job History (optional auth - returns empty if not authenticated)
 // ============================================
-// Handle OPTIONS preflight for CORS
-threeDRouter.options("/history", (_req, res) => {
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
-  res.sendStatus(200);
-});
-
 threeDRouter.get("/history", optionalAuth, async (req, res) => {
   try {
-    // Set CORS headers explicitly
-    res.setHeader("Access-Control-Allow-Origin", "*");
-    res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
-    res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
-    
     const userId = req.userId;
     
     // If authenticated, return only user's jobs
@@ -359,6 +362,7 @@ threeDRouter.get("/history", optionalAuth, async (req, res) => {
       } catch (dbErr: any) {
         logger.error({ err: dbErr, userId }, "Database error fetching jobs");
         // Return empty array instead of error to prevent frontend crash
+        // This allows the frontend to load even if database has issues
         res.json({ jobs: [] });
       }
     } else {
@@ -367,8 +371,6 @@ threeDRouter.get("/history", optionalAuth, async (req, res) => {
     }
   } catch (err: any) {
     logger.error({ err, userId: req.userId }, "Failed to fetch history");
-    // Set CORS headers even on error
-    res.setHeader("Access-Control-Allow-Origin", "*");
     res.status(500).json({ error: err.message || "Failed to fetch history" });
   }
 });
@@ -678,10 +680,16 @@ threeDRouter.post("/sync-user", requireAuth, async (req, res) => {
         }
       });
     } else {
-      res.status(500).json({ error: "Failed to sync user" });
+      logger.warn({ userId }, "User sync returned null - user may not exist in Clerk or database error");
+      // Still return success but with a warning
+      res.json({ 
+        success: false, 
+        message: "User sync failed - check logs",
+        userId 
+      });
     }
   } catch (err: any) {
-    logger.error(err, "failed to sync user");
+    logger.error({ err, userId: req.userId }, "failed to sync user");
     res.status(500).json({ error: err.message || "Failed to sync user" });
   }
 });
@@ -705,7 +713,8 @@ threeDRouter.get("/me", requireAuth, async (req, res) => {
     
     if (error) {
       logger.error({ err: error, userId }, "Failed to fetch user from database");
-      return res.status(500).json({ error: "Failed to fetch user" });
+      res.status(500).json({ error: "Failed to fetch user" });
+      return;
     }
     
     if (!user) {

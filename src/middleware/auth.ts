@@ -64,12 +64,19 @@ export async function requireAuth(req: Request, res: Response, next: NextFunctio
     const authHeader = req.headers.authorization;
     
     if (!authHeader || !authHeader.startsWith("Bearer ")) {
+      // Set CORS headers before sending error
+      res.setHeader("Access-Control-Allow-Origin", "*");
+      res.setHeader("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
+      res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
       return res.status(401).json({ error: "Authentication required" });
     }
 
     const token = authHeader.substring(7);
     
     if (!token || token === "undefined" || token === "null") {
+      res.setHeader("Access-Control-Allow-Origin", "*");
+      res.setHeader("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
+      res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
       return res.status(401).json({ error: "Invalid authentication token" });
     }
 
@@ -77,6 +84,9 @@ export async function requireAuth(req: Request, res: Response, next: NextFunctio
     const payload = await clerk.verifyToken(token);
     
     if (!payload || !payload.sub) {
+      res.setHeader("Access-Control-Allow-Origin", "*");
+      res.setHeader("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
+      res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
       return res.status(401).json({ error: "Invalid authentication token" });
     }
 
@@ -86,6 +96,10 @@ export async function requireAuth(req: Request, res: Response, next: NextFunctio
     next();
   } catch (err: any) {
     logger.error({ err: err.message }, "Authentication failed");
+    // Set CORS headers before sending error
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.setHeader("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
     return res.status(401).json({ error: "Authentication failed" });
   }
 }
