@@ -1,6 +1,7 @@
 import express from "express";
 import cors from "cors";
 import path from "path";
+import fs from "fs";
 import { threeDRouter } from "./routes/threeD.js";
 import { logger } from "./logger.js";
 import { config } from "./config.js";
@@ -15,9 +16,15 @@ async function main() {
   app.use(express.json({ limit: "10mb" }));
   app.use(pinoHttp({ logger }));
 
-  // Serve uploaded images statically
-  const uploadsDir = path.join(process.cwd(), "uploads");
-  app.use("/uploads", express.static(uploadsDir));
+  // Serve uploaded images statically (only if not in Vercel/serverless)
+  // In Vercel, files should be served from S3, not local filesystem
+  const isVercel = process.env.VERCEL === "1" || process.env.VERCEL_ENV;
+  if (!isVercel) {
+    const uploadsDir = path.join(process.cwd(), "uploads");
+    if (fs.existsSync(uploadsDir)) {
+      app.use("/uploads", express.static(uploadsDir));
+    }
+  }
 
   app.get("/api/health", (_req, res) => {
     res.json({ ok: true });

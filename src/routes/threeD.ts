@@ -12,21 +12,57 @@ import { optionalAuth, requireAuth, syncUserToDatabase } from "../middleware/aut
 export const threeDRouter = Router();
 
 // Configure multer for file uploads
-const uploadsDir = path.join(process.cwd(), "uploads");
-if (!fs.existsSync(uploadsDir)) {
-  fs.mkdirSync(uploadsDir, { recursive: true });
+// In Vercel/serverless, use /tmp which is writable, otherwise use local uploads directory
+// Detect Vercel/serverless environment more reliably
+const isVercel = process.env.VERCEL === "1" || 
+                 process.env.VERCEL_ENV || 
+                 process.cwd().startsWith("/var/task") ||
+                 process.cwd().startsWith("/var/runtime");
+
+// In Vercel/serverless, always use memory storage since files should go to S3
+// Only use disk storage in non-serverless environments where we can write to filesystem
+const canUseDiskStorage = !isVercel;
+
+// Set uploadsDir for reference, but we won't use it in Vercel
+const uploadsDir = isVercel ? "/tmp/uploads" : path.join(process.cwd(), "uploads");
+
+// Helper function to safely create directory (only called if not in Vercel)
+function ensureUploadsDir(): boolean {
+  if (isVercel) {
+    return false; // Never use disk storage in Vercel
+  }
+  try {
+    if (!fs.existsSync(uploadsDir)) {
+      fs.mkdirSync(uploadsDir, { recursive: true });
+    }
+    return true;
+  } catch (err: any) {
+    logger.warn({ err: err.message, uploadsDir }, "Failed to create uploads directory");
+    return false;
+  }
 }
 
-const storage = multer.diskStorage({
-  destination: (_req: any, _file: any, cb: any) => {
-    cb(null, uploadsDir);
-  },
-  filename: (_req: any, file: any, cb: any) => {
-    const uniqueSuffix = Date.now() + "-" + Math.round(Math.random() * 1e9);
-    const ext = path.extname(file.originalname);
-    cb(null, `image-${uniqueSuffix}${ext}`);
-  },
-});
+// Use memory storage in serverless environments or if disk storage fails
+const storage = canUseDiskStorage && ensureUploadsDir()
+  ? multer.diskStorage({
+      destination: (_req: any, _file: any, cb: any) => {
+        // Directory should already exist, but ensure it just in case
+        try {
+          if (!fs.existsSync(uploadsDir)) {
+            fs.mkdirSync(uploadsDir, { recursive: true });
+          }
+          cb(null, uploadsDir);
+        } catch (err: any) {
+          cb(err);
+        }
+      },
+      filename: (_req: any, file: any, cb: any) => {
+        const uniqueSuffix = Date.now() + "-" + Math.round(Math.random() * 1e9);
+        const ext = path.extname(file.originalname);
+        cb(null, `image-${uniqueSuffix}${ext}`);
+      },
+    })
+  : multer.memoryStorage();
 
 const upload = multer({
   storage,
@@ -533,6 +569,11 @@ threeDRouter.post("/upload-image", optionalAuth, upload.single("image"), async (
     }
 
     let imageUrl: string;
+    const fileBuffer = req.file.buffer || (req.file.path ? fs.readFileSync(req.file.path) : null);
+
+    if (!fileBuffer) {
+      return res.status(500).json({ error: "Failed to read uploaded file" });
+    }
 
     if (s3Enabled && s3Client) {
       try {
@@ -540,7 +581,6 @@ threeDRouter.post("/upload-image", optionalAuth, upload.single("image"), async (
         const contentType = req.file.mimetype || `image/${fileExtension.slice(1)}`;
         const s3Key = `uploads/${Date.now()}-${Math.round(Math.random() * 1e9)}${fileExtension}`;
 
-        const fileBuffer = fs.readFileSync(req.file.path);
         await s3Client.send(
           new PutObjectCommand({
             Bucket: config.s3.bucket,
@@ -552,14 +592,31 @@ threeDRouter.post("/upload-image", optionalAuth, upload.single("image"), async (
         );
 
         imageUrl = `https://${config.s3.bucket}.s3.${config.s3.region}.amazonaws.com/${s3Key}`;
-        fs.unlinkSync(req.file.path);
+        
+        // Clean up local file if it exists (disk storage)
+        if (req.file.path && fs.existsSync(req.file.path)) {
+          try {
+            fs.unlinkSync(req.file.path);
+          } catch (unlinkErr) {
+            logger.warn({ err: unlinkErr }, "Failed to delete temporary file");
+          }
+        }
+        
         logger.info({ s3Key, url: imageUrl }, "Image uploaded to S3");
       } catch (s3Err: any) {
-        logger.error({ err: s3Err }, "S3 upload failed, using local storage");
+        logger.error({ err: s3Err }, "S3 upload failed");
+        // In serverless, we can't serve local files, so S3 is required
+        if (isVercel) {
+          return res.status(500).json({ error: "S3 upload failed. S3 is required in serverless environment." });
+        }
         const baseUrl = process.env.BACKEND_URL || `${req.protocol}://${req.get("host")}`;
         imageUrl = `${baseUrl}/uploads/${req.file.filename}`;
       }
     } else {
+      // In serverless/Vercel, we need S3 for file storage
+      if (isVercel) {
+        return res.status(500).json({ error: "S3 storage is required in serverless environment. Please configure S3." });
+      }
       const baseUrl = process.env.BACKEND_URL || `${req.protocol}://${req.get("host")}`;
       imageUrl = `${baseUrl}/uploads/${req.file.filename}`;
     }
