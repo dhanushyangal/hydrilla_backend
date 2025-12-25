@@ -20,31 +20,32 @@ const isVercel = process.env.VERCEL === "1" ||
                  process.cwd().startsWith("/var/runtime");
 
 // In Vercel/serverless, always use memory storage since files should go to S3
-// Only use disk storage in non-serverless environments where we can write to filesystem
-const canUseDiskStorage = !isVercel;
+// Never try to create directories in Vercel - it will fail
+let storage: multer.StorageEngine;
 
-// Set uploadsDir for reference, but we won't use it in Vercel
-const uploadsDir = isVercel ? "/tmp/uploads" : path.join(process.cwd(), "uploads");
-
-// Helper function to safely create directory (only called if not in Vercel)
-function ensureUploadsDir(): boolean {
-  if (isVercel) {
-    return false; // Never use disk storage in Vercel
-  }
-  try {
-    if (!fs.existsSync(uploadsDir)) {
-      fs.mkdirSync(uploadsDir, { recursive: true });
+if (isVercel) {
+  // In Vercel, always use memory storage - files should be uploaded to S3
+  storage = multer.memoryStorage();
+} else {
+  // In non-Vercel environments, try to use disk storage
+  const uploadsDir = path.join(process.cwd(), "uploads");
+  
+  // Helper function to safely create directory
+  function ensureUploadsDir(): boolean {
+    try {
+      if (!fs.existsSync(uploadsDir)) {
+        fs.mkdirSync(uploadsDir, { recursive: true });
+      }
+      return true;
+    } catch (err: any) {
+      logger.warn({ err: err.message, uploadsDir }, "Failed to create uploads directory");
+      return false;
     }
-    return true;
-  } catch (err: any) {
-    logger.warn({ err: err.message, uploadsDir }, "Failed to create uploads directory");
-    return false;
   }
-}
 
-// Use memory storage in serverless environments or if disk storage fails
-const storage = canUseDiskStorage && ensureUploadsDir()
-  ? multer.diskStorage({
+  // Try to use disk storage, fallback to memory if it fails
+  if (ensureUploadsDir()) {
+    storage = multer.diskStorage({
       destination: (_req: any, _file: any, cb: any) => {
         // Directory should already exist, but ensure it just in case
         try {
@@ -61,8 +62,12 @@ const storage = canUseDiskStorage && ensureUploadsDir()
         const ext = path.extname(file.originalname);
         cb(null, `image-${uniqueSuffix}${ext}`);
       },
-    })
-  : multer.memoryStorage();
+    });
+  } else {
+    // Fallback to memory storage if directory creation fails
+    storage = multer.memoryStorage();
+  }
+}
 
 const upload = multer({
   storage,
