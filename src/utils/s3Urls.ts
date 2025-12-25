@@ -27,9 +27,11 @@ export function getDirectS3PreviewUrl(jobId: string): string {
 export function normalizeGlbUrl(jobId: string, apiUrl: string | null | undefined): string | null {
   if (!apiUrl) return null;
   
-  // If the URL already points to our S3 bucket, use it directly
+  // If the URL already points to our S3 bucket
   if (apiUrl.includes(config.s3.bucket) && apiUrl.includes("/image/")) {
-    return apiUrl;
+    // Strip query parameters (signed URL params like ?AWSAccessKeyId=...)
+    const urlWithoutParams = apiUrl.split('?')[0];
+    return urlWithoutParams;
   }
   
   // Otherwise, construct direct S3 URL based on jobId
@@ -43,9 +45,11 @@ export function normalizeGlbUrl(jobId: string, apiUrl: string | null | undefined
 export function normalizePreviewUrl(jobId: string, apiUrl: string | null | undefined): string | null {
   if (!apiUrl) return null;
   
-  // If the URL already points to our S3 bucket, use it directly
+  // If the URL already points to our S3 bucket
   if (apiUrl.includes(config.s3.bucket) && apiUrl.includes("/image/")) {
-    return apiUrl;
+    // Strip query parameters (signed URL params like ?AWSAccessKeyId=...)
+    const urlWithoutParams = apiUrl.split('?')[0];
+    return urlWithoutParams;
   }
   
   // Otherwise, construct direct S3 URL based on jobId
