@@ -30,11 +30,21 @@ app.use(pinoHttp({ logger }));
 
 // Health check - handle both /api/health and /health
 app.get("/api/health", (_req, res) => {
-  res.json({ ok: true });
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.json({ ok: true, timestamp: new Date().toISOString() });
 });
 
 app.get("/health", (_req, res) => {
-  res.json({ ok: true });
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.json({ ok: true, timestamp: new Date().toISOString() });
+});
+
+// Test endpoint for history (without database)
+app.get("/api/3d/test", (_req, res) => {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  res.json({ message: "Backend is accessible", jobs: [] });
 });
 
 // Root route
@@ -44,7 +54,12 @@ app.get("/", (_req, res) => {
 
 // 3D routes
 app.use("/api/3d", async (req, res, next) => {
-  await ensureDb();
+  // Initialize database in background, don't block the request
+  if (!dbInitialized) {
+    ensureDb().catch((dbErr: any) => {
+      logger.error({ err: dbErr }, "Database initialization failed");
+    });
+  }
   next();
 }, threeDRouter);
 

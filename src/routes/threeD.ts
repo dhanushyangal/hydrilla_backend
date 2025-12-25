@@ -333,21 +333,42 @@ threeDRouter.get("/result/:jobId", optionalAuth, async (req, res) => {
 // ============================================
 // Get User's Job History (requires auth)
 // ============================================
+// Handle OPTIONS preflight for CORS
+threeDRouter.options("/history", (_req, res) => {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  res.sendStatus(200);
+});
+
 threeDRouter.get("/history", optionalAuth, async (req, res) => {
   try {
+    // Set CORS headers explicitly
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+    
     const userId = req.userId;
     
     // If authenticated, return only user's jobs
     // If not authenticated, return empty array (for security)
     if (userId) {
-      const jobs = await listJobsForUser(userId, 100);
-      res.json({ jobs: jobs || [] });
+      try {
+        const jobs = await listJobsForUser(userId, 100);
+        res.json({ jobs: jobs || [] });
+      } catch (dbErr: any) {
+        logger.error({ err: dbErr, userId }, "Database error fetching jobs");
+        // Return empty array instead of error to prevent frontend crash
+        res.json({ jobs: [] });
+      }
     } else {
       // For unauthenticated requests, return empty to protect user data
       res.json({ jobs: [] });
     }
   } catch (err: any) {
     logger.error({ err, userId: req.userId }, "Failed to fetch history");
+    // Set CORS headers even on error
+    res.setHeader("Access-Control-Allow-Origin", "*");
     res.status(500).json({ error: err.message || "Failed to fetch history" });
   }
 });
