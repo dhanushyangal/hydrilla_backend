@@ -3,46 +3,37 @@ import multer from "multer";
 import path from "path";
 import fs from "fs";
 import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
-import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { logger } from "../logger.js";
 import { config } from "../config.js";
-import { createJob, getJob, listJobs, updateJobResult, updateJobStatus } from "../repository/jobs.js";
+import { supabase } from "../db.js";
+import { createJob, getJob, listJobs, listJobsForUser, updateJobResult, updateJobStatus, deleteJob, getJobForUser } from "../repository/jobs.js";
+import { optionalAuth, requireAuth, syncUserToDatabase } from "../middleware/auth.js";
 
 export const threeDRouter = Router();
 
 // Configure multer for file uploads
-// Use memory storage for Vercel (ephemeral filesystem)
-// For EC2 deployment, this can be changed to diskStorage
-const isVercel = process.env.VERCEL === "1";
 const uploadsDir = path.join(process.cwd(), "uploads");
-
-// Create uploads directory only if not on Vercel
-if (!isVercel && !fs.existsSync(uploadsDir)) {
+if (!fs.existsSync(uploadsDir)) {
   fs.mkdirSync(uploadsDir, { recursive: true });
 }
 
-// Use memory storage on Vercel, disk storage otherwise
-const storage = isVercel
-  ? multer.memoryStorage()
-  : multer.diskStorage({
-      destination: (_req: any, _file: any, cb: any) => {
-        cb(null, uploadsDir);
-      },
-      filename: (_req: any, file: any, cb: any) => {
-        // Generate unique filename with timestamp
-        const uniqueSuffix = Date.now() + "-" + Math.round(Math.random() * 1e9);
-        const ext = path.extname(file.originalname);
-        cb(null, `image-${uniqueSuffix}${ext}`);
-      },
-    });
+const storage = multer.diskStorage({
+  destination: (_req: any, _file: any, cb: any) => {
+    cb(null, uploadsDir);
+  },
+  filename: (_req: any, file: any, cb: any) => {
+    const uniqueSuffix = Date.now() + "-" + Math.round(Math.random() * 1e9);
+    const ext = path.extname(file.originalname);
+    cb(null, `image-${uniqueSuffix}${ext}`);
+  },
+});
 
 const upload = multer({
   storage,
   limits: {
-    fileSize: 10 * 1024 * 1024, // 10MB limit
+    fileSize: 10 * 1024 * 1024,
   },
   fileFilter: (_req: any, file: any, cb: any) => {
-    // Accept only image files
     const allowedMimes = ["image/jpeg", "image/jpg", "image/png", "image/webp", "image/gif"];
     if (allowedMimes.includes(file.mimetype)) {
       cb(null, true);
@@ -54,42 +45,15 @@ const upload = multer({
 
 const API_BASE = process.env.HUNYUAN_API_URL || "https://api.hydrilla.co";
 
-// Helper function to make API requests with proper error handling
-async function makeApiRequest(url: string, options: RequestInit = {}) {
-  try {
-    const response = await fetch(url, {
-      ...options,
-      headers: {
-        ...options.headers,
-        "User-Agent": "Hydrilla-Backend/1.0",
-      },
-    });
-    return response;
-  } catch (err: any) {
-    logger.error({ err, url }, "API request failed");
-    throw new Error(`Failed to connect to API: ${err.message}`);
-  }
-}
-
-// Initialize S3 client (if credentials are available)
+// Initialize S3 client
 let s3Client: S3Client | null = null;
 let s3Enabled = false;
 
 try {
-  // Check if AWS credentials are available
-  // AWS SDK will automatically detect from:
-  // 1. Environment variables: AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY
-  // 2. AWS credentials file: ~/.aws/credentials
-  // 3. IAM role (if running on EC2)
   const hasExplicitCredentials = !!(process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY);
-  
-  // Try to initialize S3 client
-  // The SDK will throw an error if credentials are truly unavailable
   s3Client = new S3Client({
     region: config.s3.region,
   });
-  
-  // If we got here, S3 client was created (credentials will be checked on first use)
   s3Enabled = true;
   logger.info({
     bucket: config.s3.bucket,
@@ -97,129 +61,74 @@ try {
     hasExplicitCredentials,
   }, "S3 client initialized");
 } catch (err: any) {
-  logger.warn({ err }, "Failed to initialize S3 client. S3 uploads disabled. Images will be stored locally.");
+  logger.warn({ err }, "Failed to initialize S3 client. S3 uploads disabled.");
   s3Enabled = false;
   s3Client = null;
 }
 
-// Helper to convert our status to API status
+// Helper functions for status conversion
 function convertStatus(apiStatus: string): "WAIT" | "RUN" | "FAIL" | "DONE" {
   switch (apiStatus) {
-    case "pending":
-      return "WAIT";
-    case "processing":
-      return "RUN";
+    case "pending": return "WAIT";
+    case "processing": return "RUN";
     case "failed":
-    case "cancelled":
-      return "FAIL";
-    case "completed":
-      return "DONE";
-    default:
-      return "WAIT";
+    case "cancelled": return "FAIL";
+    case "completed": return "DONE";
+    default: return "WAIT";
   }
 }
 
-// Helper to convert API status to our status
-function convertFromApiStatus(apiStatus: string): "pending" | "processing" | "completed" | "failed" | "cancelled" {
-  switch (apiStatus) {
-    case "WAIT":
-      return "pending";
-    case "RUN":
-      return "processing";
-    case "DONE":
-      return "completed";
-    case "FAIL":
-      return "failed";
-    default:
-      return "pending";
-  }
-}
-
-threeDRouter.post("/generate", async (req, res) => {
+// ============================================
+// Generate 3D Model Endpoint (requires auth)
+// ============================================
+threeDRouter.post("/generate", requireAuth, async (req, res) => {
   try {
-    const body = req.body as { prompt?: string; imageUrl?: string; imageBase64?: string; imageOnly?: boolean };
+    const body = req.body as { prompt?: string; imageUrl?: string; imageBase64?: string };
+    const userId = req.userId!;
+
+    // Sync user to database on first request
+    await syncUserToDatabase(userId);
 
     let jobId: string;
-    let mode: "text-to-3d" | "image-to-3d" | "text-to-image";
 
-    // Determine mode and submit to API
     if (body.prompt) {
-      // Check if this is image-only generation (for preview)
-      if (body.imageOnly) {
-        // Text-to-Image only - use URLSearchParams for form data
-        const formData = new URLSearchParams();
-        formData.append("prompt", body.prompt);
+      // Text-to-3D
+      const formData = new URLSearchParams();
+      formData.append("prompt", body.prompt);
+      formData.append("user_id", userId);  // Pass user_id to Python API
 
-        const response = await makeApiRequest(`${API_BASE}/text-to-image`, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/x-www-form-urlencoded",
-          },
-          body: formData.toString(),
-        });
+      const response = await fetch(`${API_BASE}/text-to-3d`, {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: formData.toString(),
+      });
 
-        if (!response.ok) {
-          let errorText: string;
-          try {
-            const errorData = await response.json();
-            errorText = errorData.error || "Failed to generate image";
-          } catch {
-            errorText = await response.text() || "Failed to generate image";
-          }
-          throw new Error(errorText);
+      if (!response.ok) {
+        let errorText: string;
+        try {
+          const errorData = await response.json();
+          errorText = errorData.error || "Failed to submit text-to-3d job";
+        } catch {
+          errorText = await response.text() || "Failed to submit text-to-3d job";
         }
-
-        const data = await response.json();
-        jobId = data.job_id;
-        mode = "text-to-image";
-      } else {
-        // Text-to-3D - use URLSearchParams for form data
-        const formData = new URLSearchParams();
-        formData.append("prompt", body.prompt);
-        // If imageUrl is provided, use it (for 3D generation from pre-generated image)
-        if (body.imageUrl) {
-          formData.append("image_url", body.imageUrl);
-        }
-
-        const response = await makeApiRequest(`${API_BASE}/text-to-3d`, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/x-www-form-urlencoded",
-          },
-          body: formData.toString(),
-        });
-
-        if (!response.ok) {
-          let errorText: string;
-          try {
-            const errorData = await response.json();
-            errorText = errorData.error || "Failed to submit text-to-3d job";
-          } catch {
-            errorText = await response.text() || "Failed to submit text-to-3d job";
-          }
-          throw new Error(errorText);
-        }
-
-        const data = await response.json();
-        jobId = data.job_id;
-        mode = "text-to-3d";
+        throw new Error(errorText);
       }
+
+      const data = await response.json();
+      jobId = data.job_id;
     } else if (body.imageUrl || body.imageBase64) {
-      // Image-to-3D - use URLSearchParams for form data
+      // Image-to-3D
       const formData = new URLSearchParams();
       if (body.imageUrl) {
         formData.append("image_url", body.imageUrl);
       } else if (body.imageBase64) {
-        // For base64, we need to upload it as a file or convert to URL
-        // For now, we'll reject base64 and require URL
-        return res.status(400).json({ error: "Please provide imageUrl instead of imageBase64 for image-to-3d" });
+        return res.status(400).json({ error: "Please provide imageUrl instead of imageBase64" });
       }
+      formData.append("user_id", userId);  // Pass user_id to Python API
 
-      const response = await makeApiRequest(`${API_BASE}/image-to-3d`, {
+      const response = await fetch(`${API_BASE}/image-to-3d`, {
         method: "POST",
-        headers: {
-          "Content-Type": "application/x-www-form-urlencoded",
-        },
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
         body: formData.toString(),
       });
 
@@ -236,17 +145,17 @@ threeDRouter.post("/generate", async (req, res) => {
 
       const data = await response.json();
       jobId = data.job_id;
-      mode = "image-to-3d";
     } else {
-      return res.status(400).json({ error: "Either prompt or imageUrl/imageBase64 is required" });
+      return res.status(400).json({ error: "Either prompt or imageUrl is required" });
     }
 
-    // Create job in database
+    // Create job in database with user_id
     await createJob({
       id: jobId,
+      userId,
       prompt: body.prompt || null,
       imageUrl: body.imageUrl || null,
-      generateType: "Normal", // Default for compatibility
+      generateType: "Normal",
       faceCount: null,
       enablePBR: true,
       polygonType: null,
@@ -259,11 +168,16 @@ threeDRouter.post("/generate", async (req, res) => {
   }
 });
 
-threeDRouter.get("/status/:jobId", async (req, res) => {
+// ============================================
+// Get Job Status (optional auth for viewing)
+// ============================================
+threeDRouter.get("/status/:jobId", optionalAuth, async (req, res) => {
   const { jobId } = req.params;
+  const userId = req.userId;
+
   try {
     // Fetch from API
-    const response = await makeApiRequest(`${API_BASE}/status/${jobId}`);
+    const response = await fetch(`${API_BASE}/status/${jobId}`);
     if (!response.ok) {
       if (response.status === 404) {
         return res.status(404).json({ error: "Job not found" });
@@ -276,9 +190,10 @@ threeDRouter.get("/status/:jobId", async (req, res) => {
     // Get or create job in database
     let job = await getJob(jobId);
     if (!job) {
-      // Create job if it doesn't exist
+      // Create job if it doesn't exist (for legacy support)
       await createJob({
         id: jobId,
+        userId: userId || null,
         prompt: apiJob.result?.prompt || null,
         imageUrl: null,
         generateType: "Normal",
@@ -293,25 +208,26 @@ threeDRouter.get("/status/:jobId", async (req, res) => {
       return res.status(404).json({ error: "Job not found" });
     }
 
+    // Check ownership (allow viewing if no userId or if user owns the job or if job has no owner)
+    if (userId && job.userId && job.userId !== userId) {
+      return res.status(403).json({ error: "You don't have permission to view this job" });
+    }
+
     // Update job status from API
     const status = convertStatus(apiJob.status);
     await updateJobStatus(jobId, { status });
 
-    // Update result if completed
     if (apiJob.status === "completed" && apiJob.result) {
       const glbUrl = apiJob.result.mesh_url || apiJob.result.output;
       const previewUrl = apiJob.result.processed_image_url || apiJob.result.generated_image_url || apiJob.result.processed_image || apiJob.result.generated_image;
-
       await updateJobResult(jobId, {
         resultGlbUrl: glbUrl || null,
         previewImageUrl: previewUrl || null,
       });
-
       job.resultGlbUrl = glbUrl || null;
       job.previewImageUrl = previewUrl || null;
     }
 
-    // Update error if failed
     if (apiJob.status === "failed" || apiJob.status === "cancelled") {
       await updateJobStatus(jobId, {
         status,
@@ -322,7 +238,6 @@ threeDRouter.get("/status/:jobId", async (req, res) => {
     }
 
     job.status = status;
-
     res.json({ job });
   } catch (err: any) {
     logger.error(err, "failed to query job");
@@ -330,21 +245,30 @@ threeDRouter.get("/status/:jobId", async (req, res) => {
   }
 });
 
-threeDRouter.get("/result/:jobId", async (req, res) => {
+// ============================================
+// Get Job Result
+// ============================================
+threeDRouter.get("/result/:jobId", optionalAuth, async (req, res) => {
   const { jobId } = req.params;
+  const userId = req.userId;
+
   try {
     const job = await getJob(jobId);
     if (!job) return res.status(404).json({ error: "Job not found" });
 
-    // Also fetch from API to get latest result
+    // Check ownership
+    if (userId && job.userId && job.userId !== userId) {
+      return res.status(403).json({ error: "You don't have permission to view this job" });
+    }
+
+    // Fetch from API for latest result
     try {
-      const response = await makeApiRequest(`${API_BASE}/status/${jobId}`);
+      const response = await fetch(`${API_BASE}/status/${jobId}`);
       if (response.ok) {
         const apiJob = await response.json();
         if (apiJob.status === "completed" && apiJob.result) {
           const glbUrl = apiJob.result.mesh_url || apiJob.result.output;
           const previewUrl = apiJob.result.processed_image_url || apiJob.result.generated_image_url || apiJob.result.processed_image || apiJob.result.generated_image;
-
           if (glbUrl || previewUrl) {
             await updateJobResult(jobId, {
               resultGlbUrl: glbUrl || null,
@@ -365,38 +289,98 @@ threeDRouter.get("/result/:jobId", async (req, res) => {
   }
 });
 
-threeDRouter.get("/history", async (_req, res) => {
+// ============================================
+// Get User's Job History (requires auth)
+// ============================================
+threeDRouter.get("/history", optionalAuth, async (req, res) => {
   try {
-    const jobs = await listJobs(100);
-    res.json({ jobs });
+    const userId = req.userId;
+    
+    // If authenticated, return only user's jobs
+    // If not authenticated, return empty array (for security)
+    if (userId) {
+      const jobs = await listJobsForUser(userId, 100);
+      res.json({ jobs });
+    } else {
+      // For unauthenticated requests, return empty to protect user data
+      res.json({ jobs: [] });
+    }
   } catch (err: any) {
     res.status(500).json({ error: err.message || "Failed to fetch history" });
   }
 });
 
-// Endpoint to register a job that was created directly via API
-// This allows frontend to create jobs in Supabase when calling API directly
-threeDRouter.post("/register-job", async (req, res) => {
+// ============================================
+// Delete a Job (requires auth)
+// ============================================
+threeDRouter.delete("/jobs/:jobId", requireAuth, async (req, res) => {
+  const { jobId } = req.params;
+  const userId = req.userId!;
+
+  try {
+    const job = await getJob(jobId);
+    if (!job) {
+      return res.status(404).json({ error: "Job not found" });
+    }
+
+    // Check ownership
+    if (job.userId !== userId) {
+      return res.status(403).json({ error: "You don't have permission to delete this job" });
+    }
+
+    await deleteJob(jobId, userId);
+    res.json({ success: true, message: "Job deleted" });
+  } catch (err: any) {
+    logger.error(err, "failed to delete job");
+    res.status(500).json({ error: err.message || "Failed to delete job" });
+  }
+});
+
+// ============================================
+// Register Job (with optional auth)
+// ============================================
+threeDRouter.post("/register-job", optionalAuth, async (req, res) => {
   try {
     const { job_id, prompt, imageUrl } = req.body as {
       job_id: string;
       prompt?: string;
       imageUrl?: string;
     };
+    const userId = req.userId;
 
     if (!job_id) {
       return res.status(400).json({ error: "job_id is required" });
     }
 
-    // Check if job already exists
+    // Sync user to database if authenticated (IMPORTANT: do this first!)
+    if (userId) {
+      logger.info({ userId }, "Syncing user to database before job registration");
+      const syncResult = await syncUserToDatabase(userId);
+      if (!syncResult) {
+        logger.warn({ userId }, "User sync returned null, but continuing with job registration");
+      }
+    }
+
     const existingJob = await getJob(job_id);
     if (existingJob) {
+      // Update user_id if job exists but has no owner and we have a userId
+      if (!existingJob.userId && userId) {
+        try {
+          await supabase
+            .from("jobs")
+            .update({ user_id: userId })
+            .eq("id", job_id);
+          logger.info({ jobId: job_id, userId }, "Updated job with user_id");
+        } catch (updateErr) {
+          logger.warn({ err: updateErr }, "Failed to update job with user_id");
+        }
+      }
       return res.json({ success: true, job_id, message: "Job already exists" });
     }
 
-    // Create job in database
     await createJob({
       id: job_id,
+      userId: userId || null,
       prompt: prompt || null,
       imageUrl: imageUrl || null,
       generateType: "Normal",
@@ -405,6 +389,7 @@ threeDRouter.post("/register-job", async (req, res) => {
       polygonType: null,
     });
 
+    logger.info({ jobId: job_id, userId, prompt: prompt?.slice(0, 50) }, "Job registered successfully");
     res.json({ success: true, job_id });
   } catch (err: any) {
     logger.error(err, "failed to register job");
@@ -412,27 +397,28 @@ threeDRouter.post("/register-job", async (req, res) => {
   }
 });
 
-// Webhook endpoint for API to notify backend when jobs complete
-// This allows the API to update Supabase directly
+// ============================================
+// Webhook for job updates (no auth - internal use)
+// ============================================
 threeDRouter.post("/webhook/job-update", async (req, res) => {
   try {
-    const { job_id, status, result, error } = req.body as {
+    const { job_id, status, result, error, user_id } = req.body as {
       job_id: string;
       status: string;
       result?: any;
       error?: string;
+      user_id?: string;
     };
 
     if (!job_id) {
       return res.status(400).json({ error: "job_id is required" });
     }
 
-    // Get or create job in database
     let job = await getJob(job_id);
     if (!job) {
-      // Create job if it doesn't exist
       await createJob({
         id: job_id,
+        userId: user_id || null,
         prompt: result?.prompt || null,
         imageUrl: null,
         generateType: "Normal",
@@ -447,7 +433,6 @@ threeDRouter.post("/webhook/job-update", async (req, res) => {
       return res.status(500).json({ error: "Failed to create/get job" });
     }
 
-    // Update job status
     const dbStatus = convertStatus(status);
     await updateJobStatus(job_id, {
       status: dbStatus,
@@ -455,15 +440,9 @@ threeDRouter.post("/webhook/job-update", async (req, res) => {
       errorMessage: error || null,
     });
 
-    // Update result if completed
     if (status === "completed" && result) {
       const glbUrl = result.mesh_url || result.output;
-      const previewUrl =
-        result.processed_image_url ||
-        result.generated_image_url ||
-        result.processed_image ||
-        result.generated_image;
-
+      const previewUrl = result.processed_image_url || result.generated_image_url || result.processed_image || result.generated_image;
       await updateJobResult(job_id, {
         resultGlbUrl: glbUrl || null,
         previewImageUrl: previewUrl || null,
@@ -477,51 +456,18 @@ threeDRouter.post("/webhook/job-update", async (req, res) => {
   }
 });
 
-// Proxy endpoint to fetch GLB files (bypasses CORS)
-// Accepts either jobId (preferred - fetches fresh URL from API) or url (direct URL)
+// ============================================
+// GLB Proxy (no auth - for public access)
+// ============================================
 threeDRouter.get("/glb-proxy", async (req, res) => {
   try {
-    const jobId = req.query.jobId as string;
-    const urlParam = req.query.url as string;
-    
-    let glbUrl: string;
-
-    // If jobId is provided, fetch fresh URL from Hunyuan3D API
-    if (jobId) {
-      try {
-        logger.info({ jobId }, "Fetching fresh GLB URL from API for job");
-        const apiResponse = await makeApiRequest(`${API_BASE}/status/${jobId}`);
-        
-        if (!apiResponse.ok) {
-          logger.error({ jobId, status: apiResponse.status }, "Failed to fetch job status from API");
-          return res.status(apiResponse.status).json({ error: "Failed to fetch job status from API" });
-        }
-
-        const apiJob = await apiResponse.json();
-        
-        // Get GLB URL from API response (fresh presigned URL)
-        glbUrl = apiJob.result?.mesh_url || apiJob.result?.output;
-        
-        if (!glbUrl) {
-          logger.warn({ jobId }, "No GLB URL found in API response");
-          return res.status(404).json({ error: "GLB URL not found for this job" });
-        }
-
-        logger.info({ jobId, glbUrl: glbUrl.substring(0, 100) + "..." }, "Got fresh GLB URL from API");
-      } catch (apiErr: any) {
-        logger.error({ err: apiErr, jobId }, "Failed to fetch from Hunyuan3D API");
-        return res.status(500).json({ error: "Failed to fetch job status from API" });
-      }
-    } else if (urlParam) {
-      // Use provided URL (fallback for direct URLs)
-      glbUrl = urlParam;
-    } else {
-      return res.status(400).json({ error: "Either jobId or url parameter is required" });
+    const url = req.query.url as string;
+    if (!url) {
+      return res.status(400).json({ error: "URL parameter is required" });
     }
 
-    // Validate URL
     try {
-      const urlObj = new URL(glbUrl);
+      const urlObj = new URL(url);
       if (!["https:", "http:"].includes(urlObj.protocol)) {
         return res.status(400).json({ error: "Invalid URL protocol" });
       }
@@ -529,55 +475,47 @@ threeDRouter.get("/glb-proxy", async (req, res) => {
       return res.status(400).json({ error: "Invalid URL format" });
     }
 
-    // Fetch the GLB file with timeout
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 60000); // 60 seconds
-    
+    const timeoutId = setTimeout(() => controller.abort(), 60000);
+
     try {
-      const response = await fetch(glbUrl, {
+      const response = await fetch(url, {
         headers: {
           "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
           "Accept": "*/*",
         },
         signal: controller.signal,
       });
-      
+
       clearTimeout(timeoutId);
 
       if (!response.ok) {
-        logger.error({ glbUrl: glbUrl.substring(0, 100) + "...", status: response.status, statusText: response.statusText }, "Failed to fetch GLB from URL");
+        logger.error({ url, status: response.status }, "Failed to fetch GLB");
         return res.status(response.status).json({ error: `Failed to fetch GLB: ${response.statusText}` });
       }
 
-      // Set proper headers for GLB file
       res.setHeader("Content-Type", "model/gltf-binary");
       res.setHeader("Content-Disposition", `attachment; filename="model.glb"`);
       res.setHeader("Access-Control-Allow-Origin", "*");
       res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
       res.setHeader("Access-Control-Allow-Headers", "Content-Type");
-      res.setHeader("Cache-Control", "no-cache"); // Don't cache since URLs expire
+      res.setHeader("Cache-Control", "public, max-age=3600");
 
-      // Stream the file
       const buffer = await response.arrayBuffer();
       res.send(Buffer.from(buffer));
     } catch (fetchErr: any) {
       clearTimeout(timeoutId);
       if (fetchErr.name === "AbortError") {
-        logger.error({ glbUrl: glbUrl.substring(0, 100) + "..." }, "GLB fetch timeout");
-        return res.status(504).json({ error: "Request timeout - file too large or network issue" });
+        return res.status(504).json({ error: "Request timeout" });
       }
       throw fetchErr;
     }
   } catch (err: any) {
-    logger.error({ err, jobId: req.query.jobId, url: req.query.url }, "failed to proxy GLB");
-    if (err.name === "AbortError" || err.name === "TimeoutError") {
-      return res.status(504).json({ error: "Request timeout - file too large or network issue" });
-    }
+    logger.error({ err, url: req.query.url }, "failed to proxy GLB");
     res.status(500).json({ error: err.message || "Failed to proxy GLB file" });
   }
 });
 
-// Handle OPTIONS for CORS preflight
 threeDRouter.options("/glb-proxy", (_req, res) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
@@ -585,73 +523,139 @@ threeDRouter.options("/glb-proxy", (_req, res) => {
   res.sendStatus(200);
 });
 
-// Image upload endpoint - uploads to S3 and returns public URL
-threeDRouter.post("/upload-image", upload.single("image"), async (req, res) => {
+// ============================================
+// Image Upload (with optional auth)
+// ============================================
+threeDRouter.post("/upload-image", optionalAuth, upload.single("image"), async (req, res) => {
   try {
     if (!req.file) {
       return res.status(400).json({ error: "No image file provided" });
     }
 
     let imageUrl: string;
-    const isVercel = process.env.VERCEL === "1";
 
-    // Try to upload to S3 first (if enabled)
     if (s3Enabled && s3Client) {
       try {
         const fileExtension = path.extname(req.file.originalname).toLowerCase();
         const contentType = req.file.mimetype || `image/${fileExtension.slice(1)}`;
         const s3Key = `uploads/${Date.now()}-${Math.round(Math.random() * 1e9)}${fileExtension}`;
 
-        // Get file buffer - from memory (Vercel) or disk (EC2)
-        const fileBuffer = isVercel && req.file.buffer 
-          ? req.file.buffer 
-          : fs.readFileSync(req.file.path);
-
-        // Upload to S3
+        const fileBuffer = fs.readFileSync(req.file.path);
         await s3Client.send(
           new PutObjectCommand({
             Bucket: config.s3.bucket,
             Key: s3Key,
             Body: fileBuffer,
             ContentType: contentType,
-            ACL: "public-read", // Make file publicly accessible
+            ACL: "public-read",
           })
         );
 
-        // Generate public S3 URL
         imageUrl = `https://${config.s3.bucket}.s3.${config.s3.region}.amazonaws.com/${s3Key}`;
-
-        // Clean up local file after successful S3 upload (only if not on Vercel)
-        if (!isVercel && req.file.path) {
-          fs.unlinkSync(req.file.path);
-        }
-
-        logger.info({ s3Key, url: imageUrl }, "Image uploaded to S3 successfully");
+        fs.unlinkSync(req.file.path);
+        logger.info({ s3Key, url: imageUrl }, "Image uploaded to S3");
       } catch (s3Err: any) {
-        logger.error({ err: s3Err }, "S3 upload failed");
-        // On Vercel, S3 is required since we can't store files locally
-        if (isVercel) {
-          return res.status(500).json({ error: "S3 upload failed. S3 configuration is required on Vercel." });
-        }
-        // Fall back to local storage (EC2 only)
+        logger.error({ err: s3Err }, "S3 upload failed, using local storage");
         const baseUrl = process.env.BACKEND_URL || `${req.protocol}://${req.get("host")}`;
         imageUrl = `${baseUrl}/uploads/${req.file.filename}`;
-        logger.warn({ url: imageUrl }, "Using local storage URL (S3 unavailable)");
       }
     } else {
-      // S3 not available
-      if (isVercel) {
-        return res.status(500).json({ error: "S3 configuration is required for file uploads on Vercel." });
-      }
-      // Use local storage (EC2 only)
       const baseUrl = process.env.BACKEND_URL || `${req.protocol}://${req.get("host")}`;
       imageUrl = `${baseUrl}/uploads/${req.file.filename}`;
-      logger.warn({ url: imageUrl }, "S3 not configured, using local storage URL");
     }
 
     res.json({ success: true, url: imageUrl });
   } catch (err: any) {
     logger.error(err, "failed to upload image");
     res.status(500).json({ error: err.message || "Failed to upload image" });
+  }
+});
+
+// ============================================
+// Sync User to Database (requires auth)
+// Called after login to ensure user is in database
+// ============================================
+threeDRouter.post("/sync-user", requireAuth, async (req, res) => {
+  try {
+    const userId = req.userId!;
+    
+    logger.info({ userId }, "User sync endpoint called");
+    
+    const userData = await syncUserToDatabase(userId);
+    
+    if (userData) {
+      res.json({ 
+        success: true, 
+        user: {
+          id: userData.id,
+          email: userData.email,
+          firstName: userData.first_name,
+          lastName: userData.last_name,
+        }
+      });
+    } else {
+      res.status(500).json({ error: "Failed to sync user" });
+    }
+  } catch (err: any) {
+    logger.error(err, "failed to sync user");
+    res.status(500).json({ error: err.message || "Failed to sync user" });
+  }
+});
+
+// ============================================
+// Get Current User Profile (requires auth)
+// ============================================
+threeDRouter.get("/me", requireAuth, async (req, res) => {
+  try {
+    const userId = req.userId!;
+    
+    // First sync user to ensure they exist in database
+    await syncUserToDatabase(userId);
+    
+    // Fetch user from database
+    const { data: user, error } = await supabase
+      .from("users")
+      .select("*")
+      .eq("id", userId)
+      .single();
+    
+    if (error) {
+      logger.error({ err: error, userId }, "Failed to fetch user from database");
+      return res.status(500).json({ error: "Failed to fetch user" });
+    }
+    
+    if (!user) {
+      return res.status(404).json({ error: "User not found" });
+    }
+    
+    // Get user's job stats
+    const { count: totalJobs } = await supabase
+      .from("jobs")
+      .select("*", { count: "exact", head: true })
+      .eq("user_id", userId);
+    
+    const { count: completedJobs } = await supabase
+      .from("jobs")
+      .select("*", { count: "exact", head: true })
+      .eq("user_id", userId)
+      .eq("status", "DONE");
+    
+    res.json({
+      user: {
+        id: user.id,
+        email: user.email,
+        firstName: user.first_name,
+        lastName: user.last_name,
+        imageUrl: user.image_url,
+        createdAt: user.created_at,
+      },
+      stats: {
+        totalJobs: totalJobs || 0,
+        completedJobs: completedJobs || 0,
+      }
+    });
+  } catch (err: any) {
+    logger.error(err, "failed to get user profile");
+    res.status(500).json({ error: err.message || "Failed to get user profile" });
   }
 });

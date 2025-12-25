@@ -17,6 +17,7 @@ export interface CreateJobInput {
 
 export interface JobRecord {
   id: string;
+  userId: string | null;  // Owner of the job
   status: JobStatus;
   prompt: string | null;
   imageUrl: string | null;
@@ -32,3 +33,25 @@ export interface JobRecord {
   updatedAt: Date;
 }
 
+export interface UserRecord {
+  id: string;
+  email: string | null;
+  firstName: string | null;
+  lastName: string | null;
+  imageUrl: string | null;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+export interface AssetRecord {
+  id: string;
+  userId: string;
+  jobId: string | null;
+  type: "model" | "image" | "preview";
+  name: string | null;
+  fileUrl: string;
+  fileSize: number | null;
+  mimeType: string | null;
+  metadata: Record<string, unknown> | null;
+  createdAt: Date;
+}
