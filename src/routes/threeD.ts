@@ -341,12 +341,13 @@ threeDRouter.get("/history", optionalAuth, async (req, res) => {
     // If not authenticated, return empty array (for security)
     if (userId) {
       const jobs = await listJobsForUser(userId, 100);
-      res.json({ jobs });
+      res.json({ jobs: jobs || [] });
     } else {
       // For unauthenticated requests, return empty to protect user data
       res.json({ jobs: [] });
     }
   } catch (err: any) {
+    logger.error({ err, userId: req.userId }, "Failed to fetch history");
     res.status(500).json({ error: err.message || "Failed to fetch history" });
   }
 });
