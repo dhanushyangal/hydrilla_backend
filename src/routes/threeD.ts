@@ -234,19 +234,76 @@ threeDRouter.get("/status/:jobId", optionalAuth, async (req, res) => {
   const userId = req.userId;
 
   try {
-    // Fetch from API
-    const response = await fetch(`${API_BASE}/status/${jobId}`);
-    if (!response.ok) {
-      if (response.status === 404) {
-        return res.status(404).json({ error: "Job not found" });
+    // First, try to get job from database
+    let job = await getJob(jobId);
+
+    // If job exists and is completed, return it immediately (no need to check external API)
+    if (job && (job.status === "DONE" || job.status === "FAIL")) {
+      // Check ownership
+      if (userId && job.userId && job.userId !== userId) {
+        return res.status(403).json({ error: "You don't have permission to view this job" });
       }
-      throw new Error("Failed to fetch job status");
+      return res.json({ job });
     }
 
-    const apiJob = await response.json();
+    // For pending/processing jobs or if job doesn't exist, try to fetch from external API
+    // But if API is unreachable and we have the job in DB, return the DB version
+    let apiJob = null;
+    try {
+      // Create abort controller for timeout
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 5000); // 5 second timeout
+      
+      const response = await fetch(`${API_BASE}/status/${jobId}`, {
+        signal: controller.signal,
+      });
+      
+      clearTimeout(timeoutId);
+      if (response.ok) {
+        apiJob = await response.json();
+      } else if (response.status === 404) {
+        // If API says job not found and we don't have it in DB, return 404
+        if (!job) {
+          return res.status(404).json({ error: "Job not found" });
+        }
+        // If we have it in DB but API says not found, return DB version
+        if (userId && job.userId && job.userId !== userId) {
+          return res.status(403).json({ error: "You don't have permission to view this job" });
+        }
+        return res.json({ job });
+      }
+    } catch (apiErr: any) {
+      // External API is unreachable (timeout, network error, etc.)
+      const isTimeout = apiErr.name === 'AbortError' || apiErr.message?.includes('timeout') || apiErr.message?.includes('Connect Timeout');
+      logger.warn({ jobId, err: apiErr.message, isTimeout }, "External API unreachable, using database data");
+      
+      // If we have the job in database, return it
+      if (job) {
+        if (userId && job.userId && job.userId !== userId) {
+          return res.status(403).json({ error: "You don't have permission to view this job" });
+        }
+        return res.json({ job });
+      }
+      
+      // If no job in DB and API is unreachable, return error
+      return res.status(503).json({ 
+        error: "External service unavailable. Please try again later." 
+      });
+    }
+
+    // If we got data from API, process it
+    if (!apiJob) {
+      // Should not reach here, but handle it
+      if (job) {
+        if (userId && job.userId && job.userId !== userId) {
+          return res.status(403).json({ error: "You don't have permission to view this job" });
+        }
+        return res.json({ job });
+      }
+      return res.status(404).json({ error: "Job not found" });
+    }
 
     // Get or create job in database
-    let job = await getJob(jobId);
     if (!job) {
       // Create job if it doesn't exist (for legacy support)
       await createJob({
