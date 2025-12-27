@@ -12,7 +12,21 @@ import { normalizeGlbUrl, normalizePreviewUrl } from "../utils/s3Urls.js";
 
 export const threeDRouter = Router();
 
-// Note: CORS is handled globally in server.ts, no need to duplicate here
+// Global CORS middleware for all routes in this router
+threeDRouter.use((req, res, next) => {
+  // Set CORS headers for all requests
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  
+  // Handle preflight requests
+  if (req.method === "OPTIONS") {
+    res.sendStatus(200);
+    return;
+  }
+  
+  next();
+});
 
 // Configure multer for file uploads
 // In Vercel/serverless, use /tmp which is writable, otherwise use local uploads directory
