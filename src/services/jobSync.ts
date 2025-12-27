@@ -28,14 +28,31 @@ function convertStatus(apiStatus: string): JobStatus {
  */
 export async function syncJobFromApi(jobId: string): Promise<boolean> {
   try {
-    // Fetch from API
-    const response = await fetch(`${API_BASE}/status/${jobId}`);
-    if (!response.ok) {
-      if (response.status === 404) {
-        logger.debug({ jobId }, "Job not found in API");
+    // Fetch from API with timeout
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 10000); // 10 second timeout
+    
+    let response: Response;
+    try {
+      response = await fetch(`${API_BASE}/status/${jobId}`, {
+        signal: controller.signal,
+      });
+      clearTimeout(timeoutId);
+      
+      if (!response.ok) {
+        if (response.status === 404) {
+          logger.debug({ jobId }, "Job not found in API");
+          return false;
+        }
+        throw new Error(`API returned ${response.status}`);
+      }
+    } catch (fetchErr: any) {
+      clearTimeout(timeoutId);
+      if (fetchErr.name === "AbortError") {
+        logger.warn({ jobId }, "API request timeout");
         return false;
       }
-      throw new Error(`API returned ${response.status}`);
+      throw fetchErr;
     }
 
     const apiJob = await response.json();
@@ -108,16 +125,28 @@ export async function syncAllJobs(): Promise<{ synced: number; failed: number }>
     let synced = 0;
     let failed = 0;
 
-    // Sync each job (with small delay to avoid rate limiting)
-    for (const job of activeJobs) {
-      const success = await syncJobFromApi(job.id);
-      if (success) {
-        synced++;
-      } else {
-        failed++;
+    // Sync jobs in parallel batches to improve performance
+    const BATCH_SIZE = 10;
+    const BATCH_DELAY_MS = 200;
+    
+    for (let i = 0; i < activeJobs.length; i += BATCH_SIZE) {
+      const batch = activeJobs.slice(i, i + BATCH_SIZE);
+      const results = await Promise.allSettled(
+        batch.map((job) => syncJobFromApi(job.id))
+      );
+      
+      results.forEach((result) => {
+        if (result.status === "fulfilled" && result.value) {
+          synced++;
+        } else {
+          failed++;
+        }
+      });
+      
+      // Small delay between batches to avoid overwhelming the API
+      if (i + BATCH_SIZE < activeJobs.length) {
+        await new Promise((resolve) => setTimeout(resolve, BATCH_DELAY_MS));
       }
-      // Small delay to avoid overwhelming the API
-      await new Promise((resolve) => setTimeout(resolve, 100));
     }
 
     logger.info({ synced, failed }, "Job sync completed");

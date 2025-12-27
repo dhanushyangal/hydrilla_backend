@@ -12,21 +12,7 @@ import { normalizeGlbUrl, normalizePreviewUrl } from "../utils/s3Urls.js";
 
 export const threeDRouter = Router();
 
-// Global CORS middleware for all routes in this router
-threeDRouter.use((req, res, next) => {
-  // Set CORS headers for all requests
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
-  
-  // Handle preflight requests
-  if (req.method === "OPTIONS") {
-    res.sendStatus(200);
-    return;
-  }
-  
-  next();
-});
+// Note: CORS is handled globally in server.ts, no need to duplicate here
 
 // Configure multer for file uploads
 // In Vercel/serverless, use /tmp which is writable, otherwise use local uploads directory
@@ -358,7 +344,14 @@ threeDRouter.get("/status/:jobId", optionalAuth, async (req, res) => {
     }
 
     job.status = status;
-    res.json({ job });
+    
+    // Include queue info from Python API for accurate time estimation
+    const response_data: any = { job };
+    if (apiJob.queue) {
+      response_data.queue = apiJob.queue;
+    }
+    
+    res.json(response_data);
   } catch (err: any) {
     logger.error(err, "failed to query job");
     res.status(500).json({ error: err.message || "Failed to query job" });
@@ -411,6 +404,59 @@ threeDRouter.get("/result/:jobId", optionalAuth, async (req, res) => {
     res.json({ job });
   } catch (err: any) {
     res.status(500).json({ error: err.message || "Failed to fetch result" });
+  }
+});
+
+// ============================================
+// Get Queue Info (for accurate time estimation)
+// ============================================
+threeDRouter.get("/queue/info", async (_req, res) => {
+  try {
+    // Fetch queue info from Python API
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 5000);
+    
+    const response = await fetch(`${API_BASE}/queue/info`, {
+      signal: controller.signal,
+    });
+    
+    clearTimeout(timeoutId);
+    
+    if (response.ok) {
+      const queueInfo = await response.json();
+      return res.json(queueInfo);
+    } else {
+      // Return default values if queue endpoint not available
+      return res.json({
+        queue_length: 0,
+        currently_processing: false,
+        waiting_jobs: 0,
+        estimated_wait_for_new_job_seconds: 130,
+        estimated_time_per_job_seconds: 130,
+        // Preview queue defaults
+        preview_queue_length: 0,
+        currently_generating_preview: false,
+        preview_waiting: 0,
+        estimated_wait_for_preview_seconds: 0,
+        estimated_preview_time_seconds: 20
+      });
+    }
+  } catch (err: any) {
+    logger.warn({ err: err.message }, "Failed to fetch queue info from Python API");
+    // Return default values on error
+    return res.json({
+      queue_length: 0,
+      currently_processing: false,
+      waiting_jobs: 0,
+      estimated_wait_for_new_job_seconds: 130,
+      estimated_time_per_job_seconds: 130,
+      // Preview queue defaults
+      preview_queue_length: 0,
+      currently_generating_preview: false,
+      preview_waiting: 0,
+      estimated_wait_for_preview_seconds: 0,
+      estimated_preview_time_seconds: 20
+    });
   }
 });
 
