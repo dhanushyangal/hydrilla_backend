@@ -11,6 +11,7 @@ export async function createJob(params: {
   faceCount?: number | null;
   enablePBR?: boolean;
   polygonType?: PolygonType | null;
+  status?: JobStatus;  // Optional initial status (defaults to "WAIT")
 }) {
   const {
     id,
@@ -21,13 +22,14 @@ export async function createJob(params: {
     faceCount = null,
     enablePBR = true,
     polygonType = null,
+    status = "WAIT",
   } = params;
 
   try {
     const { error } = await supabase.from("jobs").insert({
       id,
       user_id: userId,
-      status: "WAIT",
+      status: status,
       prompt,
       image_url: imageUrl,
       generate_type: generateType,
@@ -64,23 +66,15 @@ export async function updateJobStatus(jobId: string, data: { status: JobStatus; 
 }
 
 export async function updateJobResult(jobId: string, data: { resultGlbUrl?: string | null; previewImageUrl?: string | null }) {
-  // Only update fields that are provided (not null/undefined)
-  const updateData: any = {
-    updated_at: new Date().toISOString(),
-  };
-  
-  if (data.resultGlbUrl !== undefined && data.resultGlbUrl !== null) {
-    updateData.result_glb_url = data.resultGlbUrl;
-  }
-  
-  if (data.previewImageUrl !== undefined && data.previewImageUrl !== null) {
-    updateData.preview_image_url = data.previewImageUrl;
-  }
-  
+  const { resultGlbUrl = null, previewImageUrl = null } = data;
   try {
     const { error } = await supabase
       .from("jobs")
-      .update(updateData)
+      .update({
+        result_glb_url: resultGlbUrl,
+        preview_image_url: previewImageUrl,
+        updated_at: new Date().toISOString(),
+      })
       .eq("id", jobId);
 
     if (error) throw error;

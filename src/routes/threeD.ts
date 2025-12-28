@@ -9,6 +9,7 @@ import { supabase } from "../db.js";
 import { createJob, getJob, listJobs, listJobsForUser, updateJobResult, updateJobStatus, updateJobName, deleteJob, getJobForUser } from "../repository/jobs.js";
 import { optionalAuth, requireAuth, syncUserToDatabase } from "../middleware/auth.js";
 import { normalizeGlbUrl, normalizePreviewUrl } from "../utils/s3Urls.js";
+import { JobStatus } from "../types.js";
 
 export const threeDRouter = Router();
 
@@ -238,7 +239,8 @@ threeDRouter.get("/status/:jobId", optionalAuth, async (req, res) => {
     let job = await getJob(jobId);
 
     // If job exists and is completed, return it immediately (no need to check external API)
-    if (job && (job.status === "DONE" || job.status === "FAIL")) {
+    // Also return immediately for preview-only jobs (they don't exist in Python API)
+    if (job && (job.status === "DONE" || job.status === "FAIL" || (job.previewImageUrl && !job.resultGlbUrl))) {
       // Check ownership
       if (userId && job.userId && job.userId !== userId) {
         return res.status(403).json({ error: "You don't have permission to view this job" });
@@ -337,27 +339,15 @@ threeDRouter.get("/status/:jobId", optionalAuth, async (req, res) => {
       const apiPreviewUrl = apiJob.result.processed_image_url || apiJob.result.generated_image_url || apiJob.result.processed_image || apiJob.result.generated_image;
       
       // Use direct S3 URLs (public bucket, no expiration)
-      const glbUrl = apiGlbUrl ? normalizeGlbUrl(jobId, apiGlbUrl) : null;
-      const previewUrl = apiPreviewUrl ? normalizePreviewUrl(jobId, apiPreviewUrl) : null;
+      const glbUrl = normalizeGlbUrl(jobId, apiGlbUrl);
+      const previewUrl = normalizePreviewUrl(jobId, apiPreviewUrl);
       
-      // Update only the fields that are provided
-      // Preserve existing preview if 3D is being added to a preview job
-      const updateData: { resultGlbUrl?: string | null; previewImageUrl?: string | null } = {};
-      
-      if (glbUrl) {
-        updateData.resultGlbUrl = glbUrl;
-      }
-      
-      // Only update preview if it's not already set or if new one is provided
-      if (previewUrl && (!job.previewImageUrl || job.previewImageUrl !== previewUrl)) {
-        updateData.previewImageUrl = previewUrl;
-      }
-      
-      if (Object.keys(updateData).length > 0) {
-        await updateJobResult(jobId, updateData);
-        if (glbUrl) job.resultGlbUrl = glbUrl;
-        if (previewUrl) job.previewImageUrl = previewUrl;
-      }
+      await updateJobResult(jobId, {
+        resultGlbUrl: glbUrl,
+        previewImageUrl: previewUrl,
+      });
+      job.resultGlbUrl = glbUrl;
+      job.previewImageUrl = previewUrl;
     }
 
     if (apiJob.status === "failed" || apiJob.status === "cancelled") {
@@ -410,26 +400,16 @@ threeDRouter.get("/result/:jobId", optionalAuth, async (req, res) => {
           const apiPreviewUrl = apiJob.result.processed_image_url || apiJob.result.generated_image_url || apiJob.result.processed_image || apiJob.result.generated_image;
           
           // Use direct S3 URLs (public bucket, no expiration)
-          const glbUrl = apiGlbUrl ? normalizeGlbUrl(jobId, apiGlbUrl) : null;
-          const previewUrl = apiPreviewUrl ? normalizePreviewUrl(jobId, apiPreviewUrl) : null;
+          const glbUrl = normalizeGlbUrl(jobId, apiGlbUrl);
+          const previewUrl = normalizePreviewUrl(jobId, apiPreviewUrl);
           
-          // Update only the fields that are provided
-          // Preserve existing preview if 3D is being added to a preview job
-          const updateData: { resultGlbUrl?: string | null; previewImageUrl?: string | null } = {};
-          
-          if (glbUrl) {
-            updateData.resultGlbUrl = glbUrl;
-          }
-          
-          // Only update preview if it's not already set or if new one is provided
-          if (previewUrl && (!job.previewImageUrl || job.previewImageUrl !== previewUrl)) {
-            updateData.previewImageUrl = previewUrl;
-          }
-          
-          if (Object.keys(updateData).length > 0) {
-            await updateJobResult(jobId, updateData);
-            if (glbUrl) job.resultGlbUrl = glbUrl;
-            if (previewUrl) job.previewImageUrl = previewUrl;
+          if (glbUrl || previewUrl) {
+            await updateJobResult(jobId, {
+              resultGlbUrl: glbUrl,
+              previewImageUrl: previewUrl,
+            });
+            job.resultGlbUrl = glbUrl;
+            job.previewImageUrl = previewUrl;
           }
         }
       }
@@ -621,6 +601,11 @@ threeDRouter.post("/register-job", optionalAuth, async (req, res) => {
 
     const existingJob = await getJob(job_id);
     if (existingJob) {
+      // Check ownership - don't allow updating jobs owned by other users
+      if (existingJob.userId && userId && existingJob.userId !== userId) {
+        return res.status(403).json({ error: "You don't have permission to update this job" });
+      }
+      
       // Update user_id if job exists but has no owner and we have a userId
       if (!existingJob.userId && userId) {
         try {
@@ -637,11 +622,19 @@ threeDRouter.post("/register-job", optionalAuth, async (req, res) => {
       // Update preview image if provided
       if (previewImageUrl) {
         await updateJobResult(job_id, { previewImageUrl });
+        // If preview is provided and job doesn't have 3D result, set status to DONE
+        if (!existingJob.resultGlbUrl) {
+          await updateJobStatus(job_id, { status: "DONE" });
+        }
       }
       
       return res.json({ success: true, job_id, message: "Job already exists" });
     }
 
+    // If previewImageUrl is provided, this is a preview-only job (image already generated)
+    // Set status to DONE since the preview is complete
+    const initialStatus: JobStatus = previewImageUrl ? "DONE" : "WAIT";
+    
     await createJob({
       id: job_id,
       userId: userId || null,
@@ -651,6 +644,7 @@ threeDRouter.post("/register-job", optionalAuth, async (req, res) => {
       faceCount: null,
       enablePBR: true,
       polygonType: null,
+      status: initialStatus,
     });
     
     // Update preview image if provided
@@ -714,25 +708,13 @@ threeDRouter.post("/webhook/job-update", async (req, res) => {
       const apiPreviewUrl = result.processed_image_url || result.generated_image_url || result.processed_image || result.generated_image;
       
       // Use direct S3 URLs (public bucket, no expiration)
-      const glbUrl = apiGlbUrl ? normalizeGlbUrl(job_id, apiGlbUrl) : null;
-      const previewUrl = apiPreviewUrl ? normalizePreviewUrl(job_id, apiPreviewUrl) : null;
+      const glbUrl = normalizeGlbUrl(job_id, apiGlbUrl);
+      const previewUrl = normalizePreviewUrl(job_id, apiPreviewUrl);
       
-      // Update only the fields that are provided
-      // Preserve existing preview if 3D is being added to a preview job
-      const updateData: { resultGlbUrl?: string | null; previewImageUrl?: string | null } = {};
-      
-      if (glbUrl) {
-        updateData.resultGlbUrl = glbUrl;
-      }
-      
-      // Only update preview if it's not already set or if new one is provided
-      if (previewUrl) {
-        updateData.previewImageUrl = previewUrl;
-      }
-      
-      if (Object.keys(updateData).length > 0) {
-        await updateJobResult(job_id, updateData);
-      }
+      await updateJobResult(job_id, {
+        resultGlbUrl: glbUrl,
+        previewImageUrl: previewUrl,
+      });
     }
 
     res.json({ success: true, job_id });

@@ -28,6 +28,20 @@ function convertStatus(apiStatus: string): JobStatus {
  */
 export async function syncJobFromApi(jobId: string): Promise<boolean> {
   try {
+    // Get job from database first
+    const dbJob = await getJob(jobId);
+    if (!dbJob) {
+      logger.debug({ jobId }, "Job not found in database, skipping sync");
+      return false;
+    }
+    
+    // Skip syncing preview-only jobs (jobs with preview but no 3D result)
+    // These jobs don't exist in Python API, they're only in our database
+    if (dbJob.previewImageUrl && !dbJob.resultGlbUrl && dbJob.status === "DONE") {
+      logger.debug({ jobId }, "Preview-only job, skipping API sync");
+      return true; // Return true since job is already in correct state
+    }
+    
     // Fetch from API with timeout
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), 10000); // 10 second timeout
@@ -41,6 +55,11 @@ export async function syncJobFromApi(jobId: string): Promise<boolean> {
       
       if (!response.ok) {
         if (response.status === 404) {
+          // If job not found in API but is a preview-only job, that's OK
+          if (dbJob.previewImageUrl && !dbJob.resultGlbUrl) {
+            logger.debug({ jobId }, "Preview-only job not in API (expected)");
+            return true;
+          }
           logger.debug({ jobId }, "Job not found in API");
           return false;
         }
@@ -50,19 +69,16 @@ export async function syncJobFromApi(jobId: string): Promise<boolean> {
       clearTimeout(timeoutId);
       if (fetchErr.name === "AbortError") {
         logger.warn({ jobId }, "API request timeout");
+        // For preview-only jobs, timeout is OK
+        if (dbJob.previewImageUrl && !dbJob.resultGlbUrl && dbJob.status === "DONE") {
+          return true;
+        }
         return false;
       }
       throw fetchErr;
     }
 
     const apiJob = await response.json();
-
-    // Get job from database
-    const dbJob = await getJob(jobId);
-    if (!dbJob) {
-      logger.debug({ jobId }, "Job not found in database, skipping sync");
-      return false;
-    }
 
     // Convert API status to database status
     const dbStatus = convertStatus(apiJob.status);
@@ -87,26 +103,16 @@ export async function syncJobFromApi(jobId: string): Promise<boolean> {
         apiJob.result.generated_image;
 
       // Use direct S3 URLs (public bucket, no expiration)
-      const glbUrl = apiGlbUrl ? normalizeGlbUrl(jobId, apiGlbUrl) : null;
-      const previewUrl = apiPreviewUrl ? normalizePreviewUrl(jobId, apiPreviewUrl) : null;
+      const glbUrl = normalizeGlbUrl(jobId, apiGlbUrl);
+      const previewUrl = normalizePreviewUrl(jobId, apiPreviewUrl);
 
-      // Update only the fields that are provided
-      // If job already has preview, don't overwrite it unless new one is provided
-      const updateData: { resultGlbUrl?: string | null; previewImageUrl?: string | null } = {};
-      
-      if (glbUrl && dbJob.resultGlbUrl !== glbUrl) {
-        updateData.resultGlbUrl = glbUrl;
-      }
-      
-      // Only update preview if it's not already set or if new one is provided
-      if (previewUrl && (!dbJob.previewImageUrl || dbJob.previewImageUrl !== previewUrl)) {
-        updateData.previewImageUrl = previewUrl;
-      }
-      
-      // Only update if there are changes
-      if (Object.keys(updateData).length > 0) {
-        await updateJobResult(jobId, updateData);
-        logger.info({ jobId, ...updateData }, "Job result updated");
+      // Only update if URLs are different
+      if (dbJob.resultGlbUrl !== glbUrl || dbJob.previewImageUrl !== previewUrl) {
+        await updateJobResult(jobId, {
+          resultGlbUrl: glbUrl,
+          previewImageUrl: previewUrl,
+        });
+        logger.info({ jobId, glbUrl, previewUrl }, "Job result updated");
       }
     }
 
@@ -124,7 +130,11 @@ export async function syncAllJobs(): Promise<{ synced: number; failed: number }>
   try {
     // Get all jobs that are still processing
     const jobs = await listJobs(1000); // Get up to 1000 jobs
-    const activeJobs = jobs.filter((job) => job.status === "WAIT" || job.status === "RUN");
+    // Filter out preview-only jobs (they don't exist in Python API)
+    const activeJobs = jobs.filter((job) => 
+      (job.status === "WAIT" || job.status === "RUN") && 
+      !(job.previewImageUrl && !job.resultGlbUrl) // Exclude preview-only jobs
+    );
 
     if (activeJobs.length === 0) {
       return { synced: 0, failed: 0 };
