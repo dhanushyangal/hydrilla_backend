@@ -6,7 +6,7 @@ import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
 import { logger } from "../logger.js";
 import { config } from "../config.js";
 import { supabase } from "../db.js";
-import { createJob, getJob, listJobs, listJobsForUser, updateJobResult, updateJobStatus, deleteJob, getJobForUser } from "../repository/jobs.js";
+import { createJob, getJob, listJobs, listJobsForUser, updateJobResult, updateJobStatus, updateJobName, deleteJob, getJobForUser } from "../repository/jobs.js";
 import { optionalAuth, requireAuth, syncUserToDatabase } from "../middleware/auth.js";
 import { normalizeGlbUrl, normalizePreviewUrl } from "../utils/s3Urls.js";
 
@@ -337,15 +337,27 @@ threeDRouter.get("/status/:jobId", optionalAuth, async (req, res) => {
       const apiPreviewUrl = apiJob.result.processed_image_url || apiJob.result.generated_image_url || apiJob.result.processed_image || apiJob.result.generated_image;
       
       // Use direct S3 URLs (public bucket, no expiration)
-      const glbUrl = normalizeGlbUrl(jobId, apiGlbUrl);
-      const previewUrl = normalizePreviewUrl(jobId, apiPreviewUrl);
+      const glbUrl = apiGlbUrl ? normalizeGlbUrl(jobId, apiGlbUrl) : null;
+      const previewUrl = apiPreviewUrl ? normalizePreviewUrl(jobId, apiPreviewUrl) : null;
       
-      await updateJobResult(jobId, {
-        resultGlbUrl: glbUrl,
-        previewImageUrl: previewUrl,
-      });
-      job.resultGlbUrl = glbUrl;
-      job.previewImageUrl = previewUrl;
+      // Update only the fields that are provided
+      // Preserve existing preview if 3D is being added to a preview job
+      const updateData: { resultGlbUrl?: string | null; previewImageUrl?: string | null } = {};
+      
+      if (glbUrl) {
+        updateData.resultGlbUrl = glbUrl;
+      }
+      
+      // Only update preview if it's not already set or if new one is provided
+      if (previewUrl && (!job.previewImageUrl || job.previewImageUrl !== previewUrl)) {
+        updateData.previewImageUrl = previewUrl;
+      }
+      
+      if (Object.keys(updateData).length > 0) {
+        await updateJobResult(jobId, updateData);
+        if (glbUrl) job.resultGlbUrl = glbUrl;
+        if (previewUrl) job.previewImageUrl = previewUrl;
+      }
     }
 
     if (apiJob.status === "failed" || apiJob.status === "cancelled") {
@@ -398,16 +410,26 @@ threeDRouter.get("/result/:jobId", optionalAuth, async (req, res) => {
           const apiPreviewUrl = apiJob.result.processed_image_url || apiJob.result.generated_image_url || apiJob.result.processed_image || apiJob.result.generated_image;
           
           // Use direct S3 URLs (public bucket, no expiration)
-          const glbUrl = normalizeGlbUrl(jobId, apiGlbUrl);
-          const previewUrl = normalizePreviewUrl(jobId, apiPreviewUrl);
+          const glbUrl = apiGlbUrl ? normalizeGlbUrl(jobId, apiGlbUrl) : null;
+          const previewUrl = apiPreviewUrl ? normalizePreviewUrl(jobId, apiPreviewUrl) : null;
           
-          if (glbUrl || previewUrl) {
-            await updateJobResult(jobId, {
-              resultGlbUrl: glbUrl,
-              previewImageUrl: previewUrl,
-            });
-            job.resultGlbUrl = glbUrl;
-            job.previewImageUrl = previewUrl;
+          // Update only the fields that are provided
+          // Preserve existing preview if 3D is being added to a preview job
+          const updateData: { resultGlbUrl?: string | null; previewImageUrl?: string | null } = {};
+          
+          if (glbUrl) {
+            updateData.resultGlbUrl = glbUrl;
+          }
+          
+          // Only update preview if it's not already set or if new one is provided
+          if (previewUrl && (!job.previewImageUrl || job.previewImageUrl !== previewUrl)) {
+            updateData.previewImageUrl = previewUrl;
+          }
+          
+          if (Object.keys(updateData).length > 0) {
+            await updateJobResult(jobId, updateData);
+            if (glbUrl) job.resultGlbUrl = glbUrl;
+            if (previewUrl) job.previewImageUrl = previewUrl;
           }
         }
       }
@@ -515,6 +537,37 @@ threeDRouter.get("/history", optionalAuth, async (req, res) => {
 });
 
 // ============================================
+// Update Job Name (requires auth)
+// ============================================
+threeDRouter.patch("/jobs/:jobId/name", requireAuth, async (req, res) => {
+  const { jobId } = req.params;
+  const userId = req.userId!;
+  const { name } = req.body as { name?: string };
+
+  try {
+    if (!name || typeof name !== "string") {
+      return res.status(400).json({ error: "Name is required and must be a string" });
+    }
+
+    const job = await getJob(jobId);
+    if (!job) {
+      return res.status(404).json({ error: "Job not found" });
+    }
+
+    // Check ownership
+    if (job.userId && job.userId !== userId) {
+      return res.status(403).json({ error: "You don't have permission to update this job" });
+    }
+
+    await updateJobName(jobId, name.trim(), userId);
+    res.json({ success: true, message: "Job name updated" });
+  } catch (err: any) {
+    logger.error(err, "failed to update job name");
+    res.status(500).json({ error: err.message || "Failed to update job name" });
+  }
+});
+
+// ============================================
 // Delete a Job (requires auth)
 // ============================================
 threeDRouter.delete("/jobs/:jobId", requireAuth, async (req, res) => {
@@ -545,10 +598,11 @@ threeDRouter.delete("/jobs/:jobId", requireAuth, async (req, res) => {
 // ============================================
 threeDRouter.post("/register-job", optionalAuth, async (req, res) => {
   try {
-    const { job_id, prompt, imageUrl } = req.body as {
+    const { job_id, prompt, imageUrl, previewImageUrl } = req.body as {
       job_id: string;
       prompt?: string;
       imageUrl?: string;
+      previewImageUrl?: string;
     };
     const userId = req.userId;
 
@@ -579,6 +633,12 @@ threeDRouter.post("/register-job", optionalAuth, async (req, res) => {
           logger.warn({ err: updateErr }, "Failed to update job with user_id");
         }
       }
+      
+      // Update preview image if provided
+      if (previewImageUrl) {
+        await updateJobResult(job_id, { previewImageUrl });
+      }
+      
       return res.json({ success: true, job_id, message: "Job already exists" });
     }
 
@@ -592,6 +652,11 @@ threeDRouter.post("/register-job", optionalAuth, async (req, res) => {
       enablePBR: true,
       polygonType: null,
     });
+    
+    // Update preview image if provided
+    if (previewImageUrl) {
+      await updateJobResult(job_id, { previewImageUrl });
+    }
 
     logger.info({ jobId: job_id, userId, prompt: prompt?.slice(0, 50) }, "Job registered successfully");
     res.json({ success: true, job_id });
@@ -649,13 +714,25 @@ threeDRouter.post("/webhook/job-update", async (req, res) => {
       const apiPreviewUrl = result.processed_image_url || result.generated_image_url || result.processed_image || result.generated_image;
       
       // Use direct S3 URLs (public bucket, no expiration)
-      const glbUrl = normalizeGlbUrl(job_id, apiGlbUrl);
-      const previewUrl = normalizePreviewUrl(job_id, apiPreviewUrl);
+      const glbUrl = apiGlbUrl ? normalizeGlbUrl(job_id, apiGlbUrl) : null;
+      const previewUrl = apiPreviewUrl ? normalizePreviewUrl(job_id, apiPreviewUrl) : null;
       
-      await updateJobResult(job_id, {
-        resultGlbUrl: glbUrl,
-        previewImageUrl: previewUrl,
-      });
+      // Update only the fields that are provided
+      // Preserve existing preview if 3D is being added to a preview job
+      const updateData: { resultGlbUrl?: string | null; previewImageUrl?: string | null } = {};
+      
+      if (glbUrl) {
+        updateData.resultGlbUrl = glbUrl;
+      }
+      
+      // Only update preview if it's not already set or if new one is provided
+      if (previewUrl) {
+        updateData.previewImageUrl = previewUrl;
+      }
+      
+      if (Object.keys(updateData).length > 0) {
+        await updateJobResult(job_id, updateData);
+      }
     }
 
     res.json({ success: true, job_id });

@@ -87,16 +87,26 @@ export async function syncJobFromApi(jobId: string): Promise<boolean> {
         apiJob.result.generated_image;
 
       // Use direct S3 URLs (public bucket, no expiration)
-      const glbUrl = normalizeGlbUrl(jobId, apiGlbUrl);
-      const previewUrl = normalizePreviewUrl(jobId, apiPreviewUrl);
+      const glbUrl = apiGlbUrl ? normalizeGlbUrl(jobId, apiGlbUrl) : null;
+      const previewUrl = apiPreviewUrl ? normalizePreviewUrl(jobId, apiPreviewUrl) : null;
 
-      // Only update if URLs are different
-      if (dbJob.resultGlbUrl !== glbUrl || dbJob.previewImageUrl !== previewUrl) {
-        await updateJobResult(jobId, {
-          resultGlbUrl: glbUrl,
-          previewImageUrl: previewUrl,
-        });
-        logger.info({ jobId, glbUrl, previewUrl }, "Job result updated");
+      // Update only the fields that are provided
+      // If job already has preview, don't overwrite it unless new one is provided
+      const updateData: { resultGlbUrl?: string | null; previewImageUrl?: string | null } = {};
+      
+      if (glbUrl && dbJob.resultGlbUrl !== glbUrl) {
+        updateData.resultGlbUrl = glbUrl;
+      }
+      
+      // Only update preview if it's not already set or if new one is provided
+      if (previewUrl && (!dbJob.previewImageUrl || dbJob.previewImageUrl !== previewUrl)) {
+        updateData.previewImageUrl = previewUrl;
+      }
+      
+      // Only update if there are changes
+      if (Object.keys(updateData).length > 0) {
+        await updateJobResult(jobId, updateData);
+        logger.info({ jobId, ...updateData }, "Job result updated");
       }
     }
 

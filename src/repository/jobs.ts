@@ -64,20 +64,54 @@ export async function updateJobStatus(jobId: string, data: { status: JobStatus; 
 }
 
 export async function updateJobResult(jobId: string, data: { resultGlbUrl?: string | null; previewImageUrl?: string | null }) {
-  const { resultGlbUrl = null, previewImageUrl = null } = data;
+  // Only update fields that are provided (not null/undefined)
+  const updateData: any = {
+    updated_at: new Date().toISOString(),
+  };
+  
+  if (data.resultGlbUrl !== undefined && data.resultGlbUrl !== null) {
+    updateData.result_glb_url = data.resultGlbUrl;
+  }
+  
+  if (data.previewImageUrl !== undefined && data.previewImageUrl !== null) {
+    updateData.preview_image_url = data.previewImageUrl;
+  }
+  
   try {
     const { error } = await supabase
       .from("jobs")
-      .update({
-        result_glb_url: resultGlbUrl,
-        preview_image_url: previewImageUrl,
-        updated_at: new Date().toISOString(),
-      })
+      .update(updateData)
       .eq("id", jobId);
 
     if (error) throw error;
   } catch (err: any) {
     logger.error(err, "Failed to update job result");
+    throw new Error(`Database error: ${err.message}`);
+  }
+}
+
+export async function updateJobName(jobId: string, name: string, userId?: string | null): Promise<void> {
+  try {
+    const updateData: any = {
+      name,
+      updated_at: new Date().toISOString(),
+    };
+
+    // If userId is provided, ensure the job belongs to the user
+    const query = supabase
+      .from("jobs")
+      .update(updateData)
+      .eq("id", jobId);
+
+    if (userId) {
+      query.eq("user_id", userId);
+    }
+
+    const { error } = await query;
+
+    if (error) throw error;
+  } catch (err: any) {
+    logger.error(err, "Failed to update job name");
     throw new Error(`Database error: ${err.message}`);
   }
 }
@@ -217,6 +251,7 @@ function mapRow(row: any): JobRecord {
     previewImageUrl: row.preview_image_url,
     errorCode: row.error_code,
     errorMessage: row.error_message,
+    name: row.name || null,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };

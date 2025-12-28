@@ -29,6 +29,7 @@ export interface JobRecord {
   previewImageUrl: string | null;
   errorCode: string | null;
   errorMessage: string | null;
+  name: string | null;
   createdAt: Date;
   updatedAt: Date;
 }
