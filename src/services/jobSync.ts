@@ -67,25 +67,12 @@ export async function syncJobFromApi(jobId: string): Promise<boolean> {
       }
     } catch (fetchErr: any) {
       clearTimeout(timeoutId);
-      if (fetchErr.name === "AbortError" || fetchErr.message?.includes('timeout') || fetchErr.message?.includes('ECONNREFUSED') || fetchErr.message?.includes('fetch failed')) {
-        logger.warn({ jobId, err: fetchErr.message }, "API request timeout or unreachable");
-        
+      if (fetchErr.name === "AbortError") {
+        logger.warn({ jobId }, "API request timeout");
         // For preview-only jobs, timeout is OK
         if (dbJob.previewImageUrl && !dbJob.resultGlbUrl && dbJob.status === "DONE") {
           return true;
         }
-        
-        // If job is currently processing (WAIT or RUN) and API is unreachable, mark as failed
-        if (dbJob.status === "WAIT" || dbJob.status === "RUN") {
-          logger.warn({ jobId, status: dbJob.status }, "Marking job as failed due to GPU/API unavailability");
-          await updateJobStatus(jobId, {
-            status: "FAIL",
-            errorCode: "GPU_UNAVAILABLE",
-            errorMessage: "GPU service is currently offline. The job could not be completed.",
-          });
-          return true; // Return true since we successfully updated the status
-        }
-        
         return false;
       }
       throw fetchErr;

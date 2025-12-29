@@ -23,7 +23,7 @@ export const config = {
   pollIntervalMs: parseInt(process.env.POLL_INTERVAL_MS || "5000", 10),
   email: {
     url: process.env.ZEPTOMAIL_API_URL || "https://api.zeptomail.in/v1.1/email",
-    token: process.env.ZEPTOMAIL_TOKEN || "",
+    token: process.env.ZEPTOMAIL_TOKEN || "Zoho-enczapikey PHtE6r0LFLy5jW4poREJ7PbrEZPxMtwn9O02K1RPstxDWaVWGk1Vq9p+kmKzrxkqUaNBHfPIzolquO+e5e2CIm/rNz5ODmqyqK3sx/VYSPOZsbq6x00VtF8cd0bbVIToddZj3CPevdrZNA==",
     fromAddress: process.env.ZEPTOMAIL_FROM_ADDRESS || "noreply@hydrilla.co",
     fromName: process.env.ZEPTOMAIL_FROM_NAME || "Hydrilla",
     frontendUrl: process.env.FRONTEND_URL || "https://hydrilla.co",
