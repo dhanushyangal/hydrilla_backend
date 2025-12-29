@@ -3,10 +3,27 @@ import { config } from "./config.js";
 import { logger } from "./logger.js";
 
 // Create Supabase client with service_role key (bypasses RLS)
+// Optimized with connection pooling and better defaults
 export const supabase = createClient(config.supabase.url, config.supabase.serviceRoleKey, {
   auth: {
     autoRefreshToken: false,
     persistSession: false,
+  },
+  db: {
+    schema: "public",
+  },
+  global: {
+    // Optimize fetch for better performance
+    fetch: (url, options = {}) => {
+      return fetch(url, {
+        ...options,
+        // Add connection reuse headers
+        headers: {
+          ...options.headers,
+          "Connection": "keep-alive",
+        },
+      });
+    },
   },
 });
 

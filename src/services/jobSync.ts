@@ -42,14 +42,21 @@ export async function syncJobFromApi(jobId: string): Promise<boolean> {
       return true; // Return true since job is already in correct state
     }
     
-    // Fetch from API with timeout
+    // Fetch from API with timeout and connection reuse
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 10000); // 10 second timeout
+    const timeoutId = setTimeout(() => controller.abort(), 8000); // Reduced to 8 seconds for faster failure
     
     let response: Response;
     try {
       response = await fetch(`${API_BASE}/status/${jobId}`, {
         signal: controller.signal,
+        // Optimize fetch for better performance
+        headers: {
+          "Connection": "keep-alive",
+          "Accept": "application/json",
+        },
+        // Add cache control for better connection reuse
+        cache: "no-store",
       });
       clearTimeout(timeoutId);
       
@@ -106,13 +113,41 @@ export async function syncJobFromApi(jobId: string): Promise<boolean> {
       const glbUrl = normalizeGlbUrl(jobId, apiGlbUrl);
       const previewUrl = normalizePreviewUrl(jobId, apiPreviewUrl);
 
-      // Only update if URLs are different
+      // Only update if URLs are different (optimize database writes)
       if (dbJob.resultGlbUrl !== glbUrl || dbJob.previewImageUrl !== previewUrl) {
+        const hadGlbUrlBefore = !!dbJob.resultGlbUrl;
+        
+        // Batch database update
         await updateJobResult(jobId, {
           resultGlbUrl: glbUrl,
           previewImageUrl: previewUrl,
         });
         logger.info({ jobId, glbUrl, previewUrl }, "Job result updated");
+        
+        // Send completion email if this is the first time we're getting the GLB URL
+        // and the job has a user (not anonymous)
+        // Use setImmediate to avoid blocking the sync process
+        if (!hadGlbUrlBefore && glbUrl && dbJob.userId) {
+          setImmediate(() => {
+            // Import email service here to avoid circular dependency
+            import("./email.js")
+              .then(({ sendCompletionEmailForJob }) => {
+                sendCompletionEmailForJob(
+                  jobId,
+                  dbJob.userId!,
+                  dbJob.name || null,
+                  glbUrl,
+                  previewUrl
+                ).catch((err) => {
+                  // Log error but don't fail job completion
+                  logger.error({ err: err.message, jobId }, "Failed to send completion email (non-critical)");
+                });
+              })
+              .catch((err) => {
+                logger.error({ err: err.message, jobId }, "Failed to import email service");
+              });
+          });
+        }
       }
     }
 
@@ -146,8 +181,9 @@ export async function syncAllJobs(): Promise<{ synced: number; failed: number }>
     let failed = 0;
 
     // Sync jobs in parallel batches to improve performance
-    const BATCH_SIZE = 10;
-    const BATCH_DELAY_MS = 200;
+    // Increased batch size for better throughput
+    const BATCH_SIZE = 20; // Increased from 10
+    const BATCH_DELAY_MS = 100; // Reduced from 200ms
     
     for (let i = 0; i < activeJobs.length; i += BATCH_SIZE) {
       const batch = activeJobs.slice(i, i + BATCH_SIZE);
@@ -164,6 +200,7 @@ export async function syncAllJobs(): Promise<{ synced: number; failed: number }>
       });
       
       // Small delay between batches to avoid overwhelming the API
+      // Only delay if there are more batches to process
       if (i + BATCH_SIZE < activeJobs.length) {
         await new Promise((resolve) => setTimeout(resolve, BATCH_DELAY_MS));
       }

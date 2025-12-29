@@ -178,6 +178,29 @@ export async function syncUserToDatabase(userId: string) {
         return null;
       }
       logger.info({ userId, email: userData.email }, "New user created in database");
+      
+      // Send welcome email to new user (non-blocking)
+      // Use setImmediate to avoid blocking user sync
+      if (userData.email) {
+        setImmediate(() => {
+          // Import email service here to avoid circular dependency
+          import("../services/email.js")
+            .then(({ sendWelcomeEmail }) => {
+              sendWelcomeEmail(
+                userData.email!,
+                userData.first_name || userData.last_name
+                  ? `${userData.first_name || ""} ${userData.last_name || ""}`.trim()
+                  : null
+              ).catch((err) => {
+                // Log error but don't fail user creation
+                logger.error({ err: err.message, userId }, "Failed to send welcome email (non-critical)");
+              });
+            })
+            .catch((err) => {
+              logger.error({ err: err.message, userId }, "Failed to import email service");
+            });
+        });
+      }
     }
 
     return userData;

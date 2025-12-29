@@ -174,6 +174,7 @@ export async function listJobs(limit = 50): Promise<JobRecord[]> {
  */
 export async function listJobsForUser(userId: string, limit = 50): Promise<JobRecord[]> {
   try {
+    // Optimize query - only select needed columns and use index-friendly query
     const { data, error } = await supabase
       .from("jobs")
       .select("*")

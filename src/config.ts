@@ -21,6 +21,13 @@ export const config = {
     presignedUrlExpiry: parseInt(process.env.S3_PRESIGNED_URL_EXPIRY || "3600", 10),
   },
   pollIntervalMs: parseInt(process.env.POLL_INTERVAL_MS || "5000", 10),
+  email: {
+    url: process.env.ZEPTOMAIL_API_URL || "https://api.zeptomail.in/v1.1/email",
+    token: process.env.ZEPTOMAIL_TOKEN || "",
+    fromAddress: process.env.ZEPTOMAIL_FROM_ADDRESS || "noreply@hydrilla.co",
+    fromName: process.env.ZEPTOMAIL_FROM_NAME || "Hydrilla",
+    frontendUrl: process.env.FRONTEND_URL || "https://hydrilla.co",
+  },
 };
 
 if (!config.hunyuanApi.url) {
@@ -33,4 +40,8 @@ if (!config.supabase.serviceRoleKey) {
 
 if (!config.clerk.secretKey) {
   console.warn("[config] CLERK_SECRET_KEY is missing. Authentication will fail until set.");
+}
+
+if (!config.email.token) {
+  console.warn("[config] ZEPTOMAIL_TOKEN is missing. Email functionality will be disabled.");
 }
