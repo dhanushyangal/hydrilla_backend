@@ -577,12 +577,18 @@ threeDRouter.get("/glb/:jobId", optionalAuth, async (req, res) => {
           
           const s3Response = await s3Client.send(command);
           
+          // Get content length for progress tracking
+          const contentLength = s3Response.ContentLength || s3Response.ContentLength || 0;
+          
           // Set CORS headers
           res.setHeader("Access-Control-Allow-Origin", "*");
           res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
           res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
           res.setHeader("Content-Type", "model/gltf-binary");
           res.setHeader("Content-Disposition", `inline; filename="mesh.glb"`);
+          if (contentLength > 0) {
+            res.setHeader("Content-Length", contentLength.toString());
+          }
           
           // Stream the file
           if (s3Response.Body) {
@@ -621,12 +627,18 @@ threeDRouter.get("/glb/:jobId", optionalAuth, async (req, res) => {
         return res.status(response.status).json({ error: "Failed to fetch GLB file" });
       }
 
+      // Get content length from response headers
+      const contentLength = response.headers.get("content-length");
+      
       // Set CORS headers
       res.setHeader("Access-Control-Allow-Origin", "*");
       res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
       res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
       res.setHeader("Content-Type", "model/gltf-binary");
       res.setHeader("Content-Disposition", `inline; filename="mesh.glb"`);
+      if (contentLength) {
+        res.setHeader("Content-Length", contentLength);
+      }
 
       // Stream the response
       const buffer = await response.arrayBuffer();
