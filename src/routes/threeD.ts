@@ -245,6 +245,15 @@ threeDRouter.get("/status/:jobId", optionalAuth, async (req, res) => {
       if (userId && job.userId && job.userId !== userId) {
         return res.status(403).json({ error: "You don't have permission to view this job" });
       }
+      
+      // Normalize URLs to ensure they're direct S3 URLs (not expired signed URLs)
+      if (job.resultGlbUrl) {
+        job.resultGlbUrl = normalizeGlbUrl(jobId, job.resultGlbUrl);
+      }
+      if (job.previewImageUrl) {
+        job.previewImageUrl = normalizePreviewUrl(jobId, job.previewImageUrl);
+      }
+      
       return res.json({ job });
     }
 
@@ -272,6 +281,15 @@ threeDRouter.get("/status/:jobId", optionalAuth, async (req, res) => {
         if (userId && job.userId && job.userId !== userId) {
           return res.status(403).json({ error: "You don't have permission to view this job" });
         }
+        
+        // Normalize URLs to ensure they're direct S3 URLs (not expired signed URLs)
+        if (job.resultGlbUrl) {
+          job.resultGlbUrl = normalizeGlbUrl(jobId, job.resultGlbUrl);
+        }
+        if (job.previewImageUrl) {
+          job.previewImageUrl = normalizePreviewUrl(jobId, job.previewImageUrl);
+        }
+        
         return res.json({ job });
       }
     } catch (apiErr: any) {
@@ -284,6 +302,15 @@ threeDRouter.get("/status/:jobId", optionalAuth, async (req, res) => {
         if (userId && job.userId && job.userId !== userId) {
           return res.status(403).json({ error: "You don't have permission to view this job" });
         }
+        
+        // Normalize URLs to ensure they're direct S3 URLs (not expired signed URLs)
+        if (job.resultGlbUrl) {
+          job.resultGlbUrl = normalizeGlbUrl(jobId, job.resultGlbUrl);
+        }
+        if (job.previewImageUrl) {
+          job.previewImageUrl = normalizePreviewUrl(jobId, job.previewImageUrl);
+        }
+        
         return res.json({ job });
       }
       
@@ -300,6 +327,15 @@ threeDRouter.get("/status/:jobId", optionalAuth, async (req, res) => {
         if (userId && job.userId && job.userId !== userId) {
           return res.status(403).json({ error: "You don't have permission to view this job" });
         }
+        
+        // Normalize URLs to ensure they're direct S3 URLs (not expired signed URLs)
+        if (job.resultGlbUrl) {
+          job.resultGlbUrl = normalizeGlbUrl(jobId, job.resultGlbUrl);
+        }
+        if (job.previewImageUrl) {
+          job.previewImageUrl = normalizePreviewUrl(jobId, job.previewImageUrl);
+        }
+        
         return res.json({ job });
       }
       return res.status(404).json({ error: "Job not found" });
@@ -361,6 +397,14 @@ threeDRouter.get("/status/:jobId", optionalAuth, async (req, res) => {
 
     job.status = status;
     
+    // Normalize URLs to ensure they're direct S3 URLs (not expired signed URLs)
+    if (job.resultGlbUrl) {
+      job.resultGlbUrl = normalizeGlbUrl(jobId, job.resultGlbUrl);
+    }
+    if (job.previewImageUrl) {
+      job.previewImageUrl = normalizePreviewUrl(jobId, job.previewImageUrl);
+    }
+    
     // Include queue info from Python API for accurate time estimation
     const response_data: any = { job };
     if (apiJob.queue) {
@@ -415,6 +459,14 @@ threeDRouter.get("/result/:jobId", optionalAuth, async (req, res) => {
       }
     } catch (err) {
       logger.error(err, "failed to fetch from API, using cached result");
+    }
+
+    // Normalize URLs to ensure they're direct S3 URLs (not expired signed URLs)
+    if (job.resultGlbUrl) {
+      job.resultGlbUrl = normalizeGlbUrl(jobId, job.resultGlbUrl);
+    }
+    if (job.previewImageUrl) {
+      job.previewImageUrl = normalizePreviewUrl(jobId, job.previewImageUrl);
     }
 
     res.json({ job });
@@ -489,8 +541,17 @@ threeDRouter.get("/history", optionalAuth, async (req, res) => {
       try {
         const jobs = await listJobsForUser(userId, 100);
         
-        // Log first job for debugging
+        // Normalize URLs for all jobs to ensure they're direct S3 URLs (not expired signed URLs)
         if (jobs && jobs.length > 0) {
+          jobs.forEach(job => {
+            if (job.resultGlbUrl) {
+              job.resultGlbUrl = normalizeGlbUrl(job.id, job.resultGlbUrl);
+            }
+            if (job.previewImageUrl) {
+              job.previewImageUrl = normalizePreviewUrl(job.id, job.previewImageUrl);
+            }
+          });
+          
           logger.info({ 
             jobId: jobs[0].id, 
             glbUrl: jobs[0].resultGlbUrl, 
