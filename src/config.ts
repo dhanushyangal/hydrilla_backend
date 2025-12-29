@@ -6,7 +6,7 @@ export const config = {
   port: parseInt(process.env.PORT || "4000", 10),
   supabase: {
     url: process.env.SUPABASE_URL || "https://vyyzepmcqeqoxwjqnrxh.supabase.co",
-    serviceRoleKey: process.env.SUPABASE_SERVICE_ROLE_KEY || "",
+    serviceRoleKey: process.env.SUPABASE_SERVICE_ROLE_KEY || "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InZ5eXplcG1jcWVxb3h3anFucnhoIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc2NTgxNjQ3MSwiZXhwIjoyMDgxMzkyNDcxfQ.C6j9KLUGqd2erlpKJZlyyjDiN6oetytGaD_X-oMqq9A",
   },
   clerk: {
     publishableKey: process.env.NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY || "",

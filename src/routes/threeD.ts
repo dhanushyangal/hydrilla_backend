@@ -158,10 +158,7 @@ threeDRouter.post("/generate", requireAuth, async (req, res) => {
 
       const response = await fetch(`${API_BASE}/text-to-3d`, {
         method: "POST",
-        headers: { 
-          "Content-Type": "application/x-www-form-urlencoded",
-          "Connection": "keep-alive",
-        },
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
         body: formData.toString(),
       });
 
@@ -190,10 +187,7 @@ threeDRouter.post("/generate", requireAuth, async (req, res) => {
 
       const response = await fetch(`${API_BASE}/image-to-3d`, {
         method: "POST",
-        headers: { 
-          "Content-Type": "application/x-www-form-urlencoded",
-          "Connection": "keep-alive",
-        },
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
         body: formData.toString(),
       });
 
@@ -264,11 +258,6 @@ threeDRouter.get("/status/:jobId", optionalAuth, async (req, res) => {
       
       const response = await fetch(`${API_BASE}/status/${jobId}`, {
         signal: controller.signal,
-        headers: {
-          "Connection": "keep-alive",
-          "Accept": "application/json",
-        },
-        cache: "no-store",
       });
       
       clearTimeout(timeoutId);
@@ -403,13 +392,7 @@ threeDRouter.get("/result/:jobId", optionalAuth, async (req, res) => {
 
     // Fetch from API for latest result
     try {
-      const response = await fetch(`${API_BASE}/status/${jobId}`, {
-        headers: {
-          "Connection": "keep-alive",
-          "Accept": "application/json",
-        },
-        cache: "no-store",
-      });
+      const response = await fetch(`${API_BASE}/status/${jobId}`);
       if (response.ok) {
         const apiJob = await response.json();
         if (apiJob.status === "completed" && apiJob.result) {
@@ -451,11 +434,6 @@ threeDRouter.get("/queue/info", async (_req, res) => {
     
     const response = await fetch(`${API_BASE}/queue/info`, {
       signal: controller.signal,
-      headers: {
-        "Connection": "keep-alive",
-        "Accept": "application/json",
-      },
-      cache: "no-store",
     });
     
     clearTimeout(timeoutId);
@@ -743,27 +721,24 @@ threeDRouter.post("/webhook/job-update", async (req, res) => {
       
       // Send completion email if this is the first time we're getting the GLB URL
       // and the job has a user (not anonymous)
-      // Use setImmediate to avoid blocking webhook processing
       if (!hadGlbUrlBefore && glbUrl && job.userId) {
-        setImmediate(() => {
-          // Import email service here to avoid circular dependency
-          import("../services/email.js")
-            .then(({ sendCompletionEmailForJob }) => {
-              sendCompletionEmailForJob(
-                job_id,
-                job.userId!,
-                job.name || null,
-                glbUrl,
-                previewUrl
-              ).catch((err) => {
-                // Log error but don't fail webhook processing
-                logger.error({ err: err.message, job_id }, "Failed to send completion email (non-critical)");
-              });
-            })
-            .catch((err) => {
-              logger.error({ err: err.message, job_id }, "Failed to import email service");
+        // Import email service here to avoid circular dependency
+        import("../services/email.js")
+          .then(({ sendCompletionEmailForJob }) => {
+            sendCompletionEmailForJob(
+              job_id,
+              job.userId,
+              job.name || null,
+              glbUrl,
+              previewUrl
+            ).catch((err) => {
+              // Log error but don't fail webhook processing
+              logger.error({ err: err.message, job_id }, "Failed to send completion email (non-critical)");
             });
-        });
+          })
+          .catch((err) => {
+            logger.error({ err: err.message, job_id }, "Failed to import email service");
+          });
       }
     }
 
@@ -809,13 +784,12 @@ threeDRouter.post("/upload-image", optionalAuth, upload.single("image"), async (
         imageUrl = `https://${config.s3.bucket}.s3.${config.s3.region}.amazonaws.com/${s3Key}`;
         
         // Clean up local file if it exists (disk storage)
-        // Use async cleanup to avoid blocking response
         if (req.file.path && fs.existsSync(req.file.path)) {
-          fs.unlink(req.file.path, (unlinkErr) => {
-            if (unlinkErr) {
-              logger.warn({ err: unlinkErr }, "Failed to delete temporary file");
-            }
-          });
+          try {
+            fs.unlinkSync(req.file.path);
+          } catch (unlinkErr) {
+            logger.warn({ err: unlinkErr }, "Failed to delete temporary file");
+          }
         }
         
         logger.info({ s3Key, url: imageUrl }, "Image uploaded to S3");
@@ -908,33 +882,17 @@ threeDRouter.get("/me", requireAuth, async (req, res) => {
       return res.status(404).json({ error: "User not found" });
     }
     
-    // Get user's job stats - optimized with single query using aggregation
-    const { data: statsData, error: statsError } = await supabase
+    // Get user's job stats
+    const { count: totalJobs } = await supabase
       .from("jobs")
-      .select("status")
+      .select("*", { count: "exact", head: true })
       .eq("user_id", userId);
     
-    if (statsError) {
-      logger.error({ err: statsError, userId }, "Failed to fetch job stats");
-      // Return default values on error
-      return res.json({
-        user: {
-          id: user.id,
-          email: user.email,
-          firstName: user.first_name,
-          lastName: user.last_name,
-          imageUrl: user.image_url,
-          createdAt: user.created_at,
-        },
-        stats: {
-          totalJobs: 0,
-          completedJobs: 0,
-        }
-      });
-    }
-    
-    const totalJobs = statsData?.length || 0;
-    const completedJobs = statsData?.filter(job => job.status === "DONE").length || 0;
+    const { count: completedJobs } = await supabase
+      .from("jobs")
+      .select("*", { count: "exact", head: true })
+      .eq("user_id", userId)
+      .eq("status", "DONE");
     
     res.json({
       user: {
