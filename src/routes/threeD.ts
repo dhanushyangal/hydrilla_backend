@@ -2,7 +2,8 @@ import { Router } from "express";
 import multer from "multer";
 import path from "path";
 import fs from "fs";
-import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
+import { Readable } from "stream";
+import { S3Client, PutObjectCommand, GetObjectCommand } from "@aws-sdk/client-s3";
 import { logger } from "../logger.js";
 import { config } from "../config.js";
 import { supabase } from "../db.js";
@@ -532,6 +533,111 @@ threeDRouter.get("/queue/info", async (_req, res) => {
       estimated_wait_for_preview_seconds: 0,
       estimated_preview_time_seconds: 20
     });
+  }
+});
+
+// ============================================
+// Proxy GLB file from S3 (to avoid CORS issues)
+// ============================================
+threeDRouter.get("/glb/:jobId", optionalAuth, async (req, res) => {
+  const { jobId } = req.params;
+  const userId = req.userId;
+
+  try {
+    // Get job to verify ownership and get GLB URL
+    const job = await getJob(jobId);
+    if (!job) {
+      return res.status(404).json({ error: "Job not found" });
+    }
+
+    // Check ownership
+    if (userId && job.userId && job.userId !== userId) {
+      return res.status(403).json({ error: "You don't have permission to view this job" });
+    }
+
+    // Get GLB URL
+    const glbUrl = job.resultGlbUrl;
+    if (!glbUrl) {
+      return res.status(404).json({ error: "GLB file not found for this job" });
+    }
+
+    // If it's an S3 URL, try to fetch from S3 directly
+    if (glbUrl.includes(config.s3.bucket) && s3Enabled && s3Client) {
+      try {
+        // Extract S3 key from URL
+        const urlParts = glbUrl.split(`${config.s3.bucket}/`);
+        if (urlParts.length > 1) {
+          const s3Key = urlParts[1].split('?')[0]; // Remove query params
+          
+          // Fetch from S3
+          const command = new GetObjectCommand({
+            Bucket: config.s3.bucket,
+            Key: s3Key,
+          });
+          
+          const s3Response = await s3Client.send(command);
+          
+          // Set CORS headers
+          res.setHeader("Access-Control-Allow-Origin", "*");
+          res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
+          res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+          res.setHeader("Content-Type", "model/gltf-binary");
+          res.setHeader("Content-Disposition", `inline; filename="mesh.glb"`);
+          
+          // Stream the file
+          if (s3Response.Body) {
+            // Convert stream to buffer
+            const stream = s3Response.Body as Readable;
+            const chunks: Buffer[] = [];
+            
+            stream.on('data', (chunk: Buffer) => {
+              chunks.push(chunk);
+            });
+            
+            stream.on('end', () => {
+              const buffer = Buffer.concat(chunks);
+              res.send(buffer);
+            });
+            
+            stream.on('error', (err: Error) => {
+              logger.error({ jobId, err: err.message }, "Error streaming from S3");
+              if (!res.headersSent) {
+                res.status(500).json({ error: "Failed to stream GLB file" });
+              }
+            });
+            
+            return;
+          }
+        }
+      } catch (s3Err: any) {
+        logger.warn({ jobId, err: s3Err.message }, "Failed to fetch from S3, trying direct URL");
+      }
+    }
+
+    // Fallback: proxy through backend by fetching the URL
+    try {
+      const response = await fetch(glbUrl);
+      if (!response.ok) {
+        return res.status(response.status).json({ error: "Failed to fetch GLB file" });
+      }
+
+      // Set CORS headers
+      res.setHeader("Access-Control-Allow-Origin", "*");
+      res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
+      res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+      res.setHeader("Content-Type", "model/gltf-binary");
+      res.setHeader("Content-Disposition", `inline; filename="mesh.glb"`);
+
+      // Stream the response
+      const buffer = await response.arrayBuffer();
+      res.send(Buffer.from(buffer));
+    } catch (fetchErr: any) {
+      logger.error({ jobId, err: fetchErr.message }, "Failed to proxy GLB file");
+      res.status(500).json({ error: "Failed to load GLB file" });
+    }
+  } catch (err: any) {
+    logger.error({ err, jobId }, "Error proxying GLB file");
+    res.status(500).json({ error: err.message || "Failed to proxy GLB file" });
   }
 });
 
