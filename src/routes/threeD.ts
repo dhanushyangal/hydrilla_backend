@@ -294,11 +294,28 @@ threeDRouter.get("/status/:jobId", optionalAuth, async (req, res) => {
       }
     } catch (apiErr: any) {
       // External API is unreachable (timeout, network error, etc.)
-      const isTimeout = apiErr.name === 'AbortError' || apiErr.message?.includes('timeout') || apiErr.message?.includes('Connect Timeout');
+      const isTimeout = apiErr.name === 'AbortError' || apiErr.message?.includes('timeout') || apiErr.message?.includes('Connect Timeout') || apiErr.message?.includes('ECONNREFUSED') || apiErr.message?.includes('fetch failed');
       logger.warn({ jobId, err: apiErr.message, isTimeout }, "External API unreachable, using database data");
       
-      // If we have the job in database, return it
+      // If we have the job in database, check if it's processing and mark as failed
       if (job) {
+        // If job is currently processing (WAIT or RUN) and API is unreachable, mark as failed
+        if ((job.status === "WAIT" || job.status === "RUN") && isTimeout) {
+          logger.warn({ jobId, status: job.status }, "Marking job as failed due to GPU/API unavailability");
+          try {
+            await updateJobStatus(jobId, {
+              status: "FAIL",
+              errorCode: "GPU_UNAVAILABLE",
+              errorMessage: "GPU service is currently offline. The job could not be completed.",
+            });
+            // Update local job object to reflect the new status
+            job.status = "FAIL";
+            job.errorMessage = "GPU service is currently offline. The job could not be completed.";
+          } catch (updateErr: any) {
+            logger.error({ jobId, err: updateErr.message }, "Failed to update job status to failed");
+          }
+        }
+        
         if (userId && job.userId && job.userId !== userId) {
           return res.status(403).json({ error: "You don't have permission to view this job" });
         }
@@ -436,7 +453,14 @@ threeDRouter.get("/result/:jobId", optionalAuth, async (req, res) => {
 
     // Fetch from API for latest result
     try {
-      const response = await fetch(`${API_BASE}/status/${jobId}`);
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 10000); // 10 second timeout
+      
+      const response = await fetch(`${API_BASE}/status/${jobId}`, {
+        signal: controller.signal,
+      });
+      clearTimeout(timeoutId);
+      
       if (response.ok) {
         const apiJob = await response.json();
         if (apiJob.status === "completed" && apiJob.result) {
@@ -457,8 +481,26 @@ threeDRouter.get("/result/:jobId", optionalAuth, async (req, res) => {
           }
         }
       }
-    } catch (err) {
-      logger.error(err, "failed to fetch from API, using cached result");
+    } catch (err: any) {
+      const isTimeout = err.name === 'AbortError' || err.message?.includes('timeout') || err.message?.includes('ECONNREFUSED') || err.message?.includes('fetch failed');
+      logger.error({ err: err.message, isTimeout }, "failed to fetch from API, using cached result");
+      
+      // If job is currently processing (WAIT or RUN) and API is unreachable, mark as failed
+      if ((job.status === "WAIT" || job.status === "RUN") && isTimeout) {
+        logger.warn({ jobId, status: job.status }, "Marking job as failed due to GPU/API unavailability");
+        try {
+          await updateJobStatus(jobId, {
+            status: "FAIL",
+            errorCode: "GPU_UNAVAILABLE",
+            errorMessage: "GPU service is currently offline. The job could not be completed.",
+          });
+          // Update local job object to reflect the new status
+          job.status = "FAIL";
+          job.errorMessage = "GPU service is currently offline. The job could not be completed.";
+        } catch (updateErr: any) {
+          logger.error({ jobId, err: updateErr.message }, "Failed to update job status to failed");
+        }
+      }
     }
 
     // Normalize URLs to ensure they're direct S3 URLs (not expired signed URLs)
@@ -492,9 +534,14 @@ threeDRouter.get("/queue/info", async (_req, res) => {
     
     if (response.ok) {
       const queueInfo = await response.json();
-      return res.json(queueInfo);
+      // GPU is available if we got a successful response
+      return res.json({
+        ...queueInfo,
+        gpu_available: true
+      });
     } else {
-      // Return default values if queue endpoint not available
+      // GPU is not available if endpoint returns error
+      logger.warn("Python API returned error status, GPU may be unavailable");
       return res.json({
         queue_length: 0,
         currently_processing: false,
@@ -506,12 +553,13 @@ threeDRouter.get("/queue/info", async (_req, res) => {
         currently_generating_preview: false,
         preview_waiting: 0,
         estimated_wait_for_preview_seconds: 0,
-        estimated_preview_time_seconds: 20
+        estimated_preview_time_seconds: 20,
+        gpu_available: false
       });
     }
   } catch (err: any) {
-    logger.warn({ err: err.message }, "Failed to fetch queue info from Python API");
-    // Return default values on error
+    logger.warn({ err: err.message }, "Failed to fetch queue info from Python API - GPU is not available");
+    // GPU is not available if we can't reach the API
     return res.json({
       queue_length: 0,
       currently_processing: false,
@@ -523,7 +571,8 @@ threeDRouter.get("/queue/info", async (_req, res) => {
       currently_generating_preview: false,
       preview_waiting: 0,
       estimated_wait_for_preview_seconds: 0,
-      estimated_preview_time_seconds: 20
+      estimated_preview_time_seconds: 20,
+      gpu_available: false
     });
   }
 });
