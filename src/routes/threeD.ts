@@ -488,9 +488,9 @@ threeDRouter.get("/result/:jobId", optionalAuth, async (req, res) => {
 // ============================================
 threeDRouter.get("/queue/info", async (_req, res) => {
   try {
-    // Fetch queue info from Python API
+    // Fetch queue info from Python API with shorter timeout for faster failure detection
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 5000);
+    const timeoutId = setTimeout(() => controller.abort(), 3000); // Reduced to 3 seconds
     
     const response = await fetch(`${API_BASE}/queue/info`, {
       signal: controller.signal,
@@ -500,16 +500,21 @@ threeDRouter.get("/queue/info", async (_req, res) => {
     
     if (response.ok) {
       const queueInfo = await response.json();
-      return res.json(queueInfo);
-    } else {
-      // Return default values if queue endpoint not available
       return res.json({
+        ...queueInfo,
+        api_available: true, // Flag to indicate API is working
+      });
+    } else {
+      // API returned error status - mark as unavailable
+      logger.warn({ status: response.status }, "Python API returned error status for queue info");
+      return res.status(503).json({
+        error: "GPU API is currently unavailable",
+        api_available: false,
         queue_length: 0,
         currently_processing: false,
         waiting_jobs: 0,
         estimated_wait_for_new_job_seconds: 130,
         estimated_time_per_job_seconds: 130,
-        // Preview queue defaults
         preview_queue_length: 0,
         currently_generating_preview: false,
         preview_waiting: 0,
@@ -519,14 +524,15 @@ threeDRouter.get("/queue/info", async (_req, res) => {
     }
   } catch (err: any) {
     logger.warn({ err: err.message }, "Failed to fetch queue info from Python API");
-    // Return default values on error
-    return res.json({
+    // Return 503 status to indicate service unavailable
+    return res.status(503).json({
+      error: "GPU API is currently unavailable",
+      api_available: false,
       queue_length: 0,
       currently_processing: false,
       waiting_jobs: 0,
       estimated_wait_for_new_job_seconds: 130,
       estimated_time_per_job_seconds: 130,
-      // Preview queue defaults
       preview_queue_length: 0,
       currently_generating_preview: false,
       preview_waiting: 0,
@@ -1097,5 +1103,60 @@ threeDRouter.get("/me", requireAuth, async (req, res) => {
   } catch (err: any) {
     logger.error(err, "failed to get user profile");
     res.status(500).json({ error: err.message || "Failed to get user profile" });
+  }
+});
+
+// ============================================
+// GPU Offline Notification Endpoint
+// ============================================
+threeDRouter.post("/notify-gpu-offline", optionalAuth, async (req, res) => {
+  try {
+    const userId = req.userId || null;
+    const { errorMessage } = req.body;
+
+    logger.info({ userId, errorMessage }, "Received GPU offline notification request");
+
+    if (!errorMessage) {
+      logger.warn({ userId }, "GPU offline notification request missing errorMessage");
+      return res.status(400).json({ error: "errorMessage is required" });
+    }
+
+    // Import email service here to avoid circular dependency
+    import("../services/email.js")
+      .then(async ({ sendGpuOfflineNotification, getUserEmail }) => {
+        // Fetch user email from database if userId is available
+        let userEmail: string | null = null;
+        if (userId) {
+          try {
+            const userInfo = await getUserEmail(userId);
+            userEmail = userInfo?.email || null;
+            logger.info({ userId, userEmail }, "Fetched user email for notification");
+          } catch (err: any) {
+            logger.warn({ err: err.message, userId }, "Failed to fetch user email for notification");
+          }
+        }
+
+        logger.info({ userId, userEmail, errorMessage }, "Sending GPU offline notification email");
+        sendGpuOfflineNotification(userId, userEmail, errorMessage)
+          .then((success) => {
+            if (success) {
+              logger.info({ userId, userEmail }, "GPU offline notification email sent successfully");
+            } else {
+              logger.error({ userId, userEmail }, "GPU offline notification email failed after retries");
+            }
+          })
+          .catch((err: any) => {
+            logger.error({ err: err.message, stack: err.stack, userId, userEmail }, "Failed to send GPU offline notification (non-critical)");
+          });
+      })
+      .catch((err: any) => {
+        logger.error({ err: err.message, stack: err.stack, userId }, "Failed to import email service");
+      });
+
+    // Return success immediately (email is sent asynchronously)
+    res.json({ success: true, message: "Notification sent" });
+  } catch (err: any) {
+    logger.error({ err: err.message, stack: err.stack }, "Error in notify-gpu-offline endpoint");
+    res.status(500).json({ error: "Failed to send notification" });
   }
 });

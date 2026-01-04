@@ -230,7 +230,7 @@ export async function sendCompletionEmail(
 /**
  * Get user email from database by userId
  */
-async function getUserEmail(userId: string | null): Promise<{ email: string | null; name: string | null } | null> {
+export async function getUserEmail(userId: string | null): Promise<{ email: string | null; name: string | null } | null> {
   if (!userId) {
     return null;
   }
@@ -296,5 +296,131 @@ export async function sendCompletionEmailForJob(
     logger.error({ err: err.message, jobId }, "Failed to send completion email for job");
     return false;
   }
+}
+
+/**
+ * Send GPU offline notification email to founders with retry logic
+ */
+export async function sendGpuOfflineNotification(
+  userId: string | null,
+  userEmail: string | null,
+  errorMessage: string
+): Promise<boolean> {
+  const maxRetries = 3;
+  const retryDelay = 2000; // 2 seconds
+
+  const htmlBody = `
+    <!DOCTYPE html>
+    <html>
+      <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>GPU Offline Notification</title>
+      </head>
+      <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif; line-height: 1.6; color: #333; max-width: 600px; margin: 0 auto; padding: 20px;">
+        <div style="background-color: #ffffff; border-radius: 12px; padding: 40px; box-shadow: 0 2px 8px rgba(0,0,0,0.1);">
+          <div style="text-align: center; margin-bottom: 30px;">
+            <h1 style="color: #dc2626; font-size: 24px; font-weight: 700; margin: 0 0 10px 0;">⚠️ GPU Offline Alert</h1>
+          </div>
+          
+          <p style="font-size: 16px; color: #333; margin-bottom: 20px;">
+            A user encountered a GPU offline error.
+          </p>
+          
+          <div style="background-color: #fef2f2; border-left: 4px solid #dc2626; border-radius: 4px; padding: 16px; margin: 20px 0;">
+            <p style="font-size: 14px; color: #991b1b; margin: 0; font-weight: 600;">Error Details:</p>
+            <p style="font-size: 14px; color: #7f1d1d; margin: 8px 0 0 0;">${errorMessage.replace(/</g, '&lt;').replace(/>/g, '&gt;')}</p>
+          </div>
+          
+          <div style="background-color: #f5f5f5; border-radius: 8px; padding: 20px; margin: 30px 0;">
+            <h2 style="color: #000000; font-size: 18px; margin-top: 0; margin-bottom: 15px;">User Information:</h2>
+            <ul style="color: #333; font-size: 14px; padding-left: 20px; margin: 0;">
+              <li style="margin-bottom: 8px;"><strong>User ID:</strong> ${userId || 'Anonymous'}</li>
+              <li style="margin-bottom: 8px;"><strong>User Email:</strong> ${userEmail || 'Not available'}</li>
+              <li style="margin-bottom: 0;"><strong>Timestamp:</strong> ${new Date().toISOString()}</li>
+            </ul>
+          </div>
+          
+          <p style="font-size: 14px; color: #666; margin-top: 30px; margin-bottom: 0;">
+            Please check the GPU instance and restart if necessary.
+          </p>
+        </div>
+      </body>
+    </html>
+  `;
+
+  // Retry logic with timeout wrapper
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      // Wrap email send in a timeout promise
+      const emailPromise = emailClient.sendMail({
+        from: {
+          address: config.email.fromAddress,
+          name: config.email.fromName,
+        },
+        to: [
+          {
+            email_address: {
+              address: "founders@hydrilla.co",
+              name: "Hydrilla Founders",
+            },
+          },
+        ],
+        subject: "🚨 GPU Offline Alert - Action Required",
+        htmlbody: htmlBody,
+      });
+
+      // Add 30 second timeout for email sending
+      const timeoutPromise = new Promise((_, reject) => {
+        setTimeout(() => reject(new Error("Email send timeout after 30 seconds")), 30000);
+      });
+
+      await Promise.race([emailPromise, timeoutPromise]);
+
+      logger.info({ userId, userEmail, attempt }, "GPU offline notification email sent to founders");
+      return true;
+    } catch (err: any) {
+      const isTimeout = err.message?.includes("ETIMEDOUT") || 
+                       err.message?.includes("timeout") ||
+                       err.message?.includes("ECONNRESET") ||
+                       err.message?.includes("ECONNREFUSED");
+      
+      if (attempt < maxRetries && isTimeout) {
+        logger.warn(
+          { err: err.message, userId, userEmail, attempt, maxRetries },
+          `Failed to send GPU offline notification email (attempt ${attempt}/${maxRetries}), retrying in ${retryDelay * attempt}ms...`
+        );
+        // Wait before retrying with exponential backoff
+        await new Promise(resolve => setTimeout(resolve, retryDelay * attempt));
+        continue;
+      }
+      
+      // Log detailed error for debugging
+      logger.error(
+        { 
+          err: err.message, 
+          stack: err.stack, 
+          userId, 
+          userEmail, 
+          attempt,
+          errorType: err.constructor?.name,
+          code: err.code,
+        },
+        "Failed to send GPU offline notification email after retries"
+      );
+      
+      // If all retries failed, still log that we tried (for monitoring)
+      if (attempt === maxRetries) {
+        logger.error(
+          { userId, userEmail, errorMessage },
+          "CRITICAL: GPU offline notification email failed after all retries. Manual intervention may be needed."
+        );
+      }
+      
+      return false;
+    }
+  }
+
+  return false;
 }
 

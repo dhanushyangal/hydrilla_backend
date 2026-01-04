@@ -6,6 +6,68 @@ import { normalizeGlbUrl, normalizePreviewUrl } from "../utils/s3Urls.js";
 
 const API_BASE = config.hunyuanApi.url;
 
+// Circuit breaker state to prevent continuous API calls when API is offline
+let circuitBreakerState = {
+  isOpen: false, // Circuit is open (API is offline)
+  consecutiveFailures: 0,
+  lastFailureTime: null as number | null,
+  lastSuccessTime: null as number | null,
+};
+
+const CIRCUIT_BREAKER_THRESHOLD = 3; // Open circuit after 3 consecutive failures
+const CIRCUIT_BREAKER_RESET_TIME = 60000; // Try again after 60 seconds
+const CIRCUIT_BREAKER_SUCCESS_RESET = 1; // Close circuit after 1 successful call
+
+/**
+ * Check if API is available (circuit breaker closed)
+ */
+function isApiAvailable(): boolean {
+  if (!circuitBreakerState.isOpen) {
+    return true; // Circuit is closed, API is available
+  }
+
+  // If circuit is open, check if enough time has passed to retry
+  if (circuitBreakerState.lastFailureTime) {
+    const timeSinceLastFailure = Date.now() - circuitBreakerState.lastFailureTime;
+    if (timeSinceLastFailure >= CIRCUIT_BREAKER_RESET_TIME) {
+      logger.info("Circuit breaker: Attempting to reconnect to API");
+      circuitBreakerState.isOpen = false;
+      circuitBreakerState.consecutiveFailures = 0;
+      return true;
+    }
+  }
+
+  return false; // Circuit is open, API is unavailable
+}
+
+/**
+ * Record API failure
+ */
+function recordApiFailure(): void {
+  circuitBreakerState.consecutiveFailures++;
+  circuitBreakerState.lastFailureTime = Date.now();
+
+  if (circuitBreakerState.consecutiveFailures >= CIRCUIT_BREAKER_THRESHOLD) {
+    circuitBreakerState.isOpen = true;
+    logger.warn(
+      { consecutiveFailures: circuitBreakerState.consecutiveFailures },
+      "Circuit breaker opened: API appears to be offline. Pausing job sync."
+    );
+  }
+}
+
+/**
+ * Record API success
+ */
+function recordApiSuccess(): void {
+  if (circuitBreakerState.isOpen) {
+    logger.info("Circuit breaker closed: API is back online");
+  }
+  circuitBreakerState.isOpen = false;
+  circuitBreakerState.consecutiveFailures = 0;
+  circuitBreakerState.lastSuccessTime = Date.now();
+}
+
 // Helper to convert API status to database status
 function convertStatus(apiStatus: string): JobStatus {
   switch (apiStatus) {
@@ -69,16 +131,25 @@ export async function syncJobFromApi(jobId: string): Promise<boolean> {
       clearTimeout(timeoutId);
       if (fetchErr.name === "AbortError") {
         logger.warn({ jobId }, "API request timeout");
+        // Record API failure for circuit breaker
+        recordApiFailure();
         // For preview-only jobs, timeout is OK
         if (dbJob.previewImageUrl && !dbJob.resultGlbUrl && dbJob.status === "DONE") {
           return true;
         }
         return false;
       }
+      // Record other network errors
+      if (fetchErr.message?.includes("fetch") || fetchErr.message?.includes("network") || fetchErr.message?.includes("ECONNREFUSED")) {
+        recordApiFailure();
+      }
       throw fetchErr;
     }
 
     const apiJob = await response.json();
+
+    // Record API success (circuit breaker)
+    recordApiSuccess();
 
     // Convert API status to database status
     const dbStatus = convertStatus(apiJob.status);
@@ -142,6 +213,17 @@ export async function syncJobFromApi(jobId: string): Promise<boolean> {
 
     return true;
   } catch (err: any) {
+    // Check if it's a network error
+    const isNetworkError = err.message?.includes("fetch") || 
+                          err.message?.includes("network") || 
+                          err.message?.includes("ECONNREFUSED") ||
+                          err.message?.includes("ETIMEDOUT") ||
+                          err.name === "TypeError";
+    
+    if (isNetworkError) {
+      recordApiFailure();
+    }
+    
     logger.error({ err, jobId }, "Failed to sync job from API");
     return false;
   }
@@ -152,6 +234,17 @@ export async function syncJobFromApi(jobId: string): Promise<boolean> {
  */
 export async function syncAllJobs(): Promise<{ synced: number; failed: number }> {
   try {
+    // Check circuit breaker - if API is offline, skip sync
+    if (!isApiAvailable()) {
+      // Only log once per minute to avoid spam
+      const shouldLog = !circuitBreakerState.lastFailureTime || 
+                       (Date.now() - circuitBreakerState.lastFailureTime) > 60000;
+      if (shouldLog) {
+        logger.debug("Skipping job sync: API is offline (circuit breaker open)");
+      }
+      return { synced: 0, failed: 0 };
+    }
+
     // Get all jobs that are still processing
     const jobs = await listJobs(1000); // Get up to 1000 jobs
     // Filter out preview-only jobs (they don't exist in Python API)
