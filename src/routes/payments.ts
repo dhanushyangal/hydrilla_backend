@@ -4,6 +4,14 @@ import { config } from "../config.js";
 import { supabase } from "../db.js";
 import { optionalAuth, requireAuth } from "../middleware/auth.js";
 import crypto from "crypto";
+import DodoPayments from "dodopayments";
+
+// Initialize DodoPayments client for webhook verification
+const dodoClient = new DodoPayments({
+  bearerToken: config.dodoPayment.apiKey,
+  environment: config.dodoPayment.mode === "live" ? "live_mode" : "test_mode",
+  webhookKey: config.dodoPayment.webhookSecret,
+});
 
 export const paymentsRouter = Router();
 
@@ -290,6 +298,9 @@ paymentsRouter.get("/early-access/:paymentId", optionalAuth, async (req: Request
 /**
  * Webhook endpoint for Dodo Payment callbacks
  * POST /api/payments/webhook/dodo
+ * 
+ * IMPORTANT: This endpoint uses express.raw({ type: 'application/json' }) middleware
+ * to receive the raw body for signature verification (configured in api/index.ts)
  */
 paymentsRouter.post("/webhook/dodo", async (req: Request, res: Response) => {
   // Ensure response is sent even if there's an error
@@ -303,7 +314,7 @@ paymentsRouter.post("/webhook/dodo", async (req: Request, res: Response) => {
   };
 
   try {
-    // Dodo Payment webhook headers
+    // Dodo Payment webhook headers (Express lowercases them)
     const webhookId = req.headers["webhook-id"] as string;
     const webhookSignature = req.headers["webhook-signature"] as string;
     const webhookTimestamp = req.headers["webhook-timestamp"] as string;
@@ -312,7 +323,9 @@ paymentsRouter.post("/webhook/dodo", async (req: Request, res: Response) => {
       hasWebhookId: !!webhookId,
       hasWebhookSignature: !!webhookSignature,
       hasWebhookTimestamp: !!webhookTimestamp,
-      contentType: req.headers["content-type"]
+      contentType: req.headers["content-type"],
+      bodyType: typeof req.body,
+      isBuffer: Buffer.isBuffer(req.body)
     }, "Webhook received - checking headers");
 
     if (!webhookId || !webhookSignature || !webhookTimestamp) {
@@ -325,65 +338,76 @@ paymentsRouter.post("/webhook/dodo", async (req: Request, res: Response) => {
       return sendResponse(401, { error: "Missing webhook headers" });
     }
 
-    // Get raw body for signature verification (req.body is Buffer when using express.raw)
-    let rawBody: string;
-    try {
-      rawBody = Buffer.isBuffer(req.body) ? req.body.toString("utf8") : (typeof req.body === "string" ? req.body : JSON.stringify(req.body));
-    } catch (bodyError) {
-      logger.error({ bodyError }, "Failed to extract raw body");
-      return sendResponse(400, { error: "Invalid request body" });
-    }
-    
-    // Verify webhook signature
-    let isValid = false;
-    try {
-      isValid = verifyWebhookSignature(
-        rawBody,
-        webhookId,
-        webhookSignature,
-        webhookTimestamp,
-        config.dodoPayment.webhookSecret
-      );
-    } catch (sigError) {
-      logger.error({ sigError }, "Error during signature verification");
-      return sendResponse(401, { error: "Signature verification failed" });
+    // Get raw body for signature verification
+    // CRITICAL: req.body is Buffer when using express.raw({ type: 'application/json' })
+    // We MUST use the exact raw bytes, not JSON.stringify(parsed)
+    let payload: string;
+    if (Buffer.isBuffer(req.body)) {
+      payload = req.body.toString("utf8");
+    } else if (typeof req.body === "string") {
+      payload = req.body;
+    } else {
+      // If body was already parsed (shouldn't happen with express.raw), this may cause signature failure
+      logger.warn({ bodyType: typeof req.body }, "Body is not Buffer - may cause signature verification failure");
+      payload = JSON.stringify(req.body);
     }
 
-    if (!isValid) {
+    logger.info({ 
+      payloadLength: payload.length,
+      payloadPreview: payload.substring(0, 100) + "..."
+    }, "Raw payload extracted for verification");
+
+    // Use the official DodoPayments SDK to verify and unwrap the webhook
+    let event: any;
+    try {
+      // The SDK's unwrap method handles signature verification internally
+      // Signature format: { headers: { "webhook-id": ..., ... }, key?: string }
+      event = dodoClient.webhooks.unwrap(payload, {
+        headers: {
+          "webhook-id": webhookId,
+          "webhook-signature": webhookSignature,
+          "webhook-timestamp": webhookTimestamp,
+        }
+      });
+      
+      logger.info({ 
+        eventType: event?.type,
+        hasData: !!event?.data,
+        verified: true
+      }, "✅ Webhook signature verified successfully using DodoPayments SDK");
+    } catch (verifyError: any) {
       logger.error({ 
+        error: verifyError?.message || verifyError,
         webhookId,
         hasSecret: !!config.dodoPayment.webhookSecret,
         secretPrefix: config.dodoPayment.webhookSecret ? config.dodoPayment.webhookSecret.substring(0, 20) + "..." : "missing",
-        bodyLength: rawBody.length,
-        bodyPreview: rawBody.substring(0, 200)
-      }, "❌ Invalid webhook signature - verification failed");
+        payloadLength: payload.length,
+        payloadPreview: payload.substring(0, 200)
+      }, "❌ Webhook signature verification failed");
       
       // TEMPORARY: Allow bypass for testing (remove in production!)
       if (process.env.SKIP_WEBHOOK_VERIFICATION === "true") {
         logger.warn("⚠️ SKIPPING WEBHOOK SIGNATURE VERIFICATION (TESTING ONLY - REMOVE IN PRODUCTION!)");
-        // Continue processing without verification
+        // Parse the event manually since SDK verification failed
+        try {
+          event = JSON.parse(payload);
+        } catch (parseError) {
+          logger.error({ parseError }, "Failed to parse webhook payload");
+          return sendResponse(400, { error: "Invalid JSON body" });
+        }
       } else {
         return sendResponse(401, { error: "Signature verification failed" });
       }
     }
 
-    // Parse JSON body
-    let event: any;
-    try {
-      event = typeof req.body === "string" ? JSON.parse(req.body) : (Buffer.isBuffer(req.body) ? JSON.parse(req.body.toString("utf8")) : req.body);
-    } catch (parseError) {
-      logger.error({ parseError, bodyType: typeof req.body }, "Failed to parse webhook body");
-      return sendResponse(400, { error: "Invalid JSON body" });
-    }
-
     logger.info({ 
-      eventType: event?.event_type || event?.type,
+      eventType: event?.type,
       hasData: !!event?.data,
       eventKeys: event ? Object.keys(event) : []
-    }, "Received Dodo Payment webhook - parsed successfully");
+    }, "Received Dodo Payment webhook - processing event");
 
-    // Dodo Payment webhook structure: { type: "...", data: { ... } } or { event_type: "...", data: { ... } }
-    // Handle different event types (Dodo Payment event format)
+    // Dodo Payment webhook structure: { type: "...", data: { ... } }
+    // Handle different event types
     const eventType = event?.type || event?.event_type;
     const eventData = event?.data || event; // Extract data payload
     
