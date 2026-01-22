@@ -519,27 +519,47 @@ function verifyWebhookSignature(
     }
 
     // StandardWebhooks format: HMAC SHA256 of (webhook_id.timestamp.payload)
-    // The payload should be the raw body as a string
+    // The payload should be the raw body as a string (exactly as received)
     const signedPayload = `${webhookId}.${webhookTimestamp}.${payload}`;
     
-    // Extract the secret key (remove 'whsec_' prefix if present)
-    const secretKey = secret.startsWith("whsec_") ? secret.substring(6) : secret;
+    // StandardWebhooks: If secret starts with 'whsec_', the part after is base64-encoded
+    // We need to decode it to get the actual secret key
+    let secretKey: string;
+    if (secret.startsWith("whsec_")) {
+      try {
+        // Decode the base64 part after 'whsec_'
+        const base64Part = secret.substring(6);
+        secretKey = Buffer.from(base64Part, "base64").toString("utf8");
+        logger.info({ secretFormat: "whsec_ (decoded)", secretKeyLength: secretKey.length }, "Decoded whsec_ secret");
+      } catch (decodeError) {
+        logger.error({ decodeError, secretPrefix: secret.substring(0, 20) }, "Failed to decode whsec_ secret, trying raw");
+        // Fallback: try using the raw secret without prefix
+        secretKey = secret.substring(6);
+      }
+    } else {
+      // If no whsec_ prefix, use secret as-is
+      secretKey = secret;
+      logger.info({ secretFormat: "raw" }, "Using raw secret");
+    }
     
+    // Compute HMAC SHA256 signature
     const hmac = crypto.createHmac("sha256", secretKey);
     hmac.update(signedPayload);
-    const hash = hmac.digest("base64"); // Use base64, not hex
+    const hash = hmac.digest("base64"); // Base64 encoding
     const expectedSignature = `v1=${hash}`;
     
     // The provided signature already has v1= prefix
     const providedSig = webhookSignature;
     
     logger.info({ 
-      providedSig: providedSig.substring(0, 20) + "...",
-      expectedSig: expectedSignature.substring(0, 20) + "...",
+      providedSigPrefix: providedSig.substring(0, 30) + "...",
+      expectedSigPrefix: expectedSignature.substring(0, 30) + "...",
       providedLength: providedSig.length,
       expectedLength: expectedSignature.length,
       hasSecret: !!secret,
-      secretPrefix: secret.substring(0, 10) + "..."
+      secretFormat: secret.startsWith("whsec_") ? "whsec_ (decoded)" : "raw",
+      payloadLength: payload.length,
+      signedPayloadLength: signedPayload.length
     }, "Verifying webhook signature");
     
     if (providedSig.length !== expectedSignature.length) {
@@ -560,8 +580,15 @@ function verifyWebhookSignature(
     if (!isValid) {
       logger.warn({ 
         providedSig: providedSig.substring(0, 50),
-        expectedSig: expectedSignature.substring(0, 50)
+        expectedSig: expectedSignature.substring(0, 50),
+        webhookId,
+        timestamp: webhookTimestamp,
+        payloadPreview: payload.substring(0, 200),
+        signedPayloadPreview: signedPayload.substring(0, 200),
+        secretKeyLength: secretKey.length
       }, "Webhook signature verification failed - signatures do not match");
+    } else {
+      logger.info("✅ Webhook signature verification succeeded");
     }
     
     return isValid;
