@@ -115,46 +115,59 @@ paymentsRouter.post("/early-access/create", optionalAuth, async (req: Request, r
     // PRE-CHECK: Does email already have access?
     // This prevents showing checkout to users who already paid
     // ========================================
-    const { data: existingAccess } = await supabase
-      .from("early_access")
-      .select("id, email, granted_at, status")
-      .eq("email", email)
-      .eq("status", "granted")
-      .maybeSingle();
+    try {
+      const { data: existingAccess, error: checkError } = await supabase
+        .from("early_access")
+        .select("id, email, granted_at, status")
+        .eq("email", email)
+        .eq("status", "granted")
+        .maybeSingle();
 
-    if (existingAccess) {
-      logger.info({ 
-        email, 
-        accessId: existingAccess.id,
-        grantedAt: existingAccess.granted_at 
-      }, "User already has early access - blocking checkout");
-      
-      return res.status(409).json({ 
-        error: "ALREADY_HAS_ACCESS",
-        message: "This email already has early access",
-        accessInfo: existingAccess,
-        status: "ALREADY_HAS_ACCESS"
-      });
+      if (checkError) {
+        // Table might not exist - log and continue to checkout
+        logger.warn({ checkError, email }, "Error checking early_access - table might not exist, continuing to checkout");
+      } else if (existingAccess) {
+        logger.info({ 
+          email, 
+          accessId: existingAccess.id,
+          grantedAt: existingAccess.granted_at 
+        }, "User already has early access - blocking checkout");
+        
+        return res.status(409).json({ 
+          error: "ALREADY_HAS_ACCESS",
+          message: "This email already has early access",
+          accessInfo: existingAccess,
+          status: "ALREADY_HAS_ACCESS"
+        });
+      }
+    } catch (checkErr) {
+      logger.warn({ checkErr, email }, "Exception checking early access - continuing to checkout");
     }
 
     // Also check by user_id if provided
     if (userId) {
-      const { data: existingByUserId } = await supabase
-        .from("early_access")
-        .select("id, email, granted_at")
-        .eq("user_id", userId)
-        .eq("status", "granted")
-        .maybeSingle();
+      try {
+        const { data: existingByUserId, error: userIdCheckError } = await supabase
+          .from("early_access")
+          .select("id, email, granted_at")
+          .eq("user_id", userId)
+          .eq("status", "granted")
+          .maybeSingle();
 
-      if (existingByUserId) {
-        logger.info({ userId, email, accessId: existingByUserId.id }, "User already has access by user_id");
-        
-        return res.status(409).json({ 
-          error: "ALREADY_HAS_ACCESS",
-          message: "You already have early access",
-          accessInfo: existingByUserId,
-          status: "ALREADY_HAS_ACCESS"
-        });
+        if (userIdCheckError) {
+          logger.warn({ userIdCheckError, userId }, "Error checking by user_id - continuing");
+        } else if (existingByUserId) {
+          logger.info({ userId, email, accessId: existingByUserId.id }, "User already has access by user_id");
+          
+          return res.status(409).json({ 
+            error: "ALREADY_HAS_ACCESS",
+            message: "You already have early access",
+            accessInfo: existingByUserId,
+            status: "ALREADY_HAS_ACCESS"
+          });
+        }
+      } catch (userCheckErr) {
+        logger.warn({ userCheckErr, userId }, "Exception checking by user_id - continuing");
       }
     }
 
@@ -398,7 +411,16 @@ async function createCheckoutSession(params: {
         email: email,
         created_at: new Date().toISOString(),
       },
-      allowed_payment_method_types: ["credit", "debit"],
+      // Include UPI, cards, and other popular payment methods
+      allowed_payment_method_types: [
+        "credit", 
+        "debit", 
+        "upi_collect",   // UPI - collect via VPA
+        "upi_intent",    // UPI - intent based
+        "google_pay",    // Google Pay
+        "apple_pay",     // Apple Pay
+        "paypal",        // PayPal
+      ],
     };
 
     logger.info({ apiUrl, returnUrl, email }, "Creating checkout session");
