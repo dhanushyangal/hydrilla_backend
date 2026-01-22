@@ -3,6 +3,7 @@ import cors from "cors";
 import path from "path";
 import fs from "fs";
 import { threeDRouter } from "./routes/threeD.js";
+import { paymentsRouter } from "./routes/payments.js";
 import { logger } from "./logger.js";
 import { config } from "./config.js";
 import { initDb } from "./db.js";
@@ -13,8 +14,13 @@ async function main() {
   await initDb();
   const app = express();
   app.use(cors());
-  app.use(express.json({ limit: "10mb" }));
   app.use(pinoHttp({ logger }));
+  
+  // Raw body parser for webhook signature verification (must be before json parser)
+  app.use("/api/payments/webhook/dodo", express.raw({ type: "application/json" }));
+  
+  // JSON parser for all other routes
+  app.use(express.json({ limit: "10mb" }));
 
   // Serve uploaded images statically (only if not in Vercel/serverless)
   // In Vercel, files should be served from S3, not local filesystem
@@ -31,6 +37,7 @@ async function main() {
   });
 
   app.use("/api/3d", threeDRouter);
+  app.use("/api/payments", paymentsRouter);
 
   app.use((err: any, _req: any, res: any, _next: any) => {
     logger.error(err);

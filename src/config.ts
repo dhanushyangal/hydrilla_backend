@@ -28,6 +28,14 @@ export const config = {
     fromName: process.env.ZEPTOMAIL_FROM_NAME || "Hydrilla",
     frontendUrl: process.env.FRONTEND_URL || "https://hydrilla.co",
   },
+  dodoPayment: {
+    apiKey: process.env.DODO_PAYMENT_API_KEY || "",
+    mode: process.env.DODO_PAYMENT_MODE || "test",  // "test" or "live"
+    webhookSecret: process.env.DODO_PAYMENT_WEBHOOK_SECRET || "",
+    baseUrl: (process.env.DODO_PAYMENT_MODE || "test") === "live" ? "https://live.dodopayments.com" : "https://test.dodopayments.com",
+    productId: process.env.DODO_PAYMENT_PRODUCT_ID || "",  // Early Access product ID (created in Dodo dashboard)
+    returnUrl: process.env.DODO_PAYMENTS_RETURN_URL || "",  // Return URL after payment (e.g., http://localhost:3000/checkout/success)
+  },
 };
 
 if (!config.hunyuanApi.url) {
@@ -44,4 +52,16 @@ if (!config.clerk.secretKey) {
 
 if (!config.email.token) {
   console.warn("[config] ZEPTOMAIL_TOKEN is missing. Email functionality will be disabled.");
+}
+
+if (!config.dodoPayment.apiKey) {
+  console.warn("[config] DODO_PAYMENT_API_KEY is missing. Payment functionality will be disabled.");
+}
+
+if (!config.dodoPayment.productId) {
+  console.warn("[config] DODO_PAYMENT_PRODUCT_ID is missing. You need to create a product in Dodo dashboard first.");
+}
+
+if (!config.dodoPayment.returnUrl) {
+  console.warn("[config] DODO_PAYMENTS_RETURN_URL is missing. Payment redirects will not work correctly.");
 }
