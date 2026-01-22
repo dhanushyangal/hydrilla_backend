@@ -1,6 +1,7 @@
 import express from "express";
 import cors from "cors";
 import { threeDRouter } from "../src/routes/threeD.js";
+import { paymentsRouter } from "../src/routes/payments.js";
 import { logger } from "../src/logger.js";
 import { initDb } from "../src/db.js";
 import pinoHttp from "pino-http";
@@ -21,9 +22,14 @@ const app = express();
 app.use(cors({
   origin: '*',
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'webhook-id', 'webhook-signature', 'webhook-timestamp'],
   credentials: false
 }));
+
+// Raw body parser for webhook signature verification (must be before json parser)
+app.use("/api/payments/webhook/dodo", express.raw({ type: "application/json" }));
+
+// JSON parser for all other routes
 app.use(express.json({ limit: "10mb" }));
 app.use(express.urlencoded({ extended: true, limit: "10mb" }));
 app.use(pinoHttp({ logger }));
@@ -42,16 +48,24 @@ app.get("/", (_req, res) => {
   res.json({ message: "Hydrilla Backend API", status: "ok" });
 });
 
-// 3D routes
-app.use("/api/3d", async (req, res, next) => {
-  // Initialize database in background, don't block the request
+// Initialize database middleware
+async function initDbMiddleware(req: express.Request, res: express.Response, next: express.NextFunction) {
   if (!dbInitialized) {
-    ensureDb().catch((dbErr: any) => {
+    try {
+      await ensureDb();
+    } catch (dbErr: any) {
       logger.error({ err: dbErr }, "Database initialization failed");
-    });
+      // Don't block the request, but log the error
+    }
   }
   next();
-}, threeDRouter);
+}
+
+// 3D routes
+app.use("/api/3d", initDbMiddleware, threeDRouter);
+
+// Payments routes
+app.use("/api/payments", initDbMiddleware, paymentsRouter);
 
 // Error handler
 app.use((err: any, _req: any, res: any, _next: any) => {
@@ -59,7 +73,7 @@ app.use((err: any, _req: any, res: any, _next: any) => {
   res.status(500).json({ error: "Internal Server Error" });
 });
 
-// 404 handler
+// 404 handler (must be last)
 app.use((_req, res) => {
   res.status(404).json({ error: "Not Found", code: "NOT_FOUND" });
 });
