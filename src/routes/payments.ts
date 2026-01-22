@@ -447,7 +447,7 @@ async function createCheckoutSession(params: {
       customer: {
         email: email,
       },
-      return_url: config.dodoPayment.returnUrl || `${config.email.frontendUrl}/checkout/success`,
+      return_url: config.dodoPayment.returnUrl || (config.email.frontendUrl ? `${config.email.frontendUrl}/checkout/success` : "https://hydrilla.ai/checkout/success"),
       metadata: {
         payment_record_id: paymentRecordId,
         product: "early_access",
@@ -490,7 +490,7 @@ async function createCheckoutSession(params: {
     logger.info({ 
       session_id: data.session_id,
       has_checkout_url: !!data.checkout_url,
-      return_url: config.dodoPayment.returnUrl || `${config.email.frontendUrl}/checkout/success`,
+      return_url: config.dodoPayment.returnUrl || (config.email.frontendUrl ? `${config.email.frontendUrl}/checkout/success` : "https://hydrilla.ai/checkout/success"),
     }, "Checkout session created successfully");
     
     return {
@@ -519,29 +519,52 @@ function verifyWebhookSignature(
     }
 
     // StandardWebhooks format: HMAC SHA256 of (webhook_id.timestamp.payload)
+    // The payload should be the raw body as a string
     const signedPayload = `${webhookId}.${webhookTimestamp}.${payload}`;
-    const hmac = crypto.createHmac("sha256", secret);
+    
+    // Extract the secret key (remove 'whsec_' prefix if present)
+    const secretKey = secret.startsWith("whsec_") ? secret.substring(6) : secret;
+    
+    const hmac = crypto.createHmac("sha256", secretKey);
     hmac.update(signedPayload);
-    const hash = hmac.digest("hex");
+    const hash = hmac.digest("base64"); // Use base64, not hex
     const expectedSignature = `v1=${hash}`;
     
-    // Compare signatures using timing-safe comparison
-    const providedSig = webhookSignature.startsWith("v1=") 
-      ? webhookSignature 
-      : `v1=${webhookSignature}`;
+    // The provided signature already has v1= prefix
+    const providedSig = webhookSignature;
+    
+    logger.info({ 
+      providedSig: providedSig.substring(0, 20) + "...",
+      expectedSig: expectedSignature.substring(0, 20) + "...",
+      providedLength: providedSig.length,
+      expectedLength: expectedSignature.length,
+      hasSecret: !!secret,
+      secretPrefix: secret.substring(0, 10) + "..."
+    }, "Verifying webhook signature");
     
     if (providedSig.length !== expectedSignature.length) {
       logger.warn({ 
         providedLength: providedSig.length,
-        expectedLength: expectedSignature.length
+        expectedLength: expectedSignature.length,
+        providedSig: providedSig.substring(0, 50),
+        expectedSig: expectedSignature.substring(0, 50)
       }, "Webhook signature length mismatch");
       return false;
     }
     
-    return crypto.timingSafeEqual(
+    const isValid = crypto.timingSafeEqual(
       Buffer.from(providedSig),
       Buffer.from(expectedSignature)
     );
+    
+    if (!isValid) {
+      logger.warn({ 
+        providedSig: providedSig.substring(0, 50),
+        expectedSig: expectedSignature.substring(0, 50)
+      }, "Webhook signature verification failed - signatures do not match");
+    }
+    
+    return isValid;
   } catch (error) {
     logger.error({ error, stack: (error as Error).stack }, "Error verifying webhook signature");
     return false;
