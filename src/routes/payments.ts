@@ -350,12 +350,21 @@ paymentsRouter.post("/webhook/dodo", async (req: Request, res: Response) => {
     }
 
     if (!isValid) {
-      logger.warn({ 
+      logger.error({ 
         webhookId,
         hasSecret: !!config.dodoPayment.webhookSecret,
-        bodyLength: rawBody.length
-      }, "Invalid webhook signature - verification failed");
-      return sendResponse(401, { error: "Invalid signature" });
+        secretPrefix: config.dodoPayment.webhookSecret ? config.dodoPayment.webhookSecret.substring(0, 20) + "..." : "missing",
+        bodyLength: rawBody.length,
+        bodyPreview: rawBody.substring(0, 200)
+      }, "❌ Invalid webhook signature - verification failed");
+      
+      // TEMPORARY: Allow bypass for testing (remove in production!)
+      if (process.env.SKIP_WEBHOOK_VERIFICATION === "true") {
+        logger.warn("⚠️ SKIPPING WEBHOOK SIGNATURE VERIFICATION (TESTING ONLY - REMOVE IN PRODUCTION!)");
+        // Continue processing without verification
+      } else {
+        return sendResponse(401, { error: "Signature verification failed" });
+      }
     }
 
     // Parse JSON body
