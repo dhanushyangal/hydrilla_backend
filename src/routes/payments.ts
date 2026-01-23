@@ -338,7 +338,10 @@ paymentsRouter.post("/webhook/dodo", async (req: Request, res: Response) => {
         await handlePaymentFailure(eventData, webhookId);
         break;
       case "refund.succeeded":
-        await handleRefund(eventData, webhookId);
+        await handleRefund(eventData, webhookId, "succeeded");
+        break;
+      case "refund.failed":
+        await handleRefund(eventData, webhookId, "failed");
         break;
       default:
         logger.info({ eventType }, "Unhandled event type");
@@ -375,6 +378,193 @@ paymentsRouter.get("/early-access/:id", optionalAuth, async (req: Request, res: 
     res.json(access);
   } catch (error: any) {
     logger.error({ error }, "Error fetching access info");
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// ============================================================================
+// GET REFUNDS FOR PAYMENT
+// GET /api/payments/refunds/:paymentId
+// Get all refunds for a payment from Dodo API
+// ============================================================================
+paymentsRouter.get("/refunds/:paymentId", optionalAuth, async (req: Request, res: Response) => {
+  try {
+    const { paymentId } = req.params;
+    
+    logger.info({ paymentId }, "Fetching refunds from Dodo API");
+
+    // Fetch payment details from Dodo API
+    const apiUrl = `${config.dodoPayment.baseUrl}/payments/${paymentId}`;
+    
+    const response = await fetch(apiUrl, {
+      method: "GET",
+      headers: {
+        "Authorization": `Bearer ${config.dodoPayment.apiKey}`,
+        "Content-Type": "application/json",
+      },
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      logger.error({ status: response.status, error: errorText }, "Failed to fetch payment from Dodo");
+      return res.status(response.status).json({ 
+        error: "Failed to fetch payment from Dodo API",
+        details: errorText 
+      });
+    }
+
+    const paymentData = await response.json();
+    const refunds = paymentData.refunds || [];
+    
+    res.json({
+      paymentId,
+      refunds,
+      refundCount: refunds.length
+    });
+
+  } catch (error: any) {
+    logger.error({ error }, "Error fetching refunds");
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// ============================================================================
+// SYNC REFUND STATUS FROM DODO API
+// POST /api/payments/sync-refund/:paymentId
+// Manually check refund status from Dodo API and update database
+// ============================================================================
+paymentsRouter.post("/sync-refund/:paymentId", optionalAuth, async (req: Request, res: Response) => {
+  try {
+    const { paymentId } = req.params;
+    
+    logger.info({ paymentId }, "🔄 Syncing refund status from Dodo API");
+
+    // Fetch payment details from Dodo API
+    const apiUrl = `${config.dodoPayment.baseUrl}/payments/${paymentId}`;
+    
+    const response = await fetch(apiUrl, {
+      method: "GET",
+      headers: {
+        "Authorization": `Bearer ${config.dodoPayment.apiKey}`,
+        "Content-Type": "application/json",
+      },
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      logger.error({ status: response.status, error: errorText }, "Failed to fetch payment from Dodo");
+      return res.status(response.status).json({ 
+        error: "Failed to fetch payment from Dodo API",
+        details: errorText 
+      });
+    }
+
+    const paymentData = await response.json();
+    
+    logger.info({ 
+      paymentId, 
+      status: paymentData.status,
+      hasRefunds: !!paymentData.refunds 
+    }, "Payment data retrieved from Dodo");
+
+    // Check if payment has refunds
+    const refunds = paymentData.refunds || [];
+    
+    if (refunds.length === 0) {
+      return res.json({ 
+        message: "No refunds found for this payment",
+        paymentId,
+        paymentStatus: paymentData.status 
+      });
+    }
+
+    // Process each refund
+    const results = [];
+    for (const refund of refunds) {
+      const refundStatusFromDodo = refund.status || "pending";
+      const refundId = refund.refund_id || refund.id;
+      
+      // Map Dodo refund status to our handler status
+      // Dodo has: pending, succeeded, failed
+      // Our handler accepts: succeeded, failed
+      // If pending, we'll log it but not revoke access yet
+      const handlerStatus: "succeeded" | "failed" = 
+        refundStatusFromDodo === "succeeded" ? "succeeded" :
+        refundStatusFromDodo === "failed" ? "failed" :
+        "succeeded"; // Treat pending as succeeded for now (will be updated when it actually succeeds)
+      
+      logger.info({ 
+        refundId, 
+        refundStatusFromDodo,
+        handlerStatus,
+        paymentId 
+      }, "Processing refund from sync");
+
+      // Only process if refund succeeded or failed
+      // Pending refunds will be processed when they succeed via webhook
+      if (refundStatusFromDodo === "succeeded") {
+        await handleRefund({
+          payment_id: paymentId,
+          refund_id: refundId,
+          amount: refund.amount || 0,
+          currency: refund.currency || paymentData.currency,
+          customer: paymentData.customer,
+          customer_email: paymentData.customer?.email,
+        }, `sync_${Date.now()}`, "succeeded");
+      } else if (refundStatusFromDodo === "failed") {
+        await handleRefund({
+          payment_id: paymentId,
+          refund_id: refundId,
+          amount: refund.amount || 0,
+          currency: refund.currency || paymentData.currency,
+          customer: paymentData.customer,
+          customer_email: paymentData.customer?.email,
+        }, `sync_${Date.now()}`, "failed");
+      } else {
+        // Pending - just log it
+        logger.info({ 
+          refundId, 
+          paymentId 
+        }, "⏳ Refund is pending - will process when succeeded");
+        
+        // Log pending refund to payment_attempts
+        try {
+          await supabase.from("payment_attempts").insert({
+            email: paymentData.customer?.email || null,
+            payment_id: paymentId,
+            refund_id: refundId,
+            status: "refund_pending",
+            amount_cents: refund.amount || 0,
+            currency: refund.currency || paymentData.currency,
+            webhook_id: `sync_${Date.now()}`,
+            metadata: {
+              refund_data: refund,
+              refund_status: "pending",
+              processed_at: new Date().toISOString(),
+            }
+          });
+        } catch (logError: any) {
+          logger.warn({ error: logError }, "Failed to log pending refund");
+        }
+      }
+
+      results.push({
+        refundId,
+        status: refundStatusFromDodo,
+        amount: refund.amount,
+        processed: refundStatusFromDodo !== "pending"
+      });
+    }
+
+    res.json({
+      message: "Refund status synced",
+      paymentId,
+      refundsProcessed: results.length,
+      results
+    });
+
+  } catch (error: any) {
+    logger.error({ error, stack: error?.stack }, "Error syncing refund status");
     res.status(500).json({ error: "Internal server error" });
   }
 });
@@ -592,47 +782,155 @@ async function handlePaymentFailure(data: any, webhookId: string) {
 // ============================================================================
 // HANDLER: Refund
 // ============================================================================
-async function handleRefund(data: any, webhookId: string) {
+async function handleRefund(data: any, webhookId: string, refundStatus: "succeeded" | "failed" = "succeeded") {
   try {
-    const paymentId = data.payment_id || data.metadata?.payment_id;
-    const email = data.customer?.email || data.email;
+    const paymentId = data.payment_id || data.id || data.metadata?.payment_id;
+    const refundId = data.refund_id || data.id;
+    const email = data.customer?.email || data.customer_email || data.email;
+    const amountCents = data.amount || data.refund_amount || 0;
+    const currency = data.currency || "USD";
+    const refundReason = data.reason || data.refund_reason || "Refund processed";
 
-    logger.info({ paymentId, email }, "Processing refund");
+    logger.info({ 
+      paymentId, 
+      refundId,
+      email, 
+      amountCents,
+      refundStatus,
+      webhookId 
+    }, `🔄 Processing refund (status: ${refundStatus})`);
 
-    if (paymentId) {
-      // Revoke access by payment_id
-      const { data: existing } = await supabase
-        .from("early_access")
-        .select("metadata")
-        .eq("payment_id", paymentId)
-        .maybeSingle();
-      
-      await supabase
-        .from("early_access")
-        .update({ 
-          status: "refunded",
-          updated_at: new Date().toISOString(),
-          metadata: {
-            ...(existing?.metadata || {}),
-            refund_webhook_id: webhookId,
-            refunded_at: new Date().toISOString()
-          }
-        })
-        .eq("payment_id", paymentId);
-    } else if (email) {
-      // Revoke access by email
-      await supabase
-        .from("early_access")
-        .update({ 
-          status: "refunded",
-          updated_at: new Date().toISOString()
-        })
-        .eq("email", email)
-        .eq("status", "granted");
+    // Log refund attempt
+    const attemptStatus = refundStatus === "succeeded" ? "refunded" : "refund_failed";
+    
+    try {
+      await supabase.from("payment_attempts").insert({
+        email: email || null,
+        payment_id: paymentId,
+        refund_id: refundId,
+        status: attemptStatus,
+        amount_cents: amountCents,
+        currency,
+        webhook_id: webhookId,
+        error_message: refundReason,
+        metadata: {
+          refund_data: data,
+          refund_status: refundStatus,
+          processed_at: new Date().toISOString(),
+        }
+      });
+    } catch (logError: any) {
+      logger.warn({ error: logError }, "Failed to log refund attempt");
     }
 
-    logger.info({ paymentId, email }, "Access revoked due to refund");
+    // Only revoke access if refund succeeded
+    // For failed refunds, just log it but don't revoke access
+    if (refundStatus !== "succeeded") {
+      logger.info({ 
+        paymentId, 
+        refundStatus 
+      }, `⚠️ Refund ${refundStatus} - access not revoked`);
+      return;
+    }
+
+    let accessRevoked = false;
+
+    if (paymentId) {
+      // Revoke access by payment_id (most reliable)
+      const { data: existing } = await supabase
+        .from("early_access")
+        .select("id, email, metadata")
+        .eq("payment_id", paymentId)
+        .eq("status", "granted")
+        .maybeSingle();
+      
+      if (existing) {
+        const { error: updateError } = await supabase
+          .from("early_access")
+          .update({ 
+            status: "refunded",
+            updated_at: new Date().toISOString(),
+            metadata: {
+              ...(existing.metadata || {}),
+              refund_webhook_id: webhookId,
+              refund_id: refundId,
+              refunded_at: new Date().toISOString(),
+              refund_amount_cents: amountCents,
+              refund_reason: refundReason,
+              refund_status: refundStatus,
+            }
+          })
+          .eq("payment_id", paymentId)
+          .eq("status", "granted");
+        
+        if (!updateError) {
+          accessRevoked = true;
+          logger.info({ 
+            paymentId, 
+            email: existing.email,
+            accessId: existing.id 
+          }, "✅ Access revoked by payment_id");
+        } else {
+          logger.error({ error: updateError }, "Failed to revoke access by payment_id");
+        }
+      } else {
+        logger.warn({ paymentId }, "No active access found for payment_id");
+      }
+    }
+    
+    // Also try by email if payment_id didn't work
+    if (!accessRevoked && email) {
+      const { data: existingByEmail } = await supabase
+        .from("early_access")
+        .select("id, payment_id, metadata")
+        .eq("email", email)
+        .eq("status", "granted")
+        .maybeSingle();
+      
+      if (existingByEmail) {
+        const { error: updateError } = await supabase
+          .from("early_access")
+          .update({ 
+            status: "refunded",
+            updated_at: new Date().toISOString(),
+            metadata: {
+              ...(existingByEmail.metadata || {}),
+              refund_webhook_id: webhookId,
+              refund_id: refundId,
+              refunded_at: new Date().toISOString(),
+              refund_amount_cents: amountCents,
+              refund_reason: refundReason,
+              refund_status: refundStatus,
+            }
+          })
+          .eq("email", email)
+          .eq("status", "granted");
+        
+        if (!updateError) {
+          accessRevoked = true;
+          logger.info({ 
+            email,
+            paymentId: existingByEmail.payment_id,
+            accessId: existingByEmail.id 
+          }, "✅ Access revoked by email");
+        } else {
+          logger.error({ error: updateError }, "Failed to revoke access by email");
+        }
+      }
+    }
+
+    if (!accessRevoked) {
+      logger.warn({ paymentId, email }, "⚠️ No active access found to revoke");
+    }
+
+    logger.info({ 
+      paymentId, 
+      email, 
+      accessRevoked,
+      refundId,
+      refundStatus
+    }, "🔄 Refund processing complete");
   } catch (error: any) {
-    logger.error({ error }, "Error handling refund");
+    logger.error({ error, stack: error?.stack }, "❌ Error handling refund");
   }
 }

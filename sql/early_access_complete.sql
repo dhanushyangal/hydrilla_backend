@@ -89,8 +89,9 @@ CREATE TABLE payment_attempts (
     email TEXT NOT NULL,
     user_id TEXT,
     payment_id TEXT,
+    refund_id TEXT,                      -- Dodo Refund ID (for refund tracking)
     checkout_session_id TEXT,
-    status TEXT NOT NULL,               -- 'pending', 'succeeded', 'failed', 'refunded'
+    status TEXT NOT NULL,               -- 'pending', 'succeeded', 'failed', 'refunded', 'refund_pending', 'refund_failed'
     amount_cents INTEGER,
     currency TEXT DEFAULT 'USD',
     error_message TEXT,
@@ -103,6 +104,7 @@ CREATE TABLE payment_attempts (
 -- Indexes
 CREATE INDEX idx_payment_attempts_email ON payment_attempts(email);
 CREATE INDEX idx_payment_attempts_payment_id ON payment_attempts(payment_id) WHERE payment_id IS NOT NULL;
+CREATE INDEX idx_payment_attempts_refund_id ON payment_attempts(refund_id) WHERE refund_id IS NOT NULL;
 CREATE INDEX idx_payment_attempts_status ON payment_attempts(status);
 CREATE INDEX idx_payment_attempts_created_at ON payment_attempts(created_at DESC);
 
