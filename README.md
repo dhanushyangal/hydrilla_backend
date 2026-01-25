@@ -355,6 +355,7 @@ Uses Pino for structured logging. Logs are output in JSON format for easy parsin
 
 ## Related Documentation
 
+- **[BACKEND_GUIDE.md](./BACKEND_GUIDE.md)** - Complete backend guide (setup, API, payments, deployment)
 - [API Documentation](../API_DOCUMENTATION.md) - Complete API reference
 - [Environment Variables Guide](../ENVIRONMENT_VARIABLES.md) - Detailed env var guide
 - [System Architecture](../SYSTEM_ARCHITECTURE.md) - System overview
