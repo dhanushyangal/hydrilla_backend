@@ -18,6 +18,7 @@ export interface CreateJobInput {
 export interface JobRecord {
   id: string;
   userId: string | null;  // Owner of the job
+  chatId: string | null;  // Chat this job belongs to
   status: JobStatus;
   prompt: string | null;
   imageUrl: string | null;
@@ -30,6 +31,14 @@ export interface JobRecord {
   errorCode: string | null;
   errorMessage: string | null;
   name: string | null;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+export interface ChatRecord {
+  id: string;
+  userId: string;
+  name: string;
   createdAt: Date;
   updatedAt: Date;
 }

@@ -347,6 +347,20 @@ Uses Pino for structured logging. Logs are output in JSON format for easy parsin
 - Check S3 bucket permissions
 - Verify bucket name and region match
 
+### Expired Image URLs
+
+The backend automatically normalizes S3 image URLs to remove expired signed URL parameters. All image URLs returned from the API are converted to direct S3 URLs (without query parameters) to prevent expiration issues. This is handled in:
+
+- `backend/src/utils/s3Urls.ts` - URL normalization utilities
+- `backend/src/repository/jobs.ts` - Job data mapping
+- `backend/src/repository/chats.ts` - Chat preview image normalization
+- `backend/src/routes/threeD.ts` - API response normalization
+
+If images are not showing, ensure:
+1. S3 bucket is configured as public or has proper CORS settings
+2. Image URLs in the database are being normalized correctly
+3. Direct S3 URLs are being used instead of presigned URLs
+
 ### Python API Connection
 
 - Verify `HUNYUAN_API_URL` is correct

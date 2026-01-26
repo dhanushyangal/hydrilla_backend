@@ -1,10 +1,12 @@
 import { supabase } from "../db.js";
 import { GenerateType, JobRecord, JobStatus, PolygonType } from "../types.js";
 import { logger } from "../logger.js";
+import { normalizeGlbUrl, normalizePreviewUrl } from "../utils/s3Urls.js";
 
 export async function createJob(params: {
   id: string;
   userId?: string | null;  // Owner of the job
+  chatId?: string | null;  // Chat this job belongs to
   prompt?: string | null;
   imageUrl?: string | null;
   generateType: GenerateType;
@@ -16,6 +18,7 @@ export async function createJob(params: {
   const {
     id,
     userId = null,
+    chatId = null,
     prompt = null,
     imageUrl = null,
     generateType,
@@ -29,6 +32,7 @@ export async function createJob(params: {
     const { error } = await supabase.from("jobs").insert({
       id,
       user_id: userId,
+      chat_id: chatId,
       status: status,
       prompt,
       image_url: imageUrl,
@@ -231,18 +235,35 @@ export async function deleteJob(jobId: string, userId: string): Promise<boolean>
 }
 
 function mapRow(row: any): JobRecord {
+  // Normalize URLs to remove expired signed URL parameters
+  let imageUrl = row.image_url;
+  let previewImageUrl = row.preview_image_url;
+  let resultGlbUrl = row.result_glb_url;
+  
+  // Normalize image URLs
+  if (imageUrl && imageUrl.includes('amazonaws.com')) {
+    imageUrl = imageUrl.split('?')[0]; // Strip query params
+  }
+  if (previewImageUrl) {
+    previewImageUrl = normalizePreviewUrl(row.id, previewImageUrl);
+  }
+  if (resultGlbUrl) {
+    resultGlbUrl = normalizeGlbUrl(row.id, resultGlbUrl);
+  }
+  
   return {
     id: row.id,
     userId: row.user_id || null,
+    chatId: row.chat_id || null,
     status: row.status,
     prompt: row.prompt,
-    imageUrl: row.image_url,
+    imageUrl: imageUrl,
     generateType: row.generate_type,
     faceCount: row.face_count,
     enablePBR: row.enable_pbr,
     polygonType: row.polygon_type,
-    resultGlbUrl: row.result_glb_url,
-    previewImageUrl: row.preview_image_url,
+    resultGlbUrl: resultGlbUrl,
+    previewImageUrl: previewImageUrl,
     errorCode: row.error_code,
     errorMessage: row.error_message,
     name: row.name || null,

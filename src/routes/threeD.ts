@@ -8,9 +8,10 @@ import { logger } from "../logger.js";
 import { config } from "../config.js";
 import { supabase } from "../db.js";
 import { createJob, getJob, listJobs, listJobsForUser, updateJobResult, updateJobStatus, updateJobName, deleteJob, getJobForUser } from "../repository/jobs.js";
+import { createChat, getChat, getChatForUser, listChatsForUser, updateChatName, deleteChat, getOrCreateActiveChat } from "../repository/chats.js";
 import { optionalAuth, requireAuth, syncUserToDatabase } from "../middleware/auth.js";
 import { normalizeGlbUrl, normalizePreviewUrl } from "../utils/s3Urls.js";
-import { JobStatus } from "../types.js";
+import { JobStatus, JobRecord, ChatRecord } from "../types.js";
 
 export const threeDRouter = Router();
 
@@ -766,17 +767,231 @@ threeDRouter.delete("/jobs/:jobId", requireAuth, async (req, res) => {
 });
 
 // ============================================
+// Chat Management Endpoints
+// ============================================
+
+// Get all chats for user
+threeDRouter.get("/chats", requireAuth, async (req, res) => {
+  try {
+    const userId = req.userId!;
+    const chats = await listChatsForUser(userId, 100);
+    res.json({ chats });
+  } catch (err: any) {
+    logger.error(err, "failed to fetch chats");
+    // Check if error is due to missing table
+    if (err.code === "TABLE_NOT_FOUND" || 
+        (err.message && (err.message.includes("relation") || err.message.includes("does not exist")))) {
+      logger.warn("Chats table does not exist yet. Please run the migration.");
+      res.status(200).json({ chats: [] }); // Return empty array instead of error
+    } else {
+      res.status(500).json({ error: err.message || "Failed to fetch chats" });
+    }
+  }
+});
+
+// Get or create active chat (most recent chat, or create new one)
+// IMPORTANT: This must come BEFORE /chats/:chatId to avoid route conflicts
+threeDRouter.get("/chats/active", requireAuth, async (req, res) => {
+  try {
+    const userId = req.userId!;
+    
+    // Ensure user exists in database before creating chat (chats table has FK to users)
+    try {
+      await syncUserToDatabase(userId);
+    } catch (syncErr: any) {
+      logger.warn({ err: syncErr, userId }, "Failed to sync user to database, continuing anyway");
+      // Continue - user might already exist
+    }
+    
+    const chat = await getOrCreateActiveChat(userId);
+    res.json({ chat });
+  } catch (err: any) {
+    logger.error({ 
+      err, 
+      userId: req.userId, 
+      errorCode: err.code, 
+      errorMessage: err.message,
+      errorStack: err.stack 
+    }, "failed to get or create active chat");
+    
+    // Check if error is due to missing table
+    if (err.code === "TABLE_NOT_FOUND" || 
+        (err.message && (err.message.includes("relation") || err.message.includes("does not exist")))) {
+      logger.warn("Chats table does not exist yet. Please run the migration.");
+      res.status(200).json({ chat: null }); // Return null instead of error
+      return;
+    }
+    
+    // Check if error is due to user not existing (foreign key violation)
+    if (err.message && err.message.includes("does not exist") && err.message.includes("User")) {
+      logger.warn({ userId: req.userId }, "User does not exist in database - returning null chat");
+      res.status(200).json({ chat: null }); // Return null instead of error
+      return;
+    }
+    
+    // For all other errors, return null gracefully instead of 500
+    // This prevents the frontend from showing errors when the backend has issues
+    logger.warn({ 
+      fullError: err,
+      errorDetails: {
+        code: err.code,
+        message: err.message,
+        details: err.details,
+        hint: err.hint,
+      }
+    }, "Error getting active chat - returning null gracefully");
+    res.status(200).json({ chat: null }); // Return null instead of error to prevent frontend crashes
+  }
+});
+
+// Get a specific chat with its jobs
+threeDRouter.get("/chats/:chatId", requireAuth, async (req, res) => {
+  try {
+    const { chatId } = req.params;
+    const userId = req.userId!;
+
+    const chat = await getChatForUser(chatId, userId);
+    if (!chat) {
+      return res.status(404).json({ error: "Chat not found" });
+    }
+
+    // Get all jobs in this chat
+    const { data: jobsData, error: jobsError } = await supabase
+      .from("jobs")
+      .select("*")
+      .eq("chat_id", chatId)
+      .eq("user_id", userId)
+      .order("created_at", { ascending: true });
+
+    if (jobsError) throw jobsError;
+
+    const jobs = (jobsData || []).map((row: any) => {
+      // Normalize URLs to remove expired signed URL parameters
+      let imageUrl = row.image_url;
+      let previewImageUrl = row.preview_image_url;
+      let resultGlbUrl = row.result_glb_url;
+      
+      // Normalize image URLs
+      if (imageUrl && imageUrl.includes('amazonaws.com')) {
+        imageUrl = imageUrl.split('?')[0]; // Strip query params
+      }
+      if (previewImageUrl) {
+        previewImageUrl = normalizePreviewUrl(row.id, previewImageUrl);
+      }
+      if (resultGlbUrl) {
+        resultGlbUrl = normalizeGlbUrl(row.id, resultGlbUrl);
+      }
+      
+      return {
+        id: row.id,
+        userId: row.user_id || null,
+        chatId: row.chat_id || null,
+        status: row.status,
+        prompt: row.prompt,
+        imageUrl: imageUrl,
+        generateType: row.generate_type,
+        faceCount: row.face_count,
+        enablePBR: row.enable_pbr,
+        polygonType: row.polygon_type,
+        resultGlbUrl: resultGlbUrl,
+        previewImageUrl: previewImageUrl,
+        errorCode: row.error_code,
+        errorMessage: row.error_message,
+        name: row.name || null,
+        createdAt: row.created_at,
+        updatedAt: row.updated_at,
+      };
+    });
+
+    res.json({ chat, jobs });
+  } catch (err: any) {
+    logger.error(err, "failed to fetch chat");
+    res.status(500).json({ error: err.message || "Failed to fetch chat" });
+  }
+});
+
+// Create a new chat
+threeDRouter.post("/chats", requireAuth, async (req, res) => {
+  try {
+    const userId = req.userId!;
+    const { name } = req.body as { name?: string };
+
+    const chat = await createChat({
+      userId,
+      name: name || "New Chat",
+    });
+
+    res.json({ chat });
+  } catch (err: any) {
+    logger.error(err, "failed to create chat");
+    res.status(500).json({ error: err.message || "Failed to create chat" });
+  }
+});
+
+// Update chat name
+threeDRouter.patch("/chats/:chatId/name", requireAuth, async (req, res) => {
+  try {
+    const { chatId } = req.params;
+    const userId = req.userId!;
+    const { name } = req.body as { name: string };
+
+    if (!name || !name.trim()) {
+      return res.status(400).json({ error: "Chat name is required" });
+    }
+
+    await updateChatName(chatId, name.trim(), userId);
+    res.json({ success: true });
+  } catch (err: any) {
+    logger.error(err, "failed to update chat name");
+    res.status(500).json({ error: err.message || "Failed to update chat name" });
+  }
+});
+
+// Delete a chat
+threeDRouter.delete("/chats/:chatId", requireAuth, async (req, res) => {
+  try {
+    const { chatId } = req.params;
+    const userId = req.userId!;
+
+    const chat = await getChatForUser(chatId, userId);
+    if (!chat) {
+      return res.status(404).json({ error: "Chat not found" });
+    }
+
+    await deleteChat(chatId, userId);
+    res.json({ success: true, message: "Chat deleted" });
+  } catch (err: any) {
+    logger.error(err, "failed to delete chat");
+    res.status(500).json({ error: err.message || "Failed to delete chat" });
+  }
+});
+
+// ============================================
 // Register Job (with optional auth)
 // ============================================
 threeDRouter.post("/register-job", optionalAuth, async (req, res) => {
   try {
-    const { job_id, prompt, imageUrl, previewImageUrl } = req.body as {
+    const { job_id, prompt, imageUrl, previewImageUrl, previewJobId, chatId } = req.body as {
       job_id: string;
       prompt?: string;
       imageUrl?: string;
       previewImageUrl?: string;
+      previewJobId?: string;
+      chatId?: string;
     };
     const userId = req.userId;
+    
+    // Get or create active chat if user is authenticated and no chatId provided
+    let finalChatId: string | null = chatId || null;
+    if (userId && !finalChatId) {
+      try {
+        const activeChat = await getOrCreateActiveChat(userId);
+        finalChatId = activeChat.id;
+        logger.info({ jobId: job_id, chatId: finalChatId }, "Using active chat for job");
+      } catch (chatErr) {
+        logger.warn({ err: chatErr, jobId: job_id }, "Failed to get/create active chat, continuing without chat");
+      }
+    }
 
     if (!job_id) {
       return res.status(400).json({ error: "job_id is required" });
@@ -791,6 +1006,69 @@ threeDRouter.post("/register-job", optionalAuth, async (req, res) => {
       }
     }
 
+    // If previewJobId is provided, fetch the preview job to copy name and prompt
+    let previewJob: JobRecord | null = null;
+    let finalPrompt = prompt || null;
+    let finalName: string | null = null;
+    
+    logger.info({ jobId: job_id, previewJobId, hasPrompt: !!prompt, hasImageUrl: !!imageUrl }, "Register job request received");
+    
+    if (previewJobId) {
+      logger.info({ jobId: job_id, previewJobId }, "Preview job ID provided, fetching preview job");
+      previewJob = await getJob(previewJobId);
+      if (previewJob) {
+        logger.info({ jobId: job_id, previewJobId, previewJobPrompt: previewJob.prompt?.slice(0, 50), previewJobName: previewJob.name }, "Preview job found");
+        // Copy name and prompt from preview job (preview job prompt takes priority)
+        if (previewJob.prompt !== null && previewJob.prompt !== undefined) {
+          finalPrompt = previewJob.prompt;
+          logger.info({ jobId: job_id, previewJobId, prompt: finalPrompt?.slice(0, 50) }, "Copied prompt from preview job");
+        } else {
+          logger.warn({ jobId: job_id, previewJobId }, "Preview job has no prompt to copy");
+        }
+        if (previewJob.name !== null && previewJob.name !== undefined) {
+          finalName = previewJob.name;
+          logger.info({ jobId: job_id, previewJobId, name: finalName }, "Copied name from preview job");
+        }
+      } else {
+        logger.warn({ jobId: job_id, previewJobId }, "Preview job not found");
+      }
+    } else {
+      logger.info({ jobId: job_id }, "No preview job ID provided");
+      
+      // Fallback: If no previewJobId but we have an imageUrl, try to find the preview job
+      // by matching the imageUrl with a preview job's previewImageUrl
+      if (imageUrl && userId) {
+        try {
+          const { data: previewJobs, error: previewError } = await supabase
+            .from("jobs")
+            .select("id, prompt, name")
+            .eq("preview_image_url", imageUrl)
+            .eq("user_id", userId)
+            .is("result_glb_url", null) // Only preview jobs (no 3D result)
+            .limit(1);
+          
+          if (!previewError && previewJobs && previewJobs.length > 0) {
+            const foundPreviewJob = previewJobs[0];
+            logger.info({ jobId: job_id, foundPreviewJobId: foundPreviewJob.id, prompt: foundPreviewJob.prompt?.slice(0, 50) }, "Found preview job by matching imageUrl");
+            
+            // Use the found preview job's prompt and name
+            if (foundPreviewJob.prompt !== null && foundPreviewJob.prompt !== undefined) {
+              finalPrompt = foundPreviewJob.prompt;
+            }
+            if (foundPreviewJob.name !== null && foundPreviewJob.name !== undefined) {
+              finalName = foundPreviewJob.name;
+            }
+            // Set previewJobId for later use
+            const foundPreviewJobId = foundPreviewJob.id;
+            // We'll treat this as if previewJobId was provided
+            previewJob = await getJob(foundPreviewJobId);
+          }
+        } catch (fallbackErr) {
+          logger.warn({ err: fallbackErr, jobId: job_id }, "Failed to find preview job by imageUrl fallback");
+        }
+      }
+    }
+
     const existingJob = await getJob(job_id);
     if (existingJob) {
       // Check ownership - don't allow updating jobs owned by other users
@@ -798,17 +1076,74 @@ threeDRouter.post("/register-job", optionalAuth, async (req, res) => {
         return res.status(403).json({ error: "You don't have permission to update this job" });
       }
       
-      // Update user_id if job exists but has no owner and we have a userId
+      // Update user_id and chat_id if job exists but has no owner and we have a userId
       if (!existingJob.userId && userId) {
+        try {
+          const updateData: any = { user_id: userId };
+          if (finalChatId && !existingJob.chatId) {
+            updateData.chat_id = finalChatId;
+          }
+          await supabase
+            .from("jobs")
+            .update(updateData)
+            .eq("id", job_id);
+          logger.info({ jobId: job_id, userId, chatId: finalChatId }, "Updated job with user_id and chat_id");
+        } catch (updateErr) {
+          logger.warn({ err: updateErr }, "Failed to update job with user_id/chat_id");
+        }
+      } else if (finalChatId && !existingJob.chatId && userId) {
+        // Update chat_id if not set
         try {
           await supabase
             .from("jobs")
-            .update({ user_id: userId })
+            .update({ chat_id: finalChatId })
             .eq("id", job_id);
-          logger.info({ jobId: job_id, userId }, "Updated job with user_id");
+          logger.info({ jobId: job_id, chatId: finalChatId }, "Updated job with chat_id");
         } catch (updateErr) {
-          logger.warn({ err: updateErr }, "Failed to update job with user_id");
+          logger.warn({ err: updateErr }, "Failed to update job with chat_id");
         }
+      }
+      
+      // Update prompt and name from preview job if provided
+      if (previewJob) {
+        try {
+          const updateData: any = { updated_at: new Date().toISOString() };
+          let hasUpdates = false;
+          
+          // Always update prompt if we have it from preview job (even if it's an empty string)
+          if (finalPrompt !== null && finalPrompt !== undefined) {
+            updateData.prompt = finalPrompt;
+            hasUpdates = true;
+            logger.info({ jobId: job_id, previewJobId, prompt: finalPrompt?.slice(0, 50) }, "Will update prompt from preview job");
+          } else {
+            logger.warn({ jobId: job_id, previewJobId, previewJobPrompt: previewJob.prompt }, "Preview job has no prompt to copy");
+          }
+          
+          if (finalName !== null && finalName !== undefined) {
+            updateData.name = finalName;
+            hasUpdates = true;
+          }
+          
+          // Update the job if we have changes
+          if (hasUpdates) {
+            const { error: updateError } = await supabase
+              .from("jobs")
+              .update(updateData)
+              .eq("id", job_id);
+            
+            if (updateError) {
+              throw updateError;
+            }
+            
+            logger.info({ jobId: job_id, name: finalName, prompt: finalPrompt?.slice(0, 50) }, "Successfully updated existing job with preview job name/prompt");
+          } else {
+            logger.warn({ jobId: job_id, previewJobId }, "No updates to apply from preview job");
+          }
+        } catch (updateErr: any) {
+          logger.error({ err: updateErr, jobId: job_id, previewJobId, finalPrompt: finalPrompt?.slice(0, 50) }, "Failed to update job with preview job name/prompt");
+        }
+      } else if (previewJobId) {
+        logger.warn({ jobId: job_id, previewJobId }, "Preview job not found, cannot copy prompt/name");
       }
       
       // Update preview image if provided
@@ -830,7 +1165,8 @@ threeDRouter.post("/register-job", optionalAuth, async (req, res) => {
     await createJob({
       id: job_id,
       userId: userId || null,
-      prompt: prompt || null,
+      chatId: finalChatId,
+      prompt: finalPrompt,
       imageUrl: imageUrl || null,
       generateType: "Normal",
       faceCount: null,
@@ -839,12 +1175,17 @@ threeDRouter.post("/register-job", optionalAuth, async (req, res) => {
       status: initialStatus,
     });
     
+    // Update name if we got it from preview job
+    if (finalName) {
+      await updateJobName(job_id, finalName, userId || undefined);
+    }
+    
     // Update preview image if provided
     if (previewImageUrl) {
       await updateJobResult(job_id, { previewImageUrl });
     }
 
-    logger.info({ jobId: job_id, userId, prompt: prompt?.slice(0, 50) }, "Job registered successfully");
+    logger.info({ jobId: job_id, userId, prompt: finalPrompt?.slice(0, 50), name: finalName }, "Job registered successfully");
     res.json({ success: true, job_id });
   } catch (err: any) {
     logger.error(err, "failed to register job");
@@ -910,6 +1251,30 @@ threeDRouter.post("/webhook/job-update", async (req, res) => {
         resultGlbUrl: glbUrl,
         previewImageUrl: previewUrl,
       });
+      
+      // If this 3D job was created from a preview image, delete the preview job
+      // Find preview job by matching this job's imageUrl with preview job's previewImageUrl
+      if (job.imageUrl && job.userId) {
+        try {
+          const { data: previewJobs, error: previewError } = await supabase
+            .from("jobs")
+            .select("id")
+            .eq("preview_image_url", job.imageUrl)
+            .eq("user_id", job.userId)
+            .is("result_glb_url", null) // Only preview jobs (no 3D result)
+            .limit(1);
+          
+          if (!previewError && previewJobs && previewJobs.length > 0) {
+            const previewJobId = previewJobs[0].id;
+            // Delete the preview job
+            await deleteJob(previewJobId, job.userId);
+            logger.info({ jobId: job_id, previewJobId }, "Deleted preview job after 3D completion");
+          }
+        } catch (deleteErr) {
+          // Log but don't fail webhook processing
+          logger.warn({ err: deleteErr, job_id }, "Failed to delete preview job (non-critical)");
+        }
+      }
       
       // Send completion email if this is the first time we're getting the GLB URL
       // and the job has a user (not anonymous)
