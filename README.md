@@ -255,6 +255,97 @@ Get current user profile and statistics.
 #### `POST /api/3d/sync-user`
 Sync authenticated user to database (called automatically).
 
+### Chat Management Endpoints
+
+#### `GET /api/3d/chats`
+Get all chats for the authenticated user.
+
+**Response:**
+```json
+{
+  "chats": [
+    {
+      "id": "uuid",
+      "name": "My Chat",
+      "firstJobPreviewImageUrl": "https://s3.../preview.png",
+      "firstJobPrompt": "A red sports car",
+      "createdAt": "2024-01-01T00:00:00Z",
+      "updatedAt": "2024-01-01T00:00:00Z"
+    }
+  ]
+}
+```
+
+#### `GET /api/3d/chats/active`
+Get or create the most recently updated chat.
+
+**Response:**
+```json
+{
+  "chat": {
+    "id": "uuid",
+    "name": "New Chat",
+    "createdAt": "2024-01-01T00:00:00Z",
+    "updatedAt": "2024-01-01T00:00:00Z"
+  }
+}
+```
+
+#### `GET /api/3d/chats/:chatId`
+Get a specific chat with all its jobs.
+
+**Response:**
+```json
+{
+  "chat": {
+    "id": "uuid",
+    "name": "My Chat",
+    "createdAt": "2024-01-01T00:00:00Z",
+    "updatedAt": "2024-01-01T00:00:00Z"
+  },
+  "jobs": [
+    {
+      "id": "uuid",
+      "status": "DONE",
+      "prompt": "A red sports car",
+      "previewImageUrl": "https://s3.../preview.png",
+      "resultGlbUrl": "https://s3.../mesh.glb"
+    }
+  ]
+}
+```
+
+#### `POST /api/3d/chats`
+Create a new chat.
+
+**Request Body:**
+```json
+{
+  "name": "My New Chat"  // Optional
+}
+```
+
+#### `PATCH /api/3d/chats/:chatId/name`
+Update chat name.
+
+**Request Body:**
+```json
+{
+  "name": "Updated Chat Name"
+}
+```
+
+#### `DELETE /api/3d/chats/:chatId`
+Delete a chat (only if you own it).
+
+**Response:**
+```json
+{
+  "success": true,
+  "message": "Chat deleted"
+}
+```
+
 ### Health Check
 
 #### `GET /api/health`
@@ -292,6 +383,7 @@ See `sql/schema.sql` for the complete database schema. Key tables:
 
 - **users**: User profiles synced from Clerk
 - **jobs**: 3D generation jobs with status, URLs, and metadata
+- **chats**: Chat conversations that group multiple jobs together (ChatGPT-like interface)
 
 ## Deployment
 
