@@ -7,11 +7,12 @@ import { S3Client, PutObjectCommand, GetObjectCommand } from "@aws-sdk/client-s3
 import { logger } from "../logger.js";
 import { config } from "../config.js";
 import { supabase } from "../db.js";
-import { createJob, getJob, listJobs, listJobsForUser, updateJobResult, updateJobStatus, updateJobName, deleteJob, getJobForUser } from "../repository/jobs.js";
-import { createChat, getChat, getChatForUser, listChatsForUser, updateChatName, deleteChat, getOrCreateActiveChat } from "../repository/chats.js";
+import { createJob, getJob, listJobs, listJobsForUser, updateJobResult, updateJobStatus, updateJobName, deleteJob, getJobForUser, getJobLineage, upsertJobParents, getJobParentIds } from "../repository/jobs.js";
+import { createChat, getChat, getChatForUser, listChatsForUser, updateChatName, updateChatUpdatedAt, deleteChat, getOrCreateActiveChat } from "../repository/chats.js";
+import { createWorkspace, getWorkspace, getWorkspaceForUser, listWorkspacesForUser, listJobsForWorkspace, updateWorkspaceName, updateWorkspaceUpdatedAt, deleteWorkspace } from "../repository/workspaces.js";
 import { optionalAuth, requireAuth, syncUserToDatabase } from "../middleware/auth.js";
 import { normalizeGlbUrl, normalizePreviewUrl } from "../utils/s3Urls.js";
-import { JobStatus, JobRecord, ChatRecord } from "../types.js";
+import { JobStatus, JobRecord, ChatRecord, WorkspaceRecord, GenerateType } from "../types.js";
 
 export const threeDRouter = Router();
 
@@ -104,7 +105,7 @@ const upload = multer({
   },
 });
 
-const API_BASE = process.env.HUNYUAN_API_URL || "https://api.hydrilla.co";
+const API_BASE = process.env.HUNYUAN_API_URL || "https://api.hydrilla.ai";
 
 // Initialize S3 client
 let s3Client: S3Client | null = null;
@@ -210,12 +211,16 @@ threeDRouter.post("/generate", requireAuth, async (req, res) => {
       return res.status(400).json({ error: "Either prompt or imageUrl is required" });
     }
 
-    // Create job in database with user_id
+    // Create job in database with user_id; store source image for image-to-3D lineage
+    const sourceImages = body.imageUrl && (body.imageUrl.startsWith("http://") || body.imageUrl.startsWith("https://"))
+      ? [body.imageUrl]
+      : null;
     await createJob({
       id: jobId,
       userId,
       prompt: body.prompt || null,
       imageUrl: body.imageUrl || null,
+      sourceImages,
       generateType: "Normal",
       faceCount: null,
       enablePBR: true,
@@ -587,38 +592,25 @@ threeDRouter.get("/glb/:jobId", optionalAuth, async (req, res) => {
           // Get content length for progress tracking
           const contentLength = s3Response.ContentLength || s3Response.ContentLength || 0;
           
-          // Set CORS headers
+          // Set CORS and cache headers (browser can cache GLB for 1 hour)
           res.setHeader("Access-Control-Allow-Origin", "*");
           res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
           res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
           res.setHeader("Content-Type", "model/gltf-binary");
           res.setHeader("Content-Disposition", `inline; filename="mesh.glb"`);
+          res.setHeader("Cache-Control", "public, max-age=3600");
           if (contentLength > 0) {
             res.setHeader("Content-Length", contentLength.toString());
           }
           
-          // Stream the file
+          // Pipe S3 stream directly to response (no buffering = faster first byte)
           if (s3Response.Body) {
-            // Convert stream to buffer
             const stream = s3Response.Body as Readable;
-            const chunks: Buffer[] = [];
-            
-            stream.on('data', (chunk: Buffer) => {
-              chunks.push(chunk);
-            });
-            
-            stream.on('end', () => {
-              const buffer = Buffer.concat(chunks);
-              res.send(buffer);
-            });
-            
-            stream.on('error', (err: Error) => {
+            stream.on("error", (err: Error) => {
               logger.error({ jobId, err: err.message }, "Error streaming from S3");
-              if (!res.headersSent) {
-                res.status(500).json({ error: "Failed to stream GLB file" });
-              }
+              if (!res.headersSent) res.status(500).json({ error: "Failed to stream GLB file" });
             });
-            
+            stream.pipe(res);
             return;
           }
         }
@@ -627,29 +619,32 @@ threeDRouter.get("/glb/:jobId", optionalAuth, async (req, res) => {
       }
     }
 
-    // Fallback: proxy through backend by fetching the URL
+    // Fallback: proxy through backend by streaming the URL (no buffering = faster first byte)
     try {
       const response = await fetch(glbUrl);
       if (!response.ok) {
         return res.status(response.status).json({ error: "Failed to fetch GLB file" });
       }
 
-      // Get content length from response headers
       const contentLength = response.headers.get("content-length");
-      
-      // Set CORS headers
       res.setHeader("Access-Control-Allow-Origin", "*");
       res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
       res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
       res.setHeader("Content-Type", "model/gltf-binary");
       res.setHeader("Content-Disposition", `inline; filename="mesh.glb"`);
-      if (contentLength) {
-        res.setHeader("Content-Length", contentLength);
-      }
+      res.setHeader("Cache-Control", "public, max-age=3600");
+      if (contentLength) res.setHeader("Content-Length", contentLength);
 
-      // Stream the response
-      const buffer = await response.arrayBuffer();
-      res.send(Buffer.from(buffer));
+      // Stream response body to client (Node 18+ Readable.fromWeb = faster first byte)
+      const body = response.body;
+      if (body) {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any -- fetch body is web ReadableStream; fromWeb accepts it at runtime
+        const nodeStream = Readable.fromWeb(body as any);
+        nodeStream.pipe(res);
+      } else {
+        const buffer = await response.arrayBuffer();
+        res.send(Buffer.from(buffer));
+      }
     } catch (fetchErr: any) {
       logger.error({ jobId, err: fetchErr.message }, "Failed to proxy GLB file");
       res.status(500).json({ error: "Failed to load GLB file" });
@@ -657,6 +652,82 @@ threeDRouter.get("/glb/:jobId", optionalAuth, async (req, res) => {
   } catch (err: any) {
     logger.error({ err, jobId }, "Error proxying GLB file");
     res.status(500).json({ error: err.message || "Failed to proxy GLB file" });
+  }
+});
+
+// ============================================
+// Proxy image from S3 (to avoid CORS issues when fetching for combined edits)
+// ============================================
+threeDRouter.get("/image-proxy", optionalAuth, async (req, res) => {
+  const imageUrl = req.query.url as string;
+  if (!imageUrl) {
+    return res.status(400).json({ error: "url query parameter is required" });
+  }
+
+  // Only allow proxying from our own S3 bucket or known domains
+  const allowed = imageUrl.includes("hydrilla") || imageUrl.includes("amazonaws.com");
+  if (!allowed) {
+    return res.status(403).json({ error: "URL not allowed for proxying" });
+  }
+
+  try {
+    // If it's an S3 URL, try to fetch from S3 directly
+    if (imageUrl.includes(config.s3.bucket) && s3Enabled && s3Client) {
+      try {
+        const urlParts = imageUrl.split(`${config.s3.bucket}/`);
+        if (urlParts.length > 1) {
+          const s3Key = urlParts[1].split("?")[0];
+          const command = new GetObjectCommand({
+            Bucket: config.s3.bucket,
+            Key: s3Key,
+          });
+          const s3Response = await s3Client.send(command);
+          const contentLength = s3Response.ContentLength || 0;
+
+          res.setHeader("Access-Control-Allow-Origin", "*");
+          res.setHeader("Content-Type", s3Response.ContentType || "image/png");
+          res.setHeader("Cache-Control", "public, max-age=3600");
+          if (contentLength > 0) res.setHeader("Content-Length", contentLength.toString());
+
+          if (s3Response.Body) {
+            const stream = s3Response.Body as Readable;
+            stream.on("error", (err: Error) => {
+              logger.error({ err: err.message }, "Error streaming image from S3");
+              if (!res.headersSent) res.status(500).json({ error: "Failed to stream image" });
+            });
+            stream.pipe(res);
+            return;
+          }
+        }
+      } catch (s3Err: any) {
+        logger.warn({ err: s3Err.message }, "Failed to fetch image from S3, trying direct URL");
+      }
+    }
+
+    // Fallback: proxy through direct fetch
+    const response = await fetch(imageUrl);
+    if (!response.ok) {
+      return res.status(response.status).json({ error: "Failed to fetch image" });
+    }
+
+    const contentType = response.headers.get("content-type") || "image/png";
+    const contentLength = response.headers.get("content-length");
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.setHeader("Content-Type", contentType);
+    res.setHeader("Cache-Control", "public, max-age=3600");
+    if (contentLength) res.setHeader("Content-Length", contentLength);
+
+    const body = response.body;
+    if (body) {
+      const nodeStream = Readable.fromWeb(body as any);
+      nodeStream.pipe(res);
+    } else {
+      const buffer = await response.arrayBuffer();
+      res.send(Buffer.from(buffer));
+    }
+  } catch (err: any) {
+    logger.error({ err: err.message }, "Error proxying image");
+    res.status(500).json({ error: err.message || "Failed to proxy image" });
   }
 });
 
@@ -916,6 +987,9 @@ threeDRouter.post("/chats", requireAuth, async (req, res) => {
     const userId = req.userId!;
     const { name } = req.body as { name?: string };
 
+    // Ensure user exists in DB so chat insert (FK on user_id) succeeds
+    await syncUserToDatabase(userId);
+
     const chat = await createChat({
       userId,
       name: name || "New Chat",
@@ -971,19 +1045,25 @@ threeDRouter.delete("/chats/:chatId", requireAuth, async (req, res) => {
 // ============================================
 threeDRouter.post("/register-job", optionalAuth, async (req, res) => {
   try {
-    const { job_id, prompt, imageUrl, previewImageUrl, previewJobId, chatId } = req.body as {
+    const { job_id, prompt, imageUrl, previewImageUrl, previewJobId, parentJobId, parentJobIds, chatId, workspaceId, generateType: reqGenerateType, sourceImages } = req.body as {
       job_id: string;
       prompt?: string;
       imageUrl?: string;
       previewImageUrl?: string;
       previewJobId?: string;
+      parentJobId?: string;
+      parentJobIds?: string[];   // Multi-parent IDs (e.g. 2 images for combined edit)
       chatId?: string;
+      workspaceId?: string;
+      generateType?: string;
+      sourceImages?: string[];   // Actual source image URLs used as input
     };
     const userId = req.userId;
     
-    // Get or create active chat if user is authenticated and no chatId provided
+    // Get or create active chat if user is authenticated, no chatId provided,
+    // and this is NOT a workspace job (workspace jobs don't need chats — saves a DB round-trip)
     let finalChatId: string | null = chatId || null;
-    if (userId && !finalChatId) {
+    if (userId && !finalChatId && !workspaceId) {
       try {
         const activeChat = await getOrCreateActiveChat(userId);
         finalChatId = activeChat.id;
@@ -1076,34 +1156,74 @@ threeDRouter.post("/register-job", optionalAuth, async (req, res) => {
         return res.status(403).json({ error: "You don't have permission to update this job" });
       }
       
-      // Update user_id and chat_id if job exists but has no owner and we have a userId
+      // Resolve parent for existing job
+      const finalParentJobId = parentJobId || previewJobId || null;
+
+      // Update user_id, chat_id, workspace_id, and parent_job_id if job exists but has no owner and we have a userId
       if (!existingJob.userId && userId) {
         try {
           const updateData: any = { user_id: userId };
           if (finalChatId && !existingJob.chatId) {
             updateData.chat_id = finalChatId;
           }
+          if (workspaceId && !existingJob.workspaceId) {
+            updateData.workspace_id = workspaceId;
+          }
+          if (finalParentJobId && !existingJob.parentJobId) {
+            updateData.parent_job_id = finalParentJobId;
+          }
           await supabase
             .from("jobs")
             .update(updateData)
             .eq("id", job_id);
-          logger.info({ jobId: job_id, userId, chatId: finalChatId }, "Updated job with user_id and chat_id");
+          logger.info({ jobId: job_id, userId, chatId: finalChatId, workspaceId, parentJobId: finalParentJobId }, "Updated job with user_id, chat_id, workspace_id, parent_job_id");
         } catch (updateErr) {
-          logger.warn({ err: updateErr }, "Failed to update job with user_id/chat_id");
+          logger.warn({ err: updateErr }, "Failed to update job with user_id/chat_id/workspace_id/parent_job_id");
         }
-      } else if (finalChatId && !existingJob.chatId && userId) {
-        // Update chat_id if not set
-        try {
-          await supabase
-            .from("jobs")
-            .update({ chat_id: finalChatId })
-            .eq("id", job_id);
-          logger.info({ jobId: job_id, chatId: finalChatId }, "Updated job with chat_id");
-        } catch (updateErr) {
-          logger.warn({ err: updateErr }, "Failed to update job with chat_id");
+      } else {
+        // Job already has an owner - update chat_id, workspace_id, and parent_job_id if not set
+        const patchData: any = {};
+        if (finalChatId && !existingJob.chatId && userId) {
+          patchData.chat_id = finalChatId;
+        }
+        if (workspaceId && !existingJob.workspaceId) {
+          patchData.workspace_id = workspaceId;
+        }
+        if (finalParentJobId && !existingJob.parentJobId) {
+          patchData.parent_job_id = finalParentJobId;
+        }
+        if (Object.keys(patchData).length > 0) {
+          try {
+            await supabase
+              .from("jobs")
+              .update(patchData)
+              .eq("id", job_id);
+            logger.info({ jobId: job_id, ...patchData }, "Updated existing job with chat_id/workspace_id/parent_job_id");
+          } catch (updateErr) {
+            logger.warn({ err: updateErr }, "Failed to update job with chat_id/workspace_id/parent_job_id");
+          }
         }
       }
       
+      // Upsert multi-parent relationships + source_images for existing job
+      const existingParentJobIds = (parentJobIds && parentJobIds.length > 0) ? parentJobIds : (finalParentJobId ? [finalParentJobId] : []);
+      if (existingParentJobIds.length > 0) {
+        await upsertJobParents(job_id, existingParentJobIds);
+      }
+      const resolvedSourceImages =
+        sourceImages && sourceImages.length > 0
+          ? sourceImages
+          : imageUrl && imageUrl !== "uploaded_file" && (imageUrl.startsWith("http://") || imageUrl.startsWith("https://"))
+            ? [imageUrl]
+            : null;
+      if (resolvedSourceImages && resolvedSourceImages.length > 0 && !existingJob.sourceImages) {
+        try {
+          await supabase.from("jobs").update({ source_images: JSON.stringify(resolvedSourceImages) }).eq("id", job_id);
+        } catch (srcErr) {
+          logger.warn({ err: srcErr }, "Failed to update source_images for existing job");
+        }
+      }
+
       // Update prompt and name from preview job if provided
       if (previewJob) {
         try {
@@ -1154,7 +1274,23 @@ threeDRouter.post("/register-job", optionalAuth, async (req, res) => {
           await updateJobStatus(job_id, { status: "DONE" });
         }
       }
+
+      // Ensure workspace_id is set when provided (e.g. 3D job created by webhook first, then register-job from workspace)
+      if (workspaceId && !existingJob.workspaceId) {
+        try {
+          await supabase.from("jobs").update({ workspace_id: workspaceId }).eq("id", job_id);
+          logger.info({ jobId: job_id, workspaceId }, "Set workspace_id on existing job");
+        } catch (err: any) {
+          logger.warn({ err, jobId: job_id, workspaceId }, "Failed to set workspace_id on existing job (non-critical)");
+        }
+      }
       
+      if (finalChatId) {
+        await updateChatUpdatedAt(finalChatId);
+      }
+      if (workspaceId) {
+        await updateWorkspaceUpdatedAt(workspaceId);
+      }
       return res.json({ success: true, job_id, message: "Job already exists" });
     }
 
@@ -1162,18 +1298,49 @@ threeDRouter.post("/register-job", optionalAuth, async (req, res) => {
     // Set status to DONE since the preview is complete
     const initialStatus: JobStatus = previewImageUrl ? "DONE" : "WAIT";
     
+    // Validate and use provided generateType, fallback to "Normal"
+    const validGenerateTypes: GenerateType[] = ["Normal", "LowPoly", "Geometry", "Sketch", "EditImage", "Combined"];
+    const finalGenerateType: GenerateType = (reqGenerateType && validGenerateTypes.includes(reqGenerateType as GenerateType))
+      ? (reqGenerateType as GenerateType)
+      : "Normal";
+    
+    // Resolve parent: explicit parentJobId takes priority, then previewJobId (for 3D from image)
+    const finalParentJobId = parentJobId || previewJobId || null;
+    // Multi-parent IDs: use explicit array if provided, otherwise fall back to single parent
+    const finalParentJobIds = (parentJobIds && parentJobIds.length > 0) ? parentJobIds : (finalParentJobId ? [finalParentJobId] : []);
+
+    // Source image for image-to-3D: prefer explicit sourceImages, else imageUrl when it's a real URL
+    const resolvedSourceImages =
+      sourceImages && sourceImages.length > 0
+        ? sourceImages
+        : imageUrl && imageUrl !== "uploaded_file" && (imageUrl.startsWith("http://") || imageUrl.startsWith("https://"))
+          ? [imageUrl]
+          : null;
+
     await createJob({
       id: job_id,
       userId: userId || null,
       chatId: finalChatId,
+      workspaceId: workspaceId || null,
+      parentJobId: finalParentJobId,
+      parentJobIds: finalParentJobIds,
       prompt: finalPrompt,
       imageUrl: imageUrl || null,
-      generateType: "Normal",
+      sourceImages: resolvedSourceImages,
+      generateType: finalGenerateType,
       faceCount: null,
       enablePBR: true,
       polygonType: null,
       status: initialStatus,
     });
+    
+    if (finalChatId) {
+      await updateChatUpdatedAt(finalChatId);
+    }
+    
+    if (workspaceId) {
+      await updateWorkspaceUpdatedAt(workspaceId);
+    }
     
     // Update name if we got it from preview job
     if (finalName) {
@@ -1190,6 +1357,36 @@ threeDRouter.post("/register-job", optionalAuth, async (req, res) => {
   } catch (err: any) {
     logger.error(err, "failed to register job");
     res.status(500).json({ error: err.message || "Failed to register job" });
+  }
+});
+
+// ============================================
+// Job Lineage (iterative prompting DAG)
+// ============================================
+threeDRouter.get("/jobs/:jobId/lineage", optionalAuth, async (req, res) => {
+  try {
+    const { jobId } = req.params;
+    if (!jobId) {
+      return res.status(400).json({ error: "jobId is required" });
+    }
+    const chain = await getJobLineage(jobId);
+    res.json({
+      lineage: chain.map((j) => ({
+        id: j.id,
+        parentJobId: j.parentJobId,
+        parentJobIds: j.parentJobIds,     // All parent IDs (multi-parent)
+        sourceImages: j.sourceImages,     // Source image URLs used as input
+        prompt: j.prompt,
+        previewImageUrl: j.previewImageUrl,
+        resultGlbUrl: j.resultGlbUrl,
+        generateType: j.generateType,
+        status: j.status,
+        createdAt: j.createdAt,
+      })),
+    });
+  } catch (err: any) {
+    logger.error(err, "failed to get job lineage");
+    res.status(500).json({ error: err.message || "Failed to get job lineage" });
   }
 });
 
@@ -1523,5 +1720,160 @@ threeDRouter.post("/notify-gpu-offline", optionalAuth, async (req, res) => {
   } catch (err: any) {
     logger.error({ err: err.message, stack: err.stack }, "Error in notify-gpu-offline endpoint");
     res.status(500).json({ error: "Failed to send notification" });
+  }
+});
+
+
+// ============================================
+// WORKSPACES
+// ============================================
+
+/**
+ * List all workspaces for the current user
+ */
+threeDRouter.get("/workspaces", requireAuth, async (req, res) => {
+  try {
+    const userId = req.userId!;
+    const workspaces = await listWorkspacesForUser(userId);
+    res.json({ workspaces });
+  } catch (err: any) {
+    if (err.code === "TABLE_NOT_FOUND" || err.message?.includes("does not exist")) {
+      return res.json({ workspaces: [] });
+    }
+    logger.error(err, "Failed to list workspaces");
+    res.status(500).json({ error: err.message || "Failed to list workspaces" });
+  }
+});
+
+/**
+ * Create a new workspace
+ */
+threeDRouter.post("/workspaces", requireAuth, async (req, res) => {
+  try {
+    const userId = req.userId!;
+    const { name } = req.body as { name?: string };
+    const workspace = await createWorkspace({ userId, name: name || "Untitled Workspace" });
+    res.json({ workspace });
+  } catch (err: any) {
+    if (err.code === "TABLE_NOT_FOUND") {
+      return res.status(500).json({ error: "Workspaces table does not exist. Please run the migration." });
+    }
+    logger.error(err, "Failed to create workspace");
+    res.status(500).json({ error: err.message || "Failed to create workspace" });
+  }
+});
+
+/**
+ * Get a workspace by ID
+ */
+threeDRouter.get("/workspaces/:workspaceId", requireAuth, async (req, res) => {
+  try {
+    const userId = req.userId!;
+    const { workspaceId } = req.params;
+    const workspace = await getWorkspaceForUser(workspaceId, userId);
+    if (!workspace) {
+      return res.status(404).json({ error: "Workspace not found" });
+    }
+    res.json({ workspace });
+  } catch (err: any) {
+    logger.error(err, "Failed to get workspace");
+    res.status(500).json({ error: err.message || "Failed to get workspace" });
+  }
+});
+
+/**
+ * Get all jobs for a specific workspace
+ */
+threeDRouter.get("/workspaces/:workspaceId/jobs", requireAuth, async (req, res) => {
+  try {
+    const userId = req.userId!;
+    const { workspaceId } = req.params;
+
+    // Verify ownership
+    const workspace = await getWorkspaceForUser(workspaceId, userId);
+    if (!workspace) {
+      return res.status(404).json({ error: "Workspace not found" });
+    }
+
+    const jobs = await listJobsForWorkspace(workspaceId, userId);
+    
+    // Normalize URLs in the same way the history endpoint does
+    const normalizedJobs = jobs.map((row: any) => {
+      let imageUrl = row.image_url;
+      let previewImageUrl = row.preview_image_url;
+      let resultGlbUrl = row.result_glb_url;
+
+      if (imageUrl && imageUrl.includes("amazonaws.com")) {
+        imageUrl = imageUrl.split("?")[0];
+      }
+      if (previewImageUrl) {
+        previewImageUrl = normalizePreviewUrl(row.id, previewImageUrl);
+      }
+      if (resultGlbUrl) {
+        resultGlbUrl = normalizeGlbUrl(row.id, resultGlbUrl);
+      }
+
+      return {
+        id: row.id,
+        userId: row.user_id || null,
+        chatId: row.chat_id || null,
+        workspaceId: row.workspace_id || null,
+        status: row.status,
+        prompt: row.prompt,
+        imageUrl: imageUrl,
+        generateType: row.generate_type,
+        faceCount: row.face_count,
+        enablePBR: row.enable_pbr,
+        polygonType: row.polygon_type,
+        resultGlbUrl: resultGlbUrl,
+        previewImageUrl: previewImageUrl,
+        errorCode: row.error_code,
+        errorMessage: row.error_message,
+        name: row.name || null,
+        createdAt: row.created_at,
+        updatedAt: row.updated_at,
+      };
+    });
+
+    res.json({ jobs: normalizedJobs });
+  } catch (err: any) {
+    logger.error(err, "Failed to list workspace jobs");
+    res.status(500).json({ error: err.message || "Failed to list workspace jobs" });
+  }
+});
+
+/**
+ * Update workspace name
+ */
+threeDRouter.patch("/workspaces/:workspaceId/name", requireAuth, async (req, res) => {
+  try {
+    const userId = req.userId!;
+    const { workspaceId } = req.params;
+    const { name } = req.body as { name: string };
+
+    if (!name || !name.trim()) {
+      return res.status(400).json({ error: "Name is required" });
+    }
+
+    await updateWorkspaceName(workspaceId, name.trim(), userId);
+    res.json({ success: true });
+  } catch (err: any) {
+    logger.error(err, "Failed to update workspace name");
+    res.status(500).json({ error: err.message || "Failed to update workspace name" });
+  }
+});
+
+/**
+ * Delete a workspace
+ */
+threeDRouter.delete("/workspaces/:workspaceId", requireAuth, async (req, res) => {
+  try {
+    const userId = req.userId!;
+    const { workspaceId } = req.params;
+    await deleteWorkspace(workspaceId, userId);
+    res.json({ success: true });
+  } catch (err: any) {
+    logger.error(err, "Failed to delete workspace");
+    res.status(500).json({ error: err.message || "Failed to delete workspace" });
   }
 });

@@ -1,6 +1,6 @@
 export type JobStatus = "WAIT" | "RUN" | "FAIL" | "DONE";
 
-export type GenerateType = "Normal" | "LowPoly" | "Geometry" | "Sketch";
+export type GenerateType = "Normal" | "LowPoly" | "Geometry" | "Sketch" | "EditImage" | "Combined";
 
 export type PolygonType = "triangle" | "quadrilateral";
 
@@ -19,9 +19,13 @@ export interface JobRecord {
   id: string;
   userId: string | null;  // Owner of the job
   chatId: string | null;  // Chat this job belongs to
+  workspaceId: string | null;  // Workspace this job belongs to
+  parentJobId: string | null;  // Primary parent job (for iterative prompting lineage)
+  parentJobIds: string[];       // All parent job IDs (from job_parents table; for multi-parent merges)
   status: JobStatus;
   prompt: string | null;
   imageUrl: string | null;
+  sourceImages: string[] | null; // Actual source image URLs used as input (e.g. 2 URLs for combined edit)
   generateType: GenerateType;
   faceCount: number | null;
   enablePBR: boolean;
@@ -31,6 +35,14 @@ export interface JobRecord {
   errorCode: string | null;
   errorMessage: string | null;
   name: string | null;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+export interface WorkspaceRecord {
+  id: string;
+  userId: string;
+  name: string;
   createdAt: Date;
   updatedAt: Date;
 }

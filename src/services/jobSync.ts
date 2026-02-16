@@ -41,18 +41,21 @@ function isApiAvailable(): boolean {
 }
 
 /**
- * Record API failure
+ * Record API failure. Log only when the circuit transitions from closed to open.
  */
 function recordApiFailure(): void {
+  const wasOpen = circuitBreakerState.isOpen;
   circuitBreakerState.consecutiveFailures++;
   circuitBreakerState.lastFailureTime = Date.now();
 
   if (circuitBreakerState.consecutiveFailures >= CIRCUIT_BREAKER_THRESHOLD) {
     circuitBreakerState.isOpen = true;
-    logger.warn(
-      { consecutiveFailures: circuitBreakerState.consecutiveFailures },
-      "Circuit breaker opened: API appears to be offline. Pausing job sync."
-    );
+    if (!wasOpen) {
+      logger.warn(
+        { consecutiveFailures: circuitBreakerState.consecutiveFailures },
+        "Circuit breaker opened: API appears to be offline. Pausing job sync."
+      );
+    }
   }
 }
 
@@ -123,6 +126,12 @@ export async function syncJobFromApi(jobId: string): Promise<boolean> {
             return true;
           }
           logger.debug({ jobId }, "Job not found in API");
+          return false;
+        }
+        // 502/503/504 = gateway/API temporarily unavailable - don't spam ERROR logs
+        if (response.status === 502 || response.status === 503 || response.status === 504) {
+          recordApiFailure();
+          logger.debug({ jobId, status: response.status }, "External API temporarily unavailable");
           return false;
         }
         throw new Error(`API returned ${response.status}`);
@@ -213,18 +222,24 @@ export async function syncJobFromApi(jobId: string): Promise<boolean> {
 
     return true;
   } catch (err: any) {
-    // Check if it's a network error
+    // Check if it's a network error or transient API error (502/503/504)
     const isNetworkError = err.message?.includes("fetch") || 
                           err.message?.includes("network") || 
                           err.message?.includes("ECONNREFUSED") ||
                           err.message?.includes("ETIMEDOUT") ||
                           err.name === "TypeError";
-    
-    if (isNetworkError) {
+    const isTransientApiError = err.message?.includes("API returned 50"); // 502, 503, 504
+
+    if (isNetworkError || isTransientApiError) {
       recordApiFailure();
     }
-    
-    logger.error({ err, jobId }, "Failed to sync job from API");
+
+    // Don't log transient/unavailable as ERROR to avoid log spam when GPU API is down
+    if (isTransientApiError) {
+      logger.debug({ jobId, err: err.message }, "Sync skipped (API unavailable)");
+    } else {
+      logger.error({ err, jobId }, "Failed to sync job from API");
+    }
     return false;
   }
 }

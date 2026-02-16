@@ -13,7 +13,7 @@ export const config = {
     secretKey: process.env.CLERK_SECRET_KEY || "",
   },
   hunyuanApi: {
-    url: process.env.HUNYUAN_API_URL || "https://api.hydrilla.co",
+    url: process.env.HUNYUAN_API_URL || "https://api.hydrilla.ai",
   },
   s3: {
     bucket: process.env.S3_BUCKET || "hunyuan3d-outputs",

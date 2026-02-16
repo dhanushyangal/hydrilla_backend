@@ -188,6 +188,23 @@ export async function listChatsForUser(userId: string, limit = 50): Promise<(Cha
 }
 
 /**
+ * Touch chat's updated_at (e.g. when a job is added so list order is correct)
+ */
+export async function updateChatUpdatedAt(chatId: string): Promise<void> {
+  try {
+    const { error } = await supabase
+      .from("chats")
+      .update({ updated_at: new Date().toISOString() })
+      .eq("id", chatId);
+
+    if (error) throw error;
+  } catch (err: any) {
+    logger.error(err, "Failed to update chat updated_at");
+    // Non-fatal: don't throw so job registration still succeeds
+  }
+}
+
+/**
  * Update chat name
  */
 export async function updateChatName(chatId: string, name: string, userId: string): Promise<void> {

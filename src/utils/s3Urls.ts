@@ -59,7 +59,7 @@ export function normalizeGlbUrl(jobId: string, apiUrl: string | null | undefined
 
 /**
  * Normalize preview image URL - use direct S3 URL if API URL points to our bucket
- * Handles both preview/{jobId}/preview_image.png and image/{jobId}/processed_image.png paths
+ * Handles: preview/, image/, edit/, combined/ paths (S3 or gateway /outputs/ paths).
  * If no URL provided, returns preview path (for text-to-image previews)
  */
 export function normalizePreviewUrl(jobId: string, apiUrl: string | null | undefined): string | null {
@@ -67,26 +67,29 @@ export function normalizePreviewUrl(jobId: string, apiUrl: string | null | undef
     // If no URL provided, try preview path first (for text-to-image previews)
     return getDirectS3PreviewImageUrl(jobId);
   }
-  
-  // If the URL already points to our S3 bucket
+
+  const urlWithoutParams = apiUrl.split("?")[0];
+
+  // If the URL points to our S3 bucket with known paths, return as-is (no query params)
   if (apiUrl.includes(config.s3.bucket)) {
-    // Check if it's a preview path (preview/{jobId}/preview_image.png)
-    if (apiUrl.includes("/preview/")) {
-      // Strip query parameters (signed URL params like ?AWSAccessKeyId=...)
-      const urlWithoutParams = apiUrl.split('?')[0];
-      return urlWithoutParams;
-    }
-    
-    // Check if it's an image path (image/{jobId}/processed_image.png)
-    if (apiUrl.includes("/image/")) {
-      // Strip query parameters (signed URL params like ?AWSAccessKeyId=...)
-      const urlWithoutParams = apiUrl.split('?')[0];
+    if (
+      apiUrl.includes("/preview/") ||
+      apiUrl.includes("/image/") ||
+      apiUrl.includes("/edit/") ||
+      apiUrl.includes("/combined/")
+    ) {
       return urlWithoutParams;
     }
   }
-  
+
+  // Gateway-style URLs (e.g. https://api.hydrilla.ai/outputs/edit/... or .../combined/...)
+  // Keep as-is so the image loads from the gateway
+  if (apiUrl.includes("/outputs/edit/") || apiUrl.includes("/outputs/combined/")) {
+    return urlWithoutParams;
+  }
+
   // If URL doesn't match our bucket patterns, try to construct direct S3 URL
-  // Try preview path first (for text-to-image previews)
+  // (preview path for text-to-image previews only)
   return getDirectS3PreviewImageUrl(jobId);
 }
 
