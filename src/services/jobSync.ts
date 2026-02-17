@@ -14,7 +14,7 @@ let circuitBreakerState = {
   lastSuccessTime: null as number | null,
 };
 
-const CIRCUIT_BREAKER_THRESHOLD = 3; // Open circuit after 3 consecutive failures
+const CIRCUIT_BREAKER_THRESHOLD = 6; // Open after 6 failures so brief gateway busy doesn't trip
 const CIRCUIT_BREAKER_RESET_TIME = 60000; // Try again after 60 seconds
 const CIRCUIT_BREAKER_SUCCESS_RESET = 1; // Close circuit after 1 successful call
 
@@ -107,9 +107,9 @@ export async function syncJobFromApi(jobId: string): Promise<boolean> {
       return true; // Return true since job is already in correct state
     }
     
-    // Fetch from API with timeout
+    // Fetch from API with timeout (generous when gateway is busy processing another job)
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 10000); // 10 second timeout
+    const timeoutId = setTimeout(() => controller.abort(), 25000); // 25 second timeout
     
     let response: Response;
     try {

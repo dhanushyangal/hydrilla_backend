@@ -268,9 +268,9 @@ threeDRouter.get("/status/:jobId", optionalAuth, async (req, res) => {
     // But if API is unreachable and we have the job in DB, return the DB version
     let apiJob = null;
     try {
-      // Create abort controller for timeout
+      // Create abort controller for timeout (gateway may be busy processing; allow time to respond)
       const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 5000); // 5 second timeout
+      const timeoutId = setTimeout(() => controller.abort(), 15000); // 15 second timeout
       
       const response = await fetch(`${API_BASE}/status/${jobId}`, {
         signal: controller.signal,
@@ -426,6 +426,35 @@ threeDRouter.get("/status/:jobId", optionalAuth, async (req, res) => {
 });
 
 // ============================================
+// Cancel 3D Job (proxy to Python gateway)
+// ============================================
+threeDRouter.post("/cancel/:jobId", optionalAuth, async (req, res) => {
+  const { jobId } = req.params;
+  const userId = req.userId;
+
+  try {
+    const job = await getJob(jobId);
+    if (!job) return res.status(404).json({ error: "Job not found" });
+    if (userId && job.userId && job.userId !== userId) {
+      return res.status(403).json({ error: "You don't have permission to cancel this job" });
+    }
+
+    const response = await fetch(`${API_BASE}/cancel/${jobId}`, { method: "POST" });
+    const data = await response.json().catch(() => ({}));
+
+    if (!response.ok) {
+      return res.status(response.status).json({ error: data.error || "Failed to cancel job" });
+    }
+
+    await updateJobStatus(jobId, { status: "FAIL", errorMessage: "Cancelled by user" });
+    res.json({ job_id: jobId, status: "cancelled", message: data.message || "Job cancelled" });
+  } catch (err: any) {
+    logger.error(err, "cancel job");
+    res.status(500).json({ error: err.message || "Failed to cancel job" });
+  }
+});
+
+// ============================================
 // Get Job Result
 // ============================================
 threeDRouter.get("/result/:jobId", optionalAuth, async (req, res) => {
@@ -492,59 +521,67 @@ threeDRouter.get("/result/:jobId", optionalAuth, async (req, res) => {
 // ============================================
 // Get Queue Info (for accurate time estimation)
 // ============================================
+// Fallback queue info when Python API is unavailable (avoids duplication)
+// Default 3D job time (seconds) - should match gateway ESTIMATED_3D_TIME for consistent ETA
+const DEFAULT_ESTIMATED_3D_SECONDS = 300; // 5 min - conservative so progress/ETA don't overshoot
+const QUEUE_INFO_FALLBACK = {
+  error: "GPU API is currently unavailable",
+  api_available: false,
+  queue_length: 0,
+  currently_processing: false,
+  waiting_jobs: 0,
+  jobs_ahead_for_new: 0,
+  estimated_wait_for_new_job_seconds: DEFAULT_ESTIMATED_3D_SECONDS,
+  estimated_total_seconds: DEFAULT_ESTIMATED_3D_SECONDS,
+  estimated_time_per_job_seconds: DEFAULT_ESTIMATED_3D_SECONDS,
+  preview_queue_length: 0,
+  currently_generating_preview: false,
+  preview_waiting: 0,
+  estimated_wait_for_preview_seconds: 0,
+  estimated_preview_time_seconds: 25,
+};
+
 threeDRouter.get("/queue/info", async (_req, res) => {
   try {
-    // Fetch queue info from Python API with shorter timeout for faster failure detection
+    // Respond before frontend timeout: use 1.5s so we always send a response first
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 3000); // Reduced to 3 seconds
-    
+    const timeoutId = setTimeout(() => controller.abort(), 1500);
+
     const response = await fetch(`${API_BASE}/queue/info`, {
       signal: controller.signal,
     });
-    
+
     clearTimeout(timeoutId);
-    
+
     if (response.ok) {
       const queueInfo = await response.json();
-      return res.json({
-        ...queueInfo,
-        api_available: true, // Flag to indicate API is working
-      });
-    } else {
-      // API returned error status - mark as unavailable
-      logger.warn({ status: response.status }, "Python API returned error status for queue info");
-      return res.status(503).json({
-        error: "GPU API is currently unavailable",
-        api_available: false,
-        queue_length: 0,
-        currently_processing: false,
-        waiting_jobs: 0,
-        estimated_wait_for_new_job_seconds: 130,
-        estimated_time_per_job_seconds: 130,
-        preview_queue_length: 0,
-        currently_generating_preview: false,
-        preview_waiting: 0,
-        estimated_wait_for_preview_seconds: 0,
-        estimated_preview_time_seconds: 20
-      });
+      if (!res.headersSent) {
+        return res.json({ ...queueInfo, api_available: true });
+      }
+      return;
     }
+    logger.warn({ status: response.status }, "Python API returned error status for queue info");
+    // Return 200 with fallback so 3D form is not blocked; only actual submit failure shows GPU offline
+    if (!res.headersSent) {
+      return res.status(200).json({ ...QUEUE_INFO_FALLBACK, api_available: false });
+    }
+    return;
   } catch (err: any) {
-    logger.warn({ err: err.message }, "Failed to fetch queue info from Python API");
-    // Return 503 status to indicate service unavailable
-    return res.status(503).json({
-      error: "GPU API is currently unavailable",
-      api_available: false,
-      queue_length: 0,
-      currently_processing: false,
-      waiting_jobs: 0,
-      estimated_wait_for_new_job_seconds: 130,
-      estimated_time_per_job_seconds: 130,
-      preview_queue_length: 0,
-      currently_generating_preview: false,
-      preview_waiting: 0,
-      estimated_wait_for_preview_seconds: 0,
-      estimated_preview_time_seconds: 20
-    });
+    const isClientAbort = err.name === "AbortError" || err.message === "This operation was aborted";
+    if (isClientAbort && res.headersSent) {
+      return;
+    }
+    if (!isClientAbort) {
+      logger.warn({ err: err.message }, "Failed to fetch queue info from Python API");
+    }
+    // Return 200 with fallback so queue check never blocks 3D; GPU offline only on actual submit failure
+    if (!res.headersSent) {
+      try {
+        return res.status(200).json({ ...QUEUE_INFO_FALLBACK, api_available: false });
+      } catch (_) {
+        // Client may have closed the connection; ignore write errors
+      }
+    }
   }
 });
 
