@@ -13,7 +13,8 @@ Comprehensive guide for the Hydrilla Node.js/Express backend server. This docume
 7. [Payment Integration (Dodo Payments)](#payment-integration-dodo-payments)
 8. [Database Schema](#database-schema)
 9. [Deployment](#deployment)
-10. [Troubleshooting](#troubleshooting)
+10. 
+11. [Troubleshooting](#troubleshooting)
 
 ---
 
