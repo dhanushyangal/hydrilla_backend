@@ -20,7 +20,7 @@ export const config = {
     region: process.env.S3_REGION || "us-east-1",
     presignedUrlExpiry: parseInt(process.env.S3_PRESIGNED_URL_EXPIRY || "3600", 10),
   },
-  pollIntervalMs: parseInt(process.env.POLL_INTERVAL_MS || "5000", 10),
+  pollIntervalMs: parseInt(process.env.POLL_INTERVAL_MS || "2000", 10),
   email: {
     url: process.env.ZEPTOMAIL_API_URL || "https://api.zeptomail.in/v1.1/email",
     token: process.env.ZEPTOMAIL_TOKEN || "Zoho-enczapikey PHtE6r0LFLy5jW4poREJ7PbrEZPxMtwn9O02K1RPstxDWaVWGk1Vq9p+kmKzrxkqUaNBHfPIzolquO+e5e2CIm/rNz5ODmqyqK3sx/VYSPOZsbq6x00VtF8cd0bbVIToddZj3CPevdrZNA==",
