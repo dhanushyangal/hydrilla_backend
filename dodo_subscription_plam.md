@@ -1,0 +1,382 @@
+> ## Documentation Index
+> Fetch the complete documentation index at: https://docs.dodopayments.com/llms.txt
+> Use this file to discover all available pages before exploring further.
+
+# Subscription Integration Guide
+
+> This guide will help you integrate the Dodo Payments Subscription Product into your website.
+
+## Prerequisites
+
+To integrate the Dodo Payments API, you'll need:
+
+* A Dodo Payments merchant account
+* API credentials (API key and webhook secret key) from the dashboard
+
+For a more detailed guide on the prerequisites, check this [section](/developer-resources/integration-guide#dashboard-setup).
+
+## API Integration
+
+### Checkout Sessions
+
+Use Checkout Sessions to sell subscription products with a secure, hosted checkout. Pass your subscription product in `product_cart` and redirect customers to the returned `checkout_url`.
+
+<Tip>
+  **Mixed Checkout**: You can combine subscription products with one-time products in the same checkout session. This enables use cases like setup fees with subscriptions, hardware bundles with SaaS, and more. See the [Checkout Sessions guide](/developer-resources/checkout-session) for examples.
+</Tip>
+
+<Tabs>
+  <Tab title="Node.js SDK">
+    ```javascript  theme={null}
+    import DodoPayments from 'dodopayments';
+
+    const client = new DodoPayments({
+      bearerToken: process.env.DODO_PAYMENTS_API_KEY,
+      environment: 'test_mode', // defaults to 'live_mode'
+    });
+
+    async function main() {
+      const session = await client.checkoutSessions.create({
+        product_cart: [
+          { product_id: 'prod_subscription_monthly', quantity: 1 }
+        ],
+        // Optional: configure trials for subscription products
+        subscription_data: { trial_period_days: 14 },
+        customer: {
+          email: 'subscriber@example.com',
+          name: 'Jane Doe',
+        },
+        return_url: 'https://example.com/success',
+      });
+
+      console.log(session.checkout_url);
+    }
+
+    main();
+    ```
+  </Tab>
+
+  <Tab title="Python SDK">
+    ```python  theme={null}
+    import os
+    from dodopayments import DodoPayments
+
+    client = DodoPayments(
+        bearer_token=os.environ.get("DODO_PAYMENTS_API_KEY"),
+        environment="test_mode",  # defaults to "live_mode"
+    )
+
+    session = client.checkout_sessions.create(
+        product_cart=[
+            {"product_id": "prod_subscription_monthly", "quantity": 1}
+        ],
+        subscription_data={"trial_period_days": 14},  # optional
+        customer={
+            "email": "subscriber@example.com",
+            "name": "Jane Doe",
+        },
+        return_url="https://example.com/success",
+    )
+
+    print(session.checkout_url)
+    ```
+  </Tab>
+
+  <Tab title="REST API">
+    ```javascript  theme={null}
+    const response = await fetch('https://test.dodopayments.com/checkouts', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${process.env.DODO_PAYMENTS_API_KEY}`
+      },
+      body: JSON.stringify({
+        product_cart: [
+          { product_id: 'prod_subscription_monthly', quantity: 1 }
+        ],
+        subscription_data: { trial_period_days: 14 }, // optional
+        customer: {
+          email: 'subscriber@example.com',
+          name: 'Jane Doe'
+        },
+        return_url: 'https://example.com/success'
+      })
+    });
+
+    if (!response.ok) {
+      throw new Error(`HTTP error! status: ${response.status}`);
+    }
+
+    const session = await response.json();
+    console.log(session.checkout_url);
+    ```
+  </Tab>
+</Tabs>
+
+### API Response
+
+The following is an example of the response:
+
+```json  theme={null}
+{
+  "session_id": "cks_Gi6KGJ2zFJo9rq9Ukifwa",
+  "checkout_url": "https://test.checkout.dodopayments.com/session/cks_Gi6KGJ2zFJo9rq9Ukifwa"
+}
+```
+
+Redirect the customer to `checkout_url`.
+
+### Webhooks
+
+When integrating subscriptions, you'll receive webhooks to track the subscription lifecycle. These webhooks help you manage subscription states and payment scenarios effectively.
+
+To set up your webhook endpoint, please follow our [Detailed Integration Guide](/developer-resources/integration-guide#implementing-webhooks).
+
+#### Subscription Event Types
+
+The following webhook events track subscription status changes:
+
+1. **`subscription.active`** - Subscription is successfully activated.
+2. **`subscription.updated`** - Subscription object was updated (fires on any field change).
+3. **`subscription.on_hold`** - Subscription is put on hold due to failed renewal.
+4. **`subscription.failed`** - Subscription creation failed during mandate creation.
+5. **`subscription.renewed`** - Subscription is renewed for the next billing period.
+
+For reliable subscription lifecycle management, we recommend tracking these subscription events.
+
+<Tip>
+  Use `subscription.updated` to get real-time notifications about any subscription changes, keeping your application state in sync without polling the API.
+</Tip>
+
+#### Payment Scenarios
+
+**Successful Payment Flow**
+
+When a payment succeeds, you'll receive the following webhooks:
+
+1. `subscription.active` - Indicates subscription activation
+2. `payment.succeeded` - Confirms the initial payment:
+   * For immediate billing (0 trial days): Expect within 2-10 minutes
+   * For trial days: whenever that ends
+3. `subscription.renewed` - Indicates payment deduction and renewal for next cycle. (Basically, whenever payment gets deducted for subscription products, you will get `subscription.renewed` webhook along with `payment.succeeded`)
+
+**Payment Failure Scenarios**
+
+1. Subscription Failure
+
+* `subscription.failed` - Subscription creation failed due to failure to create a mandate.
+* `payment.failed` - Indicates failed payment.
+
+2. Subscription On Hold
+
+* `subscription.on_hold` - Subscription is put on hold due to failed renewal payment or failed plan change charge.
+* When a subscription goes on hold, it will not renew automatically until the payment method is updated.
+
+<Info>**Best Practice**: To simplify implementation, we recommend primarily tracking subscription events for managing the subscription lifecycle.</Info>
+
+### Handling Subscription On Hold
+
+When a subscription enters `on_hold` state, you need to update the payment method to reactivate it. This section explains when subscriptions go on hold and how to handle them.
+
+#### When Subscriptions Go On Hold
+
+A subscription is placed on hold when:
+
+* **Renewal payment fails**: The automatic renewal charge fails due to insufficient funds, expired card, or bank decline
+* **Plan change charge fails**: An immediate charge during plan upgrade/downgrade fails
+* **Payment method authorization fails**: The payment method cannot be authorized for recurring charges
+
+<Warning>
+  Subscriptions in `on_hold` state will not renew automatically. You must update the payment method to reactivate the subscription.
+</Warning>
+
+#### Reactivating Subscriptions from On Hold
+
+To reactivate a subscription from `on_hold` state, use the Update Payment Method API. This automatically:
+
+1. Creates a charge for remaining dues
+2. Generates an invoice for the charge
+3. Processes the payment using the new payment method
+4. Reactivates the subscription to `active` state upon successful payment
+
+<Steps>
+  <Step title="Handle subscription.on_hold webhook">
+    When you receive a `subscription.on_hold` webhook, update your application state and notify the customer:
+
+    ```javascript  theme={null}
+    // Webhook handler
+    app.post('/webhooks/dodo', async (req, res) => {
+      const event = req.body;
+      
+      if (event.type === 'subscription.on_hold') {
+        const subscription = event.data;
+        
+        // Update subscription status in your database
+        await updateSubscriptionStatus(subscription.subscription_id, 'on_hold');
+        
+        // Notify customer to update payment method
+        await sendEmailToCustomer(subscription.customer_id, {
+          subject: 'Payment Required - Subscription On Hold',
+          message: 'Your subscription is on hold. Please update your payment method to continue service.'
+        });
+      }
+      
+      res.json({ received: true });
+    });
+    ```
+  </Step>
+
+  <Step title="Update payment method">
+    When the customer is ready to update their payment method, call the Update Payment Method API:
+
+    <CodeGroup>
+      ```javascript Node.js theme={null}
+      // Update with new payment method
+      const response = await client.subscriptions.updatePaymentMethod(subscriptionId, {
+        type: 'new',
+        return_url: 'https://example.com/return'
+      });
+
+      // For on_hold subscriptions, a charge is automatically created
+      if (response.payment_id) {
+        console.log('Charge created for remaining dues:', response.payment_id);
+        // Redirect customer to response.payment_link to complete payment
+      }
+      ```
+
+      ```python Python theme={null}
+      # Update with new payment method
+      response = client.subscriptions.update_payment_method(
+          subscription_id=subscription_id,
+          type="new",
+          return_url="https://example.com/return"
+      )
+
+      # For on_hold subscriptions, a charge is automatically created
+      if response.payment_id:
+          print("Charge created for remaining dues:", response.payment_id)
+          # Redirect customer to response.payment_link to complete payment
+      ```
+    </CodeGroup>
+
+    <Info>
+      You can also use an existing payment method ID if the customer has saved payment methods:
+
+      ```javascript  theme={null}
+      await client.subscriptions.updatePaymentMethod(subscriptionId, {
+        type: 'existing',
+        payment_method_id: 'pm_abc123'
+      });
+      ```
+    </Info>
+  </Step>
+
+  <Step title="Monitor webhook events">
+    After updating the payment method, monitor for these webhook events:
+
+    1. **`payment.succeeded`** - The charge for remaining dues was successful
+    2. **`subscription.active`** - The subscription has been reactivated
+
+    ```javascript  theme={null}
+    if (event.type === 'payment.succeeded') {
+      const payment = event.data;
+      
+      // Check if this payment is for an on_hold subscription
+      if (payment.subscription_id) {
+        // Wait for subscription.active webhook to confirm reactivation
+      }
+    }
+
+    if (event.type === 'subscription.active') {
+      const subscription = event.data;
+      
+      // Update subscription status in your database
+      await updateSubscriptionStatus(subscription.subscription_id, 'active');
+      
+      // Restore customer access
+      await restoreCustomerAccess(subscription.customer_id);
+      
+      // Notify customer of successful reactivation
+      await sendEmailToCustomer(subscription.customer_id, {
+        subject: 'Subscription Reactivated',
+        message: 'Your subscription has been reactivated successfully.'
+      });
+    }
+    ```
+  </Step>
+</Steps>
+
+### Sample Subscription event payload
+
+***
+
+| Property      | Type   | Required | Description                                                                                  |
+| ------------- | ------ | -------- | -------------------------------------------------------------------------------------------- |
+| `business_id` | string | Yes      | The unique identifier for the business                                                       |
+| `timestamp`   | string | Yes      | The timestamp of when the event occurred (not necessarily the same as when it was delivered) |
+| `type`        | string | Yes      | The type of event. See [Event Types](#event-types)                                           |
+| `data`        | object | Yes      | The main data payload. See [Data Object](#data-object)                                       |
+
+## Changing Subscription Plans
+
+You can upgrade or downgrade a subscription plan using the change plan API endpoint. This allows you to modify the subscription's product, quantity, and handle proration.
+
+<Card title="Change Plan API Reference" icon="arrows-rotate" href="/api-reference/subscriptions/change-plan">
+  For detailed information about changing subscription plans, please refer to our Change Plan API documentation.
+</Card>
+
+### Proration Options
+
+When changing subscription plans, you have two options for handling the immediate charge:
+
+#### 1. `prorated_immediately`
+
+* Calculates the prorated amount based on the remaining time in the current billing cycle
+* Charges the customer only for the difference between the old and new plan
+* During a trial period, this will immediately switch the user to the new plan, charging the customer right away
+
+#### 2. `full_immediately`
+
+* Charges the customer the full subscription amount for the new plan
+* Ignores any remaining time or credits from the previous plan
+* Useful when you want to reset the billing cycle or charge the full amount regardless of proration
+
+#### 3. `difference_immediately`
+
+* When upgrading, the customer is immediately charged the difference between the two plan amounts.
+* For example, if the current plan is 30 Dollars and the customer upgrades to an 80 Dollars, they are charged \$50 instantly.
+* When downgrading, the unused amount from the current plan is added as internal credit and automatically applied to future subscription renewals.
+* For example, if the current plan is 50 Dollars and the customer switches to a 20 Dollars plan, the remaining \$30 is credited and used toward the next billing cycle.
+
+### Behavior
+
+* When you invoke this API, Dodo Payments immediately initiates a charge based on your selected proration option
+* If the plan change is a downgrade and you use `prorated_immediately`, credits will be automatically calculated and added to the subscription's credit balance. These credits are specific to that subscription and will only be used to offset future recurring payments of the same subscription
+* The `full_immediately` option bypasses credit calculations and charges the complete new plan amount
+
+<Tip>
+  **Choose your proration option carefully**: Use `prorated_immediately` for fair billing that accounts for unused time, or `full_immediately` when you want to charge the complete new plan amount regardless of the current billing cycle.
+</Tip>
+
+### Charge Processing
+
+* The immediate charge initiated upon plan change usually completes processing in less than 2 minutes
+* If this immediate charge fails for any reason, the subscription is automatically placed on hold until the issue is resolved
+
+## On-Demand Subscriptions
+
+<Info>
+  On-demand subscriptions let you charge customers flexibly, not just on a fixed schedule. This feature is available for all accounts.
+</Info>
+
+**To create an on-demand subscription:**
+
+To create an on-demand subscription, use the [POST /subscriptions](/api-reference/subscriptions/post-subscriptions) API endpoint and include the `on_demand` field in your request body. This allows you to authorize a payment method without an immediate charge, or set a custom initial price.
+
+**To charge an on-demand subscription:**
+
+For subsequent charges, use the [POST /subscriptions/charge](/api-reference/subscriptions/create-charge) endpoint and specify the amount to charge the customer for that transaction.
+
+<Note>
+  For a complete, step-by-step guide—including request/response examples, safe retry policies, and webhook handling—see the <a href="/developer-resources/ondemand-subscriptions">On-Demand Subscriptions Guide</a>.
+</Note>

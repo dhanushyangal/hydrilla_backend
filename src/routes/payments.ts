@@ -2,213 +2,236 @@ import { Router, Request, Response } from "express";
 import { logger } from "../logger.js";
 import { config } from "../config.js";
 import { supabase } from "../db.js";
-import { optionalAuth } from "../middleware/auth.js";
-import DodoPayments from "dodopayments";
+import { requireAuth, optionalAuth } from "../middleware/auth.js";
+import { getDodoPaymentsClient } from "../lib/dodopayments.js";
 
 // ============================================================================
-// DODO PAYMENTS INTEGRATION - Clean Implementation
+// DODO PAYMENTS - Subscription Integration
+// Plans: creator (1000 credits/mo), studio (4000 credits/mo)
+// Webhook: POST /api/payments/webhook/dodo
 // ============================================================================
-// Features:
-// 1. Webhook deduplication using webhook_id
-// 2. One-time access per email (DB enforced)
-// 3. Payment ID tracking (unique constraint)
-// 4. Pre-checkout access check (best UX)
-// ============================================================================
-
-// Initialize DodoPayments client for webhook verification
-const dodoClient = new DodoPayments({
-  bearerToken: config.dodoPayment.apiKey,
-  environment: config.dodoPayment.mode === "live" ? "live_mode" : "test_mode",
-  webhookKey: config.dodoPayment.webhookSecret,
-});
 
 export const paymentsRouter = Router();
 
-// ============================================================================
-// CORS MIDDLEWARE
-// ============================================================================
+// CORS
 paymentsRouter.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
-  
-  if (req.method === "OPTIONS") {
-    res.sendStatus(200);
-    return;
-  }
-  
+  if (req.method === "OPTIONS") { res.sendStatus(200); return; }
   next();
 });
 
 // ============================================================================
+// HELPERS
+// ============================================================================
+
+/** Get the plan name ('creator' | 'studio') from a Dodo product_id */
+function getPlanFromProductId(productId: string): "creator" | "studio" | null {
+  if (productId === config.dodoPayment.creatorProductId) return "creator";
+  if (productId === config.dodoPayment.studioProductId) return "studio";
+  return null;
+}
+
+/** Credits granted per plan per billing cycle */
+const PLAN_CREDITS: Record<string, number> = {
+  creator: 1000,
+  studio: 4000,
+};
+
+// ============================================================================
 // TEST ENDPOINT
+// GET /api/payments/test
 // ============================================================================
 paymentsRouter.get("/test", (_req: Request, res: Response) => {
-  res.json({ 
-    message: "Payments router is working",
-    timestamp: new Date().toISOString(),
-    config: {
-      hasApiKey: !!config.dodoPayment.apiKey,
-      hasProductId: !!config.dodoPayment.productId,
-      hasWebhookSecret: !!config.dodoPayment.webhookSecret,
-      mode: config.dodoPayment.mode,
-    }
+  res.json({
+    ok: true,
+    mode: config.dodoPayment.mode,
+    hasApiKey: !!config.dodoPayment.apiKey,
+    hasWebhookSecret: !!config.dodoPayment.webhookSecret,
+    creatorProductId: config.dodoPayment.creatorProductId || "(not set)",
+    studioProductId: config.dodoPayment.studioProductId || "(not set)",
   });
 });
 
 // ============================================================================
-// CHECK EARLY ACCESS STATUS
-// GET /api/payments/early-access/check
+// CREATE SUBSCRIPTION CHECKOUT SESSION
+// POST /api/payments/create-checkout
+// Body: { plan: "creator" | "studio", email: string }
 // ============================================================================
-paymentsRouter.get("/early-access/check", optionalAuth, async (req: Request, res: Response) => {
+paymentsRouter.post("/create-checkout", optionalAuth, async (req: Request, res: Response) => {
   try {
-    const userId = (req as any).userId;
-    const email = req.query.email as string;
+    const { plan, email } = req.body;
+    const userId = (req as any).userId || null;
 
-    if (!userId && !email) {
-      return res.json({ hasAccess: false, accessInfo: null });
+    if (!plan || !["creator", "studio"].includes(plan)) {
+      return res.status(400).json({ error: "plan must be 'creator' or 'studio'" });
+    }
+    if (!email || !email.includes("@")) {
+      return res.status(400).json({ error: "Valid email is required" });
     }
 
-    // Check in early_access table (new schema)
-    let query = supabase
-      .from("early_access")
-      .select("*")
-      .eq("status", "granted");
+    const productId = plan === "creator"
+      ? config.dodoPayment.creatorProductId
+      : config.dodoPayment.studioProductId;
 
-    if (email) {
-      query = query.eq("email", email);
-    } else if (userId) {
-      query = query.eq("user_id", userId);
+    if (!productId) {
+      logger.error({ plan }, "Product ID not configured for plan");
+      return res.status(500).json({ error: `Payment product for ${plan} plan not configured` });
     }
 
-    const { data: access, error } = await query.maybeSingle();
+    const returnUrl = config.dodoPayment.returnUrl ||
+      `${config.email.frontendUrl}/checkout/success`;
 
-    if (error) {
-      logger.error({ error }, "Error checking early access");
-      return res.status(500).json({ error: "Database error" });
-    }
+    const dodo = getDodoPaymentsClient();
+
+    const session = await dodo.checkoutSessions.create({
+      product_cart: [{ product_id: productId, quantity: 1 }],
+      customer: { email },
+      return_url: returnUrl,
+      metadata: {
+        plan,
+        user_id: userId || "",
+        email,
+      },
+    });
+
+    logger.info({ plan, email, sessionId: session.session_id }, "Checkout session created");
+
+    // Log the attempt
+    try {
+      await supabase.from("payment_attempts").insert({
+        email,
+        user_id: userId,
+        checkout_session_id: session.session_id,
+        plan,
+        status: "pending",
+        metadata: { plan, created_at: new Date().toISOString() },
+      });
+    } catch { /* non-critical */ }
 
     res.json({
-      hasAccess: !!access,
-      accessInfo: access || null,
+      checkoutUrl: session.checkout_url,
+      sessionId: session.session_id,
     });
   } catch (error: any) {
-    logger.error({ error }, "Error checking early access");
+    logger.error({ error: error?.message }, "Error creating checkout session");
+    res.status(500).json({ error: "Failed to create checkout session" });
+  }
+});
+
+// ============================================================================
+// GET USER SUBSCRIPTION STATUS
+// GET /api/payments/subscription
+// ============================================================================
+paymentsRouter.get("/subscription", requireAuth, async (req: Request, res: Response) => {
+  try {
+    const userId = (req as any).userId;
+
+    const { data: subscription } = await supabase
+      .from("user_subscriptions")
+      .select("*")
+      .eq("user_id", userId)
+      .in("status", ["active", "on_hold"])
+      .order("created_at", { ascending: false })
+      .maybeSingle();
+
+    res.json({ subscription: subscription || null });
+  } catch (error: any) {
+    logger.error({ error: error?.message }, "Error fetching subscription");
     res.status(500).json({ error: "Internal server error" });
   }
 });
 
 // ============================================================================
-// CREATE CHECKOUT SESSION (with pre-check)
-// POST /api/payments/early-access/create
+// SYNC SUBSCRIPTION FROM DODO (use when webhook can't reach you, e.g. localhost)
+// POST /api/payments/sync?payment_id=xxx  OR  ?subscription_id=xxx
+// Fetches subscription from Dodo API and writes to DB (same as webhook would).
 // ============================================================================
-paymentsRouter.post("/early-access/create", optionalAuth, async (req: Request, res: Response) => {
+paymentsRouter.post("/sync", optionalAuth, async (req: Request, res: Response) => {
   try {
-    const { email } = req.body;
-    const userId = (req as any).userId || null;
+    const paymentId = (req.query.payment_id || req.body?.payment_id) as string | undefined;
+    const subscriptionIdParam = (req.query.subscription_id || req.body?.subscription_id) as string | undefined;
 
-    if (!email || !email.includes("@")) {
-      return res.status(400).json({ error: "Valid email is required" });
-    }
+    let subscriptionId: string | undefined = subscriptionIdParam;
 
-    // ========================================
-    // PRE-CHECK: Does email already have access?
-    // This prevents showing checkout to users who already paid
-    // ========================================
-    try {
-      const { data: existingAccess, error: checkError } = await supabase
-        .from("early_access")
-        .select("id, email, granted_at, status")
-        .eq("email", email)
-        .eq("status", "granted")
-        .maybeSingle();
+    const dodo = getDodoPaymentsClient();
 
-      if (checkError) {
-        // Table might not exist - log and continue to checkout
-        logger.warn({ checkError, email }, "Error checking early_access - table might not exist, continuing to checkout");
-      } else if (existingAccess) {
-        logger.info({ 
-          email, 
-          accessId: existingAccess.id,
-          grantedAt: existingAccess.granted_at 
-        }, "User already has early access - blocking checkout");
-        
-        return res.status(409).json({ 
-          error: "ALREADY_HAS_ACCESS",
-          message: "This email already has early access",
-          accessInfo: existingAccess,
-          status: "ALREADY_HAS_ACCESS"
-        });
-      }
-    } catch (checkErr) {
-      logger.warn({ checkErr, email }, "Exception checking early access - continuing to checkout");
-    }
-
-    // Also check by user_id if provided
-    if (userId) {
+    if (paymentId && !subscriptionId) {
       try {
-        const { data: existingByUserId, error: userIdCheckError } = await supabase
-          .from("early_access")
-          .select("id, email, granted_at")
-          .eq("user_id", userId)
-          .eq("status", "granted")
-          .maybeSingle();
-
-        if (userIdCheckError) {
-          logger.warn({ userIdCheckError, userId }, "Error checking by user_id - continuing");
-        } else if (existingByUserId) {
-          logger.info({ userId, email, accessId: existingByUserId.id }, "User already has access by user_id");
-          
-          return res.status(409).json({ 
-            error: "ALREADY_HAS_ACCESS",
-            message: "You already have early access",
-            accessInfo: existingByUserId,
-            status: "ALREADY_HAS_ACCESS"
-          });
-        }
-      } catch (userCheckErr) {
-        logger.warn({ userCheckErr, userId }, "Exception checking by user_id - continuing");
+        const payment: any = await dodo.payments.retrieve(paymentId);
+        subscriptionId = payment.subscription_id || payment.subscription?.id;
+      } catch (err: any) {
+        logger.warn({ paymentId, err: err?.message }, "Could not fetch payment from Dodo");
+        return res.status(400).json({ error: "Invalid payment_id or could not fetch from Dodo" });
       }
     }
 
-    // ========================================
-    // CREATE CHECKOUT SESSION
-    // ========================================
-    if (!config.dodoPayment.productId) {
-      logger.error("DODO_PAYMENT_PRODUCT_ID is not configured");
-      return res.status(500).json({ error: "Payment product not configured" });
+    if (!subscriptionId) {
+      return res.status(400).json({ error: "Provide payment_id or subscription_id in query or body" });
     }
 
-    const checkoutSession = await createCheckoutSession({
-      email,
-      userId,
-    });
-
-    if (!checkoutSession) {
-      logger.error("Failed to create checkout session");
-      return res.status(500).json({ error: "Failed to create checkout session" });
-    }
-
-    // Log the attempt (for audit)
+    let sub: any;
     try {
-      await supabase.from("payment_attempts").insert({
-        email,
-        user_id: userId,
-        checkout_session_id: checkoutSession.session_id,
-        status: "pending",
-        metadata: { created_at: new Date().toISOString() }
-      });
-    } catch (err) {
-      logger.warn({ err }, "Failed to log payment attempt");
+      sub = await dodo.subscriptions.retrieve(subscriptionId);
+    } catch (err: any) {
+      logger.warn({ subscriptionId, err: err?.message }, "Could not fetch subscription from Dodo");
+      return res.status(400).json({ error: "Invalid subscription_id or could not fetch from Dodo" });
+    }
+
+    // Map Dodo API response to shape expected by handleSubscriptionActive
+    const data = {
+      subscription_id: sub.id || sub.subscription_id,
+      product_id: sub.product_id,
+      customer_id: sub.customer_id,
+      customer: sub.customer || { email: sub.customer_email, name: sub.customer_name },
+      email: sub.customer?.email || sub.customer_email,
+      currency: sub.currency || "INR",
+      current_period_start: sub.current_period_start,
+      current_period_end: sub.current_period_end,
+      recurring_pre_tax_amount: sub.recurring_pre_tax_amount ?? 0,
+    };
+
+    await handleSubscriptionActive(data, `sync-${Date.now()}`);
+
+    logger.info({ subscriptionId: data.subscription_id }, "Sync completed – subscription and credits updated in DB");
+
+    res.json({ ok: true, message: "Subscription synced to database", subscription_id: data.subscription_id });
+  } catch (error: any) {
+    logger.error({ error: error?.message }, "Error syncing subscription");
+    res.status(500).json({ error: error?.message || "Sync failed" });
+  }
+});
+
+// ============================================================================
+// GET USER CREDITS
+// GET /api/payments/credits
+// ============================================================================
+paymentsRouter.get("/credits", requireAuth, async (req: Request, res: Response) => {
+  try {
+    const userId = (req as any).userId;
+
+    const { data: credits } = await supabase
+      .from("user_credits")
+      .select("*")
+      .eq("user_id", userId)
+      .maybeSingle();
+
+    if (!credits) {
+      return res.json({ credits: { used: 0, total: 0, plan: null, remaining: 0 } });
     }
 
     res.json({
-      paymentLink: checkoutSession.checkout_url,
-      sessionId: checkoutSession.session_id,
-      status: "checkout_created",
+      credits: {
+        used: credits.credits_used,
+        total: credits.credits_total,
+        remaining: Math.max(0, credits.credits_total - credits.credits_used),
+        plan: credits.plan,
+        resetAt: credits.reset_at,
+      },
     });
   } catch (error: any) {
-    logger.error({ error }, "Error creating payment link");
+    logger.error({ error: error?.message }, "Error fetching credits");
     res.status(500).json({ error: "Internal server error" });
   }
 });
@@ -216,32 +239,20 @@ paymentsRouter.post("/early-access/create", optionalAuth, async (req: Request, r
 // ============================================================================
 // WEBHOOK ENDPOINT
 // POST /api/payments/webhook/dodo
+// Handles subscription lifecycle events from Dodo Payments
 // ============================================================================
 paymentsRouter.post("/webhook/dodo", async (req: Request, res: Response) => {
-  const startTime = Date.now();
-  
   try {
-    // ========================================
-    // STEP 1: Extract webhook headers
-    // ========================================
     const webhookId = req.headers["webhook-id"] as string;
     const webhookSignature = req.headers["webhook-signature"] as string;
     const webhookTimestamp = req.headers["webhook-timestamp"] as string;
 
-    logger.info({ 
-      webhookId,
-      hasSignature: !!webhookSignature,
-      hasTimestamp: !!webhookTimestamp,
-    }, "📥 Webhook received");
-
     if (!webhookId || !webhookSignature || !webhookTimestamp) {
-      logger.warn("Missing webhook headers");
-      return res.status(401).json({ error: "Missing webhook headers" });
+      logger.warn("Webhook missing required headers");
+      return res.status(400).json({ error: "Missing webhook headers" });
     }
 
-    // ========================================
-    // STEP 2: Check if webhook already processed (DEDUPLICATION)
-    // ========================================
+    // --- DEDUPLICATION CHECK ---
     const { data: existingWebhook } = await supabase
       .from("webhook_events")
       .select("id")
@@ -249,13 +260,11 @@ paymentsRouter.post("/webhook/dodo", async (req: Request, res: Response) => {
       .maybeSingle();
 
     if (existingWebhook) {
-      logger.info({ webhookId }, "⏭️ Webhook already processed - returning 200");
+      logger.info({ webhookId }, "Webhook already processed");
       return res.status(200).json({ received: true, status: "already_processed" });
     }
 
-    // ========================================
-    // STEP 3: Get raw payload for verification
-    // ========================================
+    // --- GET RAW PAYLOAD ---
     let payload: string;
     if (Buffer.isBuffer(req.body)) {
       payload = req.body.toString("utf8");
@@ -265,92 +274,81 @@ paymentsRouter.post("/webhook/dodo", async (req: Request, res: Response) => {
       payload = JSON.stringify(req.body);
     }
 
-    // ========================================
-    // STEP 4: Verify signature using DodoPayments SDK
-    // ========================================
+    // --- VERIFY SIGNATURE ---
     let event: any;
     try {
-      event = dodoClient.webhooks.unwrap(payload, {
+      const dodo = getDodoPaymentsClient();
+      event = dodo.webhooks.unwrap(payload, {
         headers: {
           "webhook-id": webhookId,
           "webhook-signature": webhookSignature,
           "webhook-timestamp": webhookTimestamp,
-        }
+        },
       });
-      
-      logger.info({ eventType: event?.type }, "✅ Signature verified");
+      logger.info({ type: event?.type }, "Webhook signature verified");
     } catch (verifyError: any) {
-      logger.error({ error: verifyError?.message }, "❌ Signature verification failed");
-      
-      // Allow bypass for testing only
       if (process.env.SKIP_WEBHOOK_VERIFICATION === "true") {
-        logger.warn("⚠️ SKIPPING VERIFICATION (testing only)");
-        try {
-          event = JSON.parse(payload);
-        } catch {
-          return res.status(400).json({ error: "Invalid JSON" });
+        logger.warn("Skipping webhook verification (dev mode)");
+        try { event = JSON.parse(payload); } catch {
+          return res.status(400).json({ error: "Invalid JSON payload" });
         }
       } else {
+        logger.error({ error: verifyError?.message }, "Webhook signature verification failed");
         return res.status(401).json({ error: "Signature verification failed" });
       }
     }
 
-    const eventType = event?.type || event?.event_type;
-    const eventData = event?.data || event;
+    const eventType: string = event?.type || "";
+    const eventData: any = event?.data || {};
 
-    // ========================================
-    // STEP 5: Store webhook event (for deduplication)
-    // ========================================
-    const { error: insertWebhookError } = await supabase
-      .from("webhook_events")
-      .insert({
-        webhook_id: webhookId,
-        event_type: eventType,
-        payload: event,
-      });
+    // --- STORE WEBHOOK (deduplication) ---
+    const { error: insertErr } = await supabase.from("webhook_events").insert({
+      webhook_id: webhookId,
+      event_type: eventType,
+      payload: event,
+    });
 
-    if (insertWebhookError) {
-      // If unique violation, another process handled it
-      if (insertWebhookError.code === '23505') {
-        logger.info({ webhookId }, "⏭️ Webhook inserted by another process");
-        return res.status(200).json({ received: true, status: "already_processed" });
-      }
-      logger.error({ error: insertWebhookError }, "Failed to store webhook event");
+    if (insertErr?.code === "23505") {
+      // Another process already stored it
+      return res.status(200).json({ received: true, status: "already_processed" });
     }
 
-    // ========================================
-    // STEP 6: Respond 200 immediately (Dodo expects quick response)
-    // ========================================
+    // --- ACK IMMEDIATELY ---
     res.status(200).json({ received: true });
 
-    // ========================================
-    // STEP 7: Process event asynchronously
-    // ========================================
-    const processingTime = Date.now() - startTime;
-    logger.info({ eventType, processingTime }, "Processing webhook event");
+    // --- PROCESS ASYNCHRONOUSLY ---
+    logger.info({ eventType }, "Processing webhook event");
 
     switch (eventType) {
+      case "subscription.active":
+        await handleSubscriptionActive(eventData, webhookId);
+        break;
+      case "subscription.renewed":
+        await handleSubscriptionRenewed(eventData, webhookId);
+        break;
+      case "subscription.cancelled":
+      case "subscription.expired":
+        await handleSubscriptionCancelled(eventData, eventType);
+        break;
+      case "subscription.on_hold":
+        await handleSubscriptionOnHold(eventData);
+        break;
+      case "subscription.failed":
+        await handleSubscriptionFailed(eventData);
+        break;
       case "payment.succeeded":
-      case "payment.completed":
-        await handlePaymentSuccess(eventData, webhookId);
+        await handlePaymentSucceeded(eventData, webhookId);
         break;
       case "payment.failed":
-        await handlePaymentFailure(eventData, webhookId);
-        break;
-      case "refund.succeeded":
-        await handleRefund(eventData, webhookId, "succeeded");
-        break;
-      case "refund.failed":
-        await handleRefund(eventData, webhookId, "failed");
+        await handlePaymentFailed(eventData, webhookId);
         break;
       default:
-        logger.info({ eventType }, "Unhandled event type");
+        logger.info({ eventType }, "Unhandled webhook event type");
     }
 
     return;
   } catch (error: any) {
-    logger.error({ error, stack: error?.stack }, "Webhook processing error");
-    // Still return 200 to prevent retries for server errors
+    logger.error({ error: error?.message, stack: error?.stack }, "Webhook processing error");
     if (!res.headersSent) {
       res.status(200).json({ received: true, error: "Processing error" });
     }
@@ -358,579 +356,305 @@ paymentsRouter.post("/webhook/dodo", async (req: Request, res: Response) => {
 });
 
 // ============================================================================
-// GET ACCESS INFO BY ID
-// GET /api/payments/early-access/:id
+// WEBHOOK HANDLERS
 // ============================================================================
-paymentsRouter.get("/early-access/:id", optionalAuth, async (req: Request, res: Response) => {
+
+/** subscription.active - New subscription activated, grant credits */
+async function handleSubscriptionActive(data: any, webhookId: string) {
   try {
-    const { id } = req.params;
-    
-    const { data: access, error } = await supabase
-      .from("early_access")
-      .select("*")
-      .eq("id", id)
+    const subscriptionId = data.subscription_id;
+    const productId = data.product_id;
+    const customerId = data.customer_id;
+    const email: string = data.customer?.email || data.email || "";
+    const customerName: string = data.customer?.name || "";
+    const currency: string = data.currency || "INR";
+    const currentPeriodStart = data.current_period_start;
+    const currentPeriodEnd = data.current_period_end;
+    const recurringAmount: number = data.recurring_pre_tax_amount || 0;
+
+    const plan = getPlanFromProductId(productId);
+    const credits = plan ? PLAN_CREDITS[plan] : 0;
+
+    logger.info({ subscriptionId, productId, plan, email, credits }, "Subscription activated");
+
+    if (!email) {
+      logger.error({ data }, "subscription.active missing customer email");
+      return;
+    }
+
+    // --- Find user by email ---
+    const userId = await findUserIdByEmail(email);
+
+    // --- Upsert user_subscriptions ---
+    const { error: subErr } = await supabase.from("user_subscriptions").upsert(
+      {
+        user_id: userId,
+        email,
+        plan: plan || "unknown",
+        status: "active",
+        dodo_subscription_id: subscriptionId,
+        dodo_customer_id: customerId,
+        product_id: productId,
+        recurring_amount: recurringAmount,
+        currency,
+        current_period_start: currentPeriodStart,
+        current_period_end: currentPeriodEnd,
+        customer_name: customerName,
+        metadata: { webhook_id: webhookId, raw: data },
+        updated_at: new Date().toISOString(),
+      },
+      { onConflict: "dodo_subscription_id" }
+    );
+
+    if (subErr) {
+      logger.error({ error: subErr }, "Failed to upsert user_subscriptions");
+    }
+
+    // --- Upsert user_credits ---
+    if (plan && credits > 0) {
+      await upsertUserCredits({
+        userId,
+        email,
+        plan,
+        creditsTotal: credits,
+        subscriptionId,
+        resetAt: currentPeriodEnd,
+      });
+    }
+
+    logger.info({ subscriptionId, email, plan, credits }, "✅ Subscription active + credits granted");
+  } catch (error: any) {
+    logger.error({ error: error?.message }, "Error in handleSubscriptionActive");
+  }
+}
+
+/** subscription.renewed - Billing cycle renewed, reset credits */
+async function handleSubscriptionRenewed(data: any, webhookId: string) {
+  try {
+    const subscriptionId = data.subscription_id;
+    const productId = data.product_id;
+    const email: string = data.customer?.email || data.email || "";
+    const currentPeriodStart = data.current_period_start;
+    const currentPeriodEnd = data.current_period_end;
+
+    const plan = getPlanFromProductId(productId);
+    const credits = plan ? PLAN_CREDITS[plan] : 0;
+
+    logger.info({ subscriptionId, plan, email }, "Subscription renewed");
+
+    // Update subscription period
+    await supabase
+      .from("user_subscriptions")
+      .update({
+        status: "active",
+        current_period_start: currentPeriodStart,
+        current_period_end: currentPeriodEnd,
+        updated_at: new Date().toISOString(),
+        metadata: { last_renewed: new Date().toISOString(), webhook_id: webhookId },
+      })
+      .eq("dodo_subscription_id", subscriptionId);
+
+    // Reset credits for new cycle
+    if (plan && credits > 0 && email) {
+      const userId = await findUserIdByEmail(email);
+      await upsertUserCredits({
+        userId,
+        email,
+        plan,
+        creditsTotal: credits,
+        subscriptionId,
+        resetAt: currentPeriodEnd,
+        resetUsed: true,
+      });
+    }
+
+    logger.info({ subscriptionId, plan, credits }, "✅ Subscription renewed + credits reset");
+  } catch (error: any) {
+    logger.error({ error: error?.message }, "Error in handleSubscriptionRenewed");
+  }
+}
+
+/** subscription.cancelled / subscription.expired */
+async function handleSubscriptionCancelled(data: any, eventType: string) {
+  try {
+    const subscriptionId = data.subscription_id;
+    const status = eventType === "subscription.expired" ? "expired" : "cancelled";
+
+    logger.info({ subscriptionId, status }, "Subscription cancelled/expired");
+
+    await supabase
+      .from("user_subscriptions")
+      .update({
+        status,
+        cancelled_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      })
+      .eq("dodo_subscription_id", subscriptionId);
+
+    // Optionally zero out credits on cancellation
+    // (We leave existing credits until the end of the period)
+    logger.info({ subscriptionId }, `✅ Subscription marked as ${status}`);
+  } catch (error: any) {
+    logger.error({ error: error?.message }, "Error in handleSubscriptionCancelled");
+  }
+}
+
+/** subscription.on_hold - Payment failed, subscription paused */
+async function handleSubscriptionOnHold(data: any) {
+  try {
+    const subscriptionId = data.subscription_id;
+    logger.info({ subscriptionId }, "Subscription on hold");
+
+    await supabase
+      .from("user_subscriptions")
+      .update({
+        status: "on_hold",
+        updated_at: new Date().toISOString(),
+      })
+      .eq("dodo_subscription_id", subscriptionId);
+  } catch (error: any) {
+    logger.error({ error: error?.message }, "Error in handleSubscriptionOnHold");
+  }
+}
+
+/** subscription.failed */
+async function handleSubscriptionFailed(data: any) {
+  try {
+    const subscriptionId = data.subscription_id;
+    logger.info({ subscriptionId }, "Subscription failed");
+
+    await supabase
+      .from("user_subscriptions")
+      .update({
+        status: "failed",
+        updated_at: new Date().toISOString(),
+      })
+      .eq("dodo_subscription_id", subscriptionId);
+  } catch (error: any) {
+    logger.error({ error: error?.message }, "Error in handleSubscriptionFailed");
+  }
+}
+
+/** payment.succeeded - Log payment record */
+async function handlePaymentSucceeded(data: any, webhookId: string) {
+  try {
+    const paymentId = data.payment_id || data.id;
+    const subscriptionId = data.subscription_id;
+    const email: string = data.customer?.email || "";
+    const amountCents: number = data.total_amount || data.amount || 0;
+    const currency: string = data.currency || "INR";
+    const productId = data.product_cart?.[0]?.product_id || data.product_id;
+    const plan = productId ? getPlanFromProductId(productId) : null;
+
+    logger.info({ paymentId, subscriptionId, email, amountCents, plan }, "Payment succeeded");
+
+    await supabase.from("subscription_payments").upsert(
+      {
+        email,
+        dodo_payment_id: paymentId,
+        dodo_subscription_id: subscriptionId,
+        amount_cents: amountCents,
+        currency,
+        status: "succeeded",
+        plan,
+        webhook_id: webhookId,
+        metadata: { raw: data },
+      },
+      { onConflict: "dodo_payment_id" }
+    );
+  } catch (error: any) {
+    logger.error({ error: error?.message }, "Error in handlePaymentSucceeded");
+  }
+}
+
+/** payment.failed - Log failed payment */
+async function handlePaymentFailed(data: any, webhookId: string) {
+  try {
+    const paymentId = data.payment_id || data.id;
+    const subscriptionId = data.subscription_id;
+    const email: string = data.customer?.email || "";
+    const amountCents: number = data.total_amount || data.amount || 0;
+    const currency: string = data.currency || "INR";
+
+    logger.info({ paymentId, subscriptionId, email }, "Payment failed");
+
+    await supabase.from("subscription_payments").upsert(
+      {
+        email,
+        dodo_payment_id: paymentId,
+        dodo_subscription_id: subscriptionId,
+        amount_cents: amountCents,
+        currency,
+        status: "failed",
+        webhook_id: webhookId,
+        metadata: { raw: data },
+      },
+      { onConflict: "dodo_payment_id" }
+    );
+  } catch (error: any) {
+    logger.error({ error: error?.message }, "Error in handlePaymentFailed");
+  }
+}
+
+// ============================================================================
+// UTILITY FUNCTIONS
+// ============================================================================
+
+/** Find a Clerk user_id by email from the users table */
+async function findUserIdByEmail(email: string): Promise<string | null> {
+  try {
+    const { data: user } = await supabase
+      .from("users")
+      .select("id")
+      .eq("email", email)
       .maybeSingle();
-
-    if (error || !access) {
-      return res.status(404).json({ error: "Access record not found" });
-    }
-
-    res.json(access);
-  } catch (error: any) {
-    logger.error({ error }, "Error fetching access info");
-    res.status(500).json({ error: "Internal server error" });
-  }
-});
-
-// ============================================================================
-// GET REFUNDS FOR PAYMENT
-// GET /api/payments/refunds/:paymentId
-// Get all refunds for a payment from Dodo API
-// ============================================================================
-paymentsRouter.get("/refunds/:paymentId", optionalAuth, async (req: Request, res: Response) => {
-  try {
-    const { paymentId } = req.params;
-    
-    logger.info({ paymentId }, "Fetching refunds from Dodo API");
-
-    // Fetch payment details from Dodo API
-    const apiUrl = `${config.dodoPayment.baseUrl}/payments/${paymentId}`;
-    
-    const response = await fetch(apiUrl, {
-      method: "GET",
-      headers: {
-        "Authorization": `Bearer ${config.dodoPayment.apiKey}`,
-        "Content-Type": "application/json",
-      },
-    });
-
-    if (!response.ok) {
-      const errorText = await response.text();
-      logger.error({ status: response.status, error: errorText }, "Failed to fetch payment from Dodo");
-      return res.status(response.status).json({ 
-        error: "Failed to fetch payment from Dodo API",
-        details: errorText 
-      });
-    }
-
-    const paymentData = await response.json();
-    const refunds = paymentData.refunds || [];
-    
-    res.json({
-      paymentId,
-      refunds,
-      refundCount: refunds.length
-    });
-
-  } catch (error: any) {
-    logger.error({ error }, "Error fetching refunds");
-    res.status(500).json({ error: "Internal server error" });
-  }
-});
-
-// ============================================================================
-// SYNC REFUND STATUS FROM DODO API
-// POST /api/payments/sync-refund/:paymentId
-// Manually check refund status from Dodo API and update database
-// ============================================================================
-paymentsRouter.post("/sync-refund/:paymentId", optionalAuth, async (req: Request, res: Response) => {
-  try {
-    const { paymentId } = req.params;
-    
-    logger.info({ paymentId }, "🔄 Syncing refund status from Dodo API");
-
-    // Fetch payment details from Dodo API
-    const apiUrl = `${config.dodoPayment.baseUrl}/payments/${paymentId}`;
-    
-    const response = await fetch(apiUrl, {
-      method: "GET",
-      headers: {
-        "Authorization": `Bearer ${config.dodoPayment.apiKey}`,
-        "Content-Type": "application/json",
-      },
-    });
-
-    if (!response.ok) {
-      const errorText = await response.text();
-      logger.error({ status: response.status, error: errorText }, "Failed to fetch payment from Dodo");
-      return res.status(response.status).json({ 
-        error: "Failed to fetch payment from Dodo API",
-        details: errorText 
-      });
-    }
-
-    const paymentData = await response.json();
-    
-    logger.info({ 
-      paymentId, 
-      status: paymentData.status,
-      hasRefunds: !!paymentData.refunds 
-    }, "Payment data retrieved from Dodo");
-
-    // Check if payment has refunds
-    const refunds = paymentData.refunds || [];
-    
-    if (refunds.length === 0) {
-      return res.json({ 
-        message: "No refunds found for this payment",
-        paymentId,
-        paymentStatus: paymentData.status 
-      });
-    }
-
-    // Process each refund
-    const results = [];
-    for (const refund of refunds) {
-      const refundStatusFromDodo = refund.status || "pending";
-      const refundId = refund.refund_id || refund.id;
-      
-      // Map Dodo refund status to our handler status
-      // Dodo has: pending, succeeded, failed
-      // Our handler accepts: succeeded, failed
-      // If pending, we'll log it but not revoke access yet
-      const handlerStatus: "succeeded" | "failed" = 
-        refundStatusFromDodo === "succeeded" ? "succeeded" :
-        refundStatusFromDodo === "failed" ? "failed" :
-        "succeeded"; // Treat pending as succeeded for now (will be updated when it actually succeeds)
-      
-      logger.info({ 
-        refundId, 
-        refundStatusFromDodo,
-        handlerStatus,
-        paymentId 
-      }, "Processing refund from sync");
-
-      // Only process if refund succeeded or failed
-      // Pending refunds will be processed when they succeed via webhook
-      if (refundStatusFromDodo === "succeeded") {
-        await handleRefund({
-          payment_id: paymentId,
-          refund_id: refundId,
-          amount: refund.amount || 0,
-          currency: refund.currency || paymentData.currency,
-          customer: paymentData.customer,
-          customer_email: paymentData.customer?.email,
-        }, `sync_${Date.now()}`, "succeeded");
-      } else if (refundStatusFromDodo === "failed") {
-        await handleRefund({
-          payment_id: paymentId,
-          refund_id: refundId,
-          amount: refund.amount || 0,
-          currency: refund.currency || paymentData.currency,
-          customer: paymentData.customer,
-          customer_email: paymentData.customer?.email,
-        }, `sync_${Date.now()}`, "failed");
-      } else {
-        // Pending - just log it
-        logger.info({ 
-          refundId, 
-          paymentId 
-        }, "⏳ Refund is pending - will process when succeeded");
-        
-        // Log pending refund to payment_attempts
-        try {
-          await supabase.from("payment_attempts").insert({
-            email: paymentData.customer?.email || null,
-            payment_id: paymentId,
-            refund_id: refundId,
-            status: "refund_pending",
-            amount_cents: refund.amount || 0,
-            currency: refund.currency || paymentData.currency,
-            webhook_id: `sync_${Date.now()}`,
-            metadata: {
-              refund_data: refund,
-              refund_status: "pending",
-              processed_at: new Date().toISOString(),
-            }
-          });
-        } catch (logError: any) {
-          logger.warn({ error: logError }, "Failed to log pending refund");
-        }
-      }
-
-      results.push({
-        refundId,
-        status: refundStatusFromDodo,
-        amount: refund.amount,
-        processed: refundStatusFromDodo !== "pending"
-      });
-    }
-
-    res.json({
-      message: "Refund status synced",
-      paymentId,
-      refundsProcessed: results.length,
-      results
-    });
-
-  } catch (error: any) {
-    logger.error({ error, stack: error?.stack }, "Error syncing refund status");
-    res.status(500).json({ error: "Internal server error" });
-  }
-});
-
-// ============================================================================
-// HELPER: Create Dodo Checkout Session
-// ============================================================================
-async function createCheckoutSession(params: {
-  email: string;
-  userId?: string | null;
-}): Promise<{ checkout_url: string; session_id: string } | null> {
-  try {
-    const { email, userId } = params;
-
-    const apiUrl = `${config.dodoPayment.baseUrl}/checkouts`;
-    
-    const returnUrl = config.dodoPayment.returnUrl || 
-      (config.email.frontendUrl ? `${config.email.frontendUrl}/checkout/success` : "https://hydrilla.ai/checkout/success");
-    
-    const payload = {
-      product_cart: [
-        {
-          product_id: config.dodoPayment.productId,
-          quantity: 1,
-        }
-      ],
-      customer: {
-        email: email,
-      },
-      return_url: returnUrl,
-      metadata: {
-        product: "early_access",
-        user_id: userId || null,
-        email: email,
-        created_at: new Date().toISOString(),
-      },
-      // Include UPI, cards, and other popular payment methods
-      allowed_payment_method_types: [
-        "credit", 
-        "debit", 
-        "upi_collect",   // UPI - collect via VPA
-        "upi_intent",    // UPI - intent based
-        "google_pay",    // Google Pay
-        "apple_pay",     // Apple Pay
-        "paypal",        // PayPal
-      ],
-    };
-
-    logger.info({ apiUrl, returnUrl, email }, "Creating checkout session");
-
-    const response = await fetch(apiUrl, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Authorization": `Bearer ${config.dodoPayment.apiKey}`,
-      },
-      body: JSON.stringify(payload),
-    });
-
-    if (!response.ok) {
-      const errorText = await response.text();
-      logger.error({ status: response.status, error: errorText }, "Checkout creation failed");
-      return null;
-    }
-
-    const data = await response.json();
-    
-    logger.info({ session_id: data.session_id }, "Checkout session created");
-    
-    return {
-      checkout_url: data.checkout_url,
-      session_id: data.session_id,
-    };
-  } catch (error: any) {
-    logger.error({ error }, "Error creating checkout session");
+    return user?.id || null;
+  } catch {
     return null;
   }
 }
 
-// ============================================================================
-// HANDLER: Payment Success
-// ============================================================================
-async function handlePaymentSuccess(data: any, webhookId: string) {
-  try {
-    const paymentId = data.payment_id || data.id;
-    const email = data.customer?.email || data.customer_email || data.email;
-    const customerName = data.customer?.name || data.customer_name;
-    const checkoutSessionId = data.checkout_session_id;
-    const userId = data.metadata?.user_id || null;
-    
-    // Amount handling (Dodo sends in cents)
-    const amountCents = data.total_amount || data.amount || 0;
-    const amount = typeof amountCents === 'number' ? amountCents / 100 : parseFloat(amountCents) / 100;
-    const currency = data.currency || "USD";
+/** Upsert user_credits record */
+async function upsertUserCredits(params: {
+  userId: string | null;
+  email: string;
+  plan: string;
+  creditsTotal: number;
+  subscriptionId: string;
+  resetAt?: string;
+  resetUsed?: boolean;
+}) {
+  const { userId, email, plan, creditsTotal, subscriptionId, resetAt, resetUsed } = params;
 
-    logger.info({ 
-      paymentId, 
-      email, 
-      customerName,
-      amountCents,
-      webhookId 
-    }, "Processing payment success");
+  // Check if record exists
+  const query = userId
+    ? supabase.from("user_credits").select("id, credits_used").eq("user_id", userId).maybeSingle()
+    : supabase.from("user_credits").select("id, credits_used").eq("email", email).maybeSingle();
 
-    if (!email) {
-      logger.error({ data }, "Payment success missing email");
-      return;
-    }
+  const { data: existing } = await query;
 
-    // ========================================
-    // TRY TO GRANT ACCESS (DB handles uniqueness)
-    // ========================================
-    const { data: insertResult, error: insertError } = await supabase
-      .from("early_access")
-      .insert({
-        email,
-        user_id: userId,
-        customer_name: customerName,
-        payment_id: paymentId,
-        checkout_session_id: checkoutSessionId,
-        status: "granted",
-        amount,
-        amount_cents: amountCents,
-        currency,
-        webhook_id: webhookId,
-        metadata: {
-          payment_data: data,
-          processed_at: new Date().toISOString(),
-        }
+  if (existing) {
+    await supabase
+      .from("user_credits")
+      .update({
+        plan,
+        credits_total: creditsTotal,
+        credits_used: resetUsed ? 0 : existing.credits_used,
+        subscription_id: subscriptionId,
+        reset_at: resetAt || null,
+        updated_at: new Date().toISOString(),
+        ...(userId ? { user_id: userId } : {}),
       })
-      .select()
-      .single();
-
-    if (insertError) {
-      // Check if it's a duplicate (unique constraint violation)
-      if (insertError.code === '23505') {
-        logger.info({ 
-          email, 
-          paymentId,
-          errorCode: insertError.code 
-        }, "🚫 Email already has access (DB constraint) - this is expected for duplicates");
-        
-        // Update payment attempt as duplicate
-        try {
-          await supabase.from("payment_attempts").insert({
-            email,
-            user_id: userId,
-            payment_id: paymentId,
-            status: "duplicate_blocked",
-            amount_cents: amountCents,
-            currency,
-            webhook_id: webhookId,
-            metadata: { reason: "Email already has access" }
-          });
-        } catch { /* ignore */ }
-        
-        return;
-      }
-      
-      logger.error({ error: insertError, email }, "Failed to grant access");
-      return;
-    }
-
-    logger.info({ 
-      accessId: insertResult.id,
+      .eq("id", existing.id);
+  } else {
+    await supabase.from("user_credits").insert({
+      user_id: userId,
       email,
-      paymentId,
-      status: "ACCESS_GRANTED"
-    }, "✅ Early access granted successfully!");
-
-    // Update payment attempt status
-    try {
-      await supabase.from("payment_attempts")
-        .update({ 
-          status: "succeeded", 
-          payment_id: paymentId,
-          updated_at: new Date().toISOString() 
-        })
-        .eq("email", email)
-        .eq("status", "pending");
-    } catch { /* ignore */ }
-
-  } catch (error: any) {
-    logger.error({ error }, "Error handling payment success");
-  }
-}
-
-// ============================================================================
-// HANDLER: Payment Failure
-// ============================================================================
-async function handlePaymentFailure(data: any, webhookId: string) {
-  try {
-    const email = data.customer?.email || data.customer_email || data.email;
-    const paymentId = data.payment_id || data.id;
-    const errorMessage = data.error?.message || data.failure_reason || "Unknown error";
-
-    logger.info({ email, paymentId, errorMessage }, "Processing payment failure");
-
-    // Log failed attempt
-    try {
-      await supabase.from("payment_attempts").insert({
-        email,
-        payment_id: paymentId,
-        status: "failed",
-        error_message: errorMessage,
-        webhook_id: webhookId,
-        metadata: data
-      });
-    } catch { /* ignore */ }
-
-  } catch (error: any) {
-    logger.error({ error }, "Error handling payment failure");
-  }
-}
-
-// ============================================================================
-// HANDLER: Refund
-// ============================================================================
-async function handleRefund(data: any, webhookId: string, refundStatus: "succeeded" | "failed" = "succeeded") {
-  try {
-    const paymentId = data.payment_id || data.id || data.metadata?.payment_id;
-    const refundId = data.refund_id || data.id;
-    const email = data.customer?.email || data.customer_email || data.email;
-    const amountCents = data.amount || data.refund_amount || 0;
-    const currency = data.currency || "USD";
-    const refundReason = data.reason || data.refund_reason || "Refund processed";
-
-    logger.info({ 
-      paymentId, 
-      refundId,
-      email, 
-      amountCents,
-      refundStatus,
-      webhookId 
-    }, `🔄 Processing refund (status: ${refundStatus})`);
-
-    // Log refund attempt
-    const attemptStatus = refundStatus === "succeeded" ? "refunded" : "refund_failed";
-    
-    try {
-      await supabase.from("payment_attempts").insert({
-        email: email || null,
-        payment_id: paymentId,
-        refund_id: refundId,
-        status: attemptStatus,
-        amount_cents: amountCents,
-        currency,
-        webhook_id: webhookId,
-        error_message: refundReason,
-        metadata: {
-          refund_data: data,
-          refund_status: refundStatus,
-          processed_at: new Date().toISOString(),
-        }
-      });
-    } catch (logError: any) {
-      logger.warn({ error: logError }, "Failed to log refund attempt");
-    }
-
-    // Only revoke access if refund succeeded
-    // For failed refunds, just log it but don't revoke access
-    if (refundStatus !== "succeeded") {
-      logger.info({ 
-        paymentId, 
-        refundStatus 
-      }, `⚠️ Refund ${refundStatus} - access not revoked`);
-      return;
-    }
-
-    let accessRevoked = false;
-
-    if (paymentId) {
-      // Revoke access by payment_id (most reliable)
-      const { data: existing } = await supabase
-        .from("early_access")
-        .select("id, email, metadata")
-        .eq("payment_id", paymentId)
-        .eq("status", "granted")
-        .maybeSingle();
-      
-      if (existing) {
-        const { error: updateError } = await supabase
-          .from("early_access")
-          .update({ 
-            status: "refunded",
-            updated_at: new Date().toISOString(),
-            metadata: {
-              ...(existing.metadata || {}),
-              refund_webhook_id: webhookId,
-              refund_id: refundId,
-              refunded_at: new Date().toISOString(),
-              refund_amount_cents: amountCents,
-              refund_reason: refundReason,
-              refund_status: refundStatus,
-            }
-          })
-          .eq("payment_id", paymentId)
-          .eq("status", "granted");
-        
-        if (!updateError) {
-          accessRevoked = true;
-          logger.info({ 
-            paymentId, 
-            email: existing.email,
-            accessId: existing.id 
-          }, "✅ Access revoked by payment_id");
-        } else {
-          logger.error({ error: updateError }, "Failed to revoke access by payment_id");
-        }
-      } else {
-        logger.warn({ paymentId }, "No active access found for payment_id");
-      }
-    }
-    
-    // Also try by email if payment_id didn't work
-    if (!accessRevoked && email) {
-      const { data: existingByEmail } = await supabase
-        .from("early_access")
-        .select("id, payment_id, metadata")
-        .eq("email", email)
-        .eq("status", "granted")
-        .maybeSingle();
-      
-      if (existingByEmail) {
-        const { error: updateError } = await supabase
-          .from("early_access")
-          .update({ 
-            status: "refunded",
-            updated_at: new Date().toISOString(),
-            metadata: {
-              ...(existingByEmail.metadata || {}),
-              refund_webhook_id: webhookId,
-              refund_id: refundId,
-              refunded_at: new Date().toISOString(),
-              refund_amount_cents: amountCents,
-              refund_reason: refundReason,
-              refund_status: refundStatus,
-            }
-          })
-          .eq("email", email)
-          .eq("status", "granted");
-        
-        if (!updateError) {
-          accessRevoked = true;
-          logger.info({ 
-            email,
-            paymentId: existingByEmail.payment_id,
-            accessId: existingByEmail.id 
-          }, "✅ Access revoked by email");
-        } else {
-          logger.error({ error: updateError }, "Failed to revoke access by email");
-        }
-      }
-    }
-
-    if (!accessRevoked) {
-      logger.warn({ paymentId, email }, "⚠️ No active access found to revoke");
-    }
-
-    logger.info({ 
-      paymentId, 
-      email, 
-      accessRevoked,
-      refundId,
-      refundStatus
-    }, "🔄 Refund processing complete");
-  } catch (error: any) {
-    logger.error({ error, stack: error?.stack }, "❌ Error handling refund");
+      plan,
+      credits_total: creditsTotal,
+      credits_used: 0,
+      subscription_id: subscriptionId,
+      reset_at: resetAt || null,
+    });
   }
 }

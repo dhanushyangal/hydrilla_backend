@@ -4,6 +4,7 @@ import path from "path";
 import fs from "fs";
 import { threeDRouter } from "./routes/threeD.js";
 import { paymentsRouter } from "./routes/payments.js";
+import { dodopaymentsRouter } from "./routes/dodopayments/route.js";
 import { logger } from "./logger.js";
 import { config } from "./config.js";
 import { initDb } from "./db.js";
@@ -18,6 +19,7 @@ async function main() {
   
   // Raw body parser for webhook signature verification (must be before json parser)
   app.use("/api/payments/webhook/dodo", express.raw({ type: "application/json" }));
+  app.use("/api/dodo/webhook", express.raw({ type: "application/json" }));
   
   // JSON parser for all other routes
   app.use(express.json({ limit: "10mb" }));
@@ -38,6 +40,7 @@ async function main() {
 
   app.use("/api/3d", threeDRouter);
   app.use("/api/payments", paymentsRouter);
+  app.use("/api/dodo", dodopaymentsRouter);
 
   app.use((err: any, _req: any, res: any, _next: any) => {
     logger.error(err);

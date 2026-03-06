@@ -33,9 +33,25 @@ export const config = {
     mode: process.env.DODO_PAYMENT_MODE || "test",  // "test" or "live"
     webhookSecret: process.env.DODO_PAYMENT_WEBHOOK_SECRET || "",
     baseUrl: (process.env.DODO_PAYMENT_MODE || "test") === "live" ? "https://live.dodopayments.com" : "https://test.dodopayments.com",
-    productId: process.env.DODO_PAYMENT_PRODUCT_ID || "",  // Early Access product ID (created in Dodo dashboard)
-    returnUrl: process.env.DODO_PAYMENTS_RETURN_URL || "",  // Return URL after payment (e.g., http://localhost:3000/checkout/success)
+    environment: ((process.env.DODO_PAYMENT_MODE || "test") === "live" ? "live_mode" : "test_mode") as "live_mode" | "test_mode",
+    // Subscription plan product IDs (created in Dodo dashboard)
+    creatorProductId: process.env.DODO_PAYMENT_CREATOR_PRODUCT_ID || "",
+    studioProductId: process.env.DODO_PAYMENT_STUDIO_PRODUCT_ID || "",
+    returnUrl: process.env.DODO_PAYMENTS_RETURN_URL || "",
   },
+  // Map product IDs to plan names and credit limits
+  planConfig: {
+    creator: {
+      productId: process.env.DODO_PAYMENT_CREATOR_PRODUCT_ID || "",
+      credits: 1000,
+      label: "Creator",
+    },
+    studio: {
+      productId: process.env.DODO_PAYMENT_STUDIO_PRODUCT_ID || "",
+      credits: 4000,
+      label: "Studio",
+    },
+  } as Record<string, { productId: string; credits: number; label: string }>,
 };
 
 if (!config.hunyuanApi.url) {
@@ -58,8 +74,12 @@ if (!config.dodoPayment.apiKey) {
   console.warn("[config] DODO_PAYMENT_API_KEY is missing. Payment functionality will be disabled.");
 }
 
-if (!config.dodoPayment.productId) {
-  console.warn("[config] DODO_PAYMENT_PRODUCT_ID is missing. You need to create a product in Dodo dashboard first.");
+if (!config.dodoPayment.creatorProductId) {
+  console.warn("[config] DODO_PAYMENT_CREATOR_PRODUCT_ID is missing. Creator plan checkout will not work.");
+}
+
+if (!config.dodoPayment.studioProductId) {
+  console.warn("[config] DODO_PAYMENT_STUDIO_PRODUCT_ID is missing. Studio plan checkout will not work.");
 }
 
 if (!config.dodoPayment.returnUrl) {
