@@ -211,11 +211,19 @@ paymentsRouter.get("/credits", requireAuth, async (req: Request, res: Response) 
   try {
     const userId = (req as any).userId;
 
-    const { data: credits } = await supabase
-      .from("user_credits")
-      .select("*")
-      .eq("user_id", userId)
-      .maybeSingle();
+    let credits = (await supabase.from("user_credits").select("*").eq("user_id", userId).maybeSingle()).data;
+
+    if (!credits) {
+      const { data: user } = await supabase.from("users").select("email").eq("id", userId).maybeSingle();
+      const email = user?.email;
+      if (email) {
+        const result = await supabase.from("user_credits").select("*").eq("email", email).maybeSingle();
+        credits = result.data;
+        if (credits && !credits.user_id) {
+          await supabase.from("user_credits").update({ user_id: userId, updated_at: new Date().toISOString() }).eq("id", credits.id);
+        }
+      }
+    }
 
     if (!credits) {
       return res.json({ credits: { used: 0, total: 0, plan: null, remaining: 0 } });
@@ -342,6 +350,9 @@ paymentsRouter.post("/webhook/dodo", async (req: Request, res: Response) => {
       case "payment.failed":
         await handlePaymentFailed(eventData, webhookId);
         break;
+      case "credit.added":
+        await handleCreditAdded(eventData, webhookId);
+        break;
       default:
         logger.info({ eventType }, "Unhandled webhook event type");
     }
@@ -362,15 +373,20 @@ paymentsRouter.post("/webhook/dodo", async (req: Request, res: Response) => {
 /** subscription.active - New subscription activated, grant credits */
 async function handleSubscriptionActive(data: any, webhookId: string) {
   try {
-    const subscriptionId = data.subscription_id;
+    const subscriptionId = data.subscription_id || data.id;
     const productId = data.product_id;
     const customerId = data.customer_id;
-    const email: string = data.customer?.email || data.email || "";
-    const customerName: string = data.customer?.name || "";
+    const email: string =
+      data.customer?.email ||
+      data.customer_email ||
+      data.email ||
+      (typeof data.customer === "string" ? data.customer : "") ||
+      "";
+    const customerName: string = data.customer?.name || data.customer_name || "";
     const currency: string = data.currency || "INR";
-    const currentPeriodStart = data.current_period_start;
-    const currentPeriodEnd = data.current_period_end;
-    const recurringAmount: number = data.recurring_pre_tax_amount || 0;
+    const currentPeriodStart = data.current_period_start || data.current_period_start_at;
+    const currentPeriodEnd = data.current_period_end || data.current_period_end_at;
+    const recurringAmount: number = data.recurring_pre_tax_amount ?? data.recurring_amount ?? 0;
 
     const plan = getPlanFromProductId(productId);
     const credits = plan ? PLAN_CREDITS[plan] : 0;
@@ -378,7 +394,7 @@ async function handleSubscriptionActive(data: any, webhookId: string) {
     logger.info({ subscriptionId, productId, plan, email, credits }, "Subscription activated");
 
     if (!email) {
-      logger.error({ data }, "subscription.active missing customer email");
+      logger.error({ data, keys: Object.keys(data || {}) }, "subscription.active missing customer email");
       return;
     }
 
@@ -596,6 +612,64 @@ async function handlePaymentFailed(data: any, webhookId: string) {
   }
 }
 
+/** credit.added - Credits granted (from Dodo Credit-Based Billing); ensure user_credits is set */
+async function handleCreditAdded(data: any, webhookId: string) {
+  try {
+    const subscriptionId = data.subscription_id || data.subscription?.id;
+    const customerId = data.customer_id || data.customer?.id;
+    const email: string =
+      data.customer?.email ||
+      data.customer_email ||
+      data.email ||
+      "";
+    const amount: number =
+      data.amount ?? data.quantity ?? data.credits_added ?? data.balance_after ?? 0;
+
+    logger.info({ subscriptionId, customerId, email, amount, dataKeys: Object.keys(data || {}) }, "Credit added");
+
+    let resolvedEmail = email;
+    let plan: string | null = null;
+
+    if (!resolvedEmail && subscriptionId) {
+      const { data: sub } = await supabase
+        .from("user_subscriptions")
+        .select("email, plan")
+        .eq("dodo_subscription_id", subscriptionId)
+        .maybeSingle();
+      if (sub) {
+        resolvedEmail = sub.email;
+        plan = sub.plan;
+      }
+    }
+
+    if (!resolvedEmail) {
+      logger.warn({ data }, "credit.added: no email and could not resolve from subscription");
+      return;
+    }
+
+    const userId = await findUserIdByEmail(resolvedEmail);
+    const creditsTotal = Math.max(0, Math.round(Number(amount)));
+
+    if (creditsTotal <= 0) {
+      logger.info({ amount, data }, "credit.added: amount not positive, skipping");
+      return;
+    }
+
+    await upsertUserCredits({
+      userId,
+      email: resolvedEmail,
+      plan: plan || "creator",
+      creditsTotal,
+      subscriptionId: subscriptionId || "",
+      resetAt: data.reset_at || data.period_end || undefined,
+    });
+
+    logger.info({ email: resolvedEmail, creditsTotal, subscriptionId }, "✅ credit.added applied to user_credits");
+  } catch (error: any) {
+    logger.error({ error: error?.message, stack: error?.stack }, "Error in handleCreditAdded");
+  }
+}
+
 // ============================================================================
 // UTILITY FUNCTIONS
 // ============================================================================
@@ -620,41 +694,54 @@ async function upsertUserCredits(params: {
   email: string;
   plan: string;
   creditsTotal: number;
-  subscriptionId: string;
-  resetAt?: string;
+  subscriptionId?: string | null;
+  resetAt?: string | null;
   resetUsed?: boolean;
 }) {
   const { userId, email, plan, creditsTotal, subscriptionId, resetAt, resetUsed } = params;
+  const subId = subscriptionId && subscriptionId.trim() ? subscriptionId.trim() : null;
 
-  // Check if record exists
   const query = userId
     ? supabase.from("user_credits").select("id, credits_used").eq("user_id", userId).maybeSingle()
     : supabase.from("user_credits").select("id, credits_used").eq("email", email).maybeSingle();
 
-  const { data: existing } = await query;
+  const { data: existing, error: selectErr } = await query;
+
+  if (selectErr) {
+    logger.error({ error: selectErr, email, userId }, "user_credits select failed");
+    return;
+  }
 
   if (existing) {
-    await supabase
+    const { error: updateErr } = await supabase
       .from("user_credits")
       .update({
         plan,
         credits_total: creditsTotal,
         credits_used: resetUsed ? 0 : existing.credits_used,
-        subscription_id: subscriptionId,
+        ...(subId ? { subscription_id: subId } : {}),
         reset_at: resetAt || null,
         updated_at: new Date().toISOString(),
         ...(userId ? { user_id: userId } : {}),
       })
       .eq("id", existing.id);
+    if (updateErr) {
+      logger.error({ error: updateErr, email, userId }, "user_credits update failed");
+    }
   } else {
-    await supabase.from("user_credits").insert({
+    const insertPayload: Record<string, unknown> = {
       user_id: userId,
       email,
       plan,
       credits_total: creditsTotal,
       credits_used: 0,
-      subscription_id: subscriptionId,
       reset_at: resetAt || null,
-    });
+    };
+    if (subId) insertPayload.subscription_id = subId;
+
+    const { error: insertErr } = await supabase.from("user_credits").insert(insertPayload);
+    if (insertErr) {
+      logger.error({ error: insertErr, email, userId }, "user_credits insert failed");
+    }
   }
 }
