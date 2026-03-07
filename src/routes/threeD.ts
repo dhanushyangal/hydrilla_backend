@@ -152,7 +152,8 @@ threeDRouter.post("/generate", requireAuth, async (req, res) => {
     await syncUserToDatabase(userId);
 
     const { deductCredit } = await import("../services/credits.js");
-    const deductResult = await deductCredit(userId, 1, true);
+    const CREDITS_PER_3D = 10;
+    const deductResult = await deductCredit(userId, CREDITS_PER_3D, true);
     if (!deductResult.ok) {
       return res.status(402).json({ error: deductResult.error });
     }
