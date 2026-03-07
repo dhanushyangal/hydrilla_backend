@@ -647,10 +647,11 @@ async function handleCreditAdded(data: any, webhookId: string) {
       data.customer_email ||
       data.email ||
       "";
-    const amount: number =
-      data.amount ?? data.quantity ?? data.credits_added ?? data.balance_after ?? 0;
+    const amountIncremental = Number(data.amount ?? data.quantity ?? data.credits_added ?? 0);
+    const balanceAfter = data.balance_after != null ? Number(data.balance_after) : null;
+    const totalBalance = data.total_balance != null ? Number(data.total_balance) : (data.available_balance != null ? Number(data.available_balance) : null);
 
-    logger.info({ subscriptionId, customerId, email, amount, dataKeys: Object.keys(data || {}) }, "Credit added");
+    logger.info({ subscriptionId, customerId, email, amountIncremental, balanceAfter, totalBalance, dataKeys: Object.keys(data || {}) }, "Credit added");
 
     let resolvedEmail = email;
     let plan: string | null = null;
@@ -673,10 +674,25 @@ async function handleCreditAdded(data: any, webhookId: string) {
     }
 
     const userId = await findUserIdByEmail(resolvedEmail);
-    const creditsTotal = Math.max(0, Math.round(Number(amount)));
 
-    if (creditsTotal <= 0) {
-      logger.info({ amount, data }, "credit.added: amount not positive, skipping");
+    let creditsTotal: number;
+    if (totalBalance != null && totalBalance >= 0) {
+      creditsTotal = Math.round(totalBalance);
+    } else if (balanceAfter != null && balanceAfter >= 0) {
+      creditsTotal = Math.round(balanceAfter);
+    } else if (amountIncremental > 0) {
+      const existing = userId
+        ? (await supabase.from("user_credits").select("credits_total, credits_used").eq("user_id", userId).maybeSingle()).data
+        : (await supabase.from("user_credits").select("credits_total, credits_used").eq("email", resolvedEmail).maybeSingle()).data;
+      const currentTotal = existing?.credits_total ?? 0;
+      creditsTotal = Math.max(currentTotal, currentTotal + Math.round(amountIncremental));
+    } else {
+      logger.info({ data }, "credit.added: no usable amount/balance, skipping");
+      return;
+    }
+
+    if (creditsTotal < 0) {
+      logger.info({ creditsTotal, data }, "credit.added: negative total, skipping");
       return;
     }
 
