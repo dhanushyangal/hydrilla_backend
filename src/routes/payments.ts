@@ -128,13 +128,33 @@ paymentsRouter.get("/subscription", requireAuth, async (req: Request, res: Respo
   try {
     const userId = (req as any).userId;
 
-    const { data: subscription } = await supabase
+    let subscription = (await supabase
       .from("user_subscriptions")
       .select("*")
       .eq("user_id", userId)
       .in("status", ["active", "on_hold"])
       .order("created_at", { ascending: false })
-      .maybeSingle();
+      .maybeSingle()).data;
+
+    if (!subscription) {
+      const { data: user } = await supabase.from("users").select("email").eq("id", userId).maybeSingle();
+      if (user?.email) {
+        const result = await supabase
+          .from("user_subscriptions")
+          .select("*")
+          .eq("email", user.email)
+          .in("status", ["active", "on_hold"])
+          .order("created_at", { ascending: false })
+          .maybeSingle();
+        subscription = result.data;
+        if (subscription && !subscription.user_id) {
+          await supabase
+            .from("user_subscriptions")
+            .update({ user_id: userId, updated_at: new Date().toISOString() })
+            .eq("id", subscription.id);
+        }
+      }
+    }
 
     res.json({ subscription: subscription || null });
   } catch (error: any) {
@@ -388,8 +408,13 @@ async function handleSubscriptionActive(data: any, webhookId: string) {
     const currentPeriodEnd = data.current_period_end || data.current_period_end_at;
     const recurringAmount: number = data.recurring_pre_tax_amount ?? data.recurring_amount ?? 0;
 
-    const plan = getPlanFromProductId(productId);
-    const credits = plan ? PLAN_CREDITS[plan] : 0;
+    let plan = getPlanFromProductId(productId);
+    let credits = plan ? PLAN_CREDITS[plan] : 0;
+    if (!plan && (productId || subscriptionId)) {
+      plan = "creator";
+      credits = PLAN_CREDITS.creator;
+      logger.info({ subscriptionId, productId }, "subscription.active: unknown product_id, defaulting to creator/1000");
+    }
 
     logger.info({ subscriptionId, productId, plan, email, credits }, "Subscription activated");
 

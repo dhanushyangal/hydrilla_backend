@@ -151,6 +151,12 @@ threeDRouter.post("/generate", requireAuth, async (req, res) => {
     // Sync user to database on first request
     await syncUserToDatabase(userId);
 
+    const { deductCredit } = await import("../services/credits.js");
+    const deductResult = await deductCredit(userId, 1, true);
+    if (!deductResult.ok) {
+      return res.status(402).json({ error: deductResult.error });
+    }
+
     let jobId: string;
 
     if (body.prompt) {
