@@ -384,47 +384,56 @@ paymentsRouter.post("/webhook/dodo", async (req: Request, res: Response) => {
     });
 
     if (insertErr?.code === "23505") {
-      // Another process already stored it
+      // Race: another process already stored and processed this exact webhook_id
+      logger.info({ webhookId, eventType }, "Webhook already processed (race dedup)");
       return res.status(200).json({ received: true, status: "already_processed" });
     }
 
-    // --- ACK IMMEDIATELY ---
-    res.status(200).json({ received: true });
+    // ── PROCESS BEFORE RESPONDING ─────────────────────────────────────────────
+    // On Vercel / serverless hosts the function can be frozen immediately after
+    // res.json(), so we process synchronously first, then acknowledge Dodo.
+    // DB operations are fast (< 2 s); Dodo's response timeout is ~30 s so this
+    // is safe. We ALWAYS return 200 even when a handler throws.
+    logger.info({ eventType, webhookId }, "Processing webhook event");
 
-    // --- PROCESS ASYNCHRONOUSLY ---
-    logger.info({ eventType }, "Processing webhook event");
-
-    switch (eventType) {
-      case "subscription.active":
-        await handleSubscriptionActive(eventData, webhookId);
-        break;
-      case "subscription.renewed":
-        await handleSubscriptionRenewed(eventData, webhookId);
-        break;
-      case "subscription.cancelled":
-      case "subscription.expired":
-        await handleSubscriptionCancelled(eventData, eventType);
-        break;
-      case "subscription.on_hold":
-        await handleSubscriptionOnHold(eventData);
-        break;
-      case "subscription.failed":
-        await handleSubscriptionFailed(eventData);
-        break;
-      case "payment.succeeded":
-        await handlePaymentSucceeded(eventData, webhookId);
-        break;
-      case "payment.failed":
-        await handlePaymentFailed(eventData, webhookId);
-        break;
-      case "credit.added":
-        await handleCreditAdded(eventData, webhookId);
-        break;
-      default:
-        logger.info({ eventType }, "Unhandled webhook event type");
+    try {
+      switch (eventType) {
+        case "subscription.active":
+          await handleSubscriptionActive(eventData, webhookId);
+          break;
+        case "subscription.renewed":
+          await handleSubscriptionRenewed(eventData, webhookId);
+          break;
+        case "subscription.cancelled":
+        case "subscription.expired":
+          await handleSubscriptionCancelled(eventData, eventType);
+          break;
+        case "subscription.on_hold":
+          await handleSubscriptionOnHold(eventData);
+          break;
+        case "subscription.failed":
+          await handleSubscriptionFailed(eventData);
+          break;
+        case "payment.succeeded":
+          await handlePaymentSucceeded(eventData, webhookId);
+          break;
+        case "payment.failed":
+          await handlePaymentFailed(eventData, webhookId);
+          break;
+        case "credit.added":
+          await handleCreditAdded(eventData, webhookId);
+          break;
+        default:
+          logger.info({ eventType }, "Unhandled webhook event type – ignored");
+      }
+    } catch (handlerErr: any) {
+      // Log handler errors but ALWAYS return 200 so Dodo does not retry
+      logger.error({ eventType, webhookId, error: handlerErr?.message, stack: handlerErr?.stack }, "Webhook handler error");
     }
 
-    return;
+    // --- ACK DODO AFTER PROCESSING ---
+    return res.status(200).json({ received: true, eventType });
+
   } catch (error: any) {
     logger.error({ error: error?.message, stack: error?.stack }, "Webhook processing error");
     if (!res.headersSent) {
@@ -474,6 +483,7 @@ async function handleSubscriptionActive(data: any, webhookId: string) {
     const userId: string | null = (data._callerUserId as string | null) || await findUserIdByEmail(email);
 
     // --- Upsert user_subscriptions ---
+    logger.info({ subscriptionId, email, plan, userId }, "Upserting user_subscriptions...");
     const { error: subErr } = await supabase.from("user_subscriptions").upsert(
       {
         user_id: userId,
@@ -495,7 +505,9 @@ async function handleSubscriptionActive(data: any, webhookId: string) {
     );
 
     if (subErr) {
-      logger.error({ error: subErr }, "Failed to upsert user_subscriptions");
+      logger.error({ error: subErr, code: subErr.code, details: subErr.details, hint: subErr.hint, subscriptionId, email, plan, userId }, "❌ Failed to upsert user_subscriptions");
+    } else {
+      logger.info({ subscriptionId, email, plan, userId }, "✅ user_subscriptions upserted");
     }
 
     // --- Upsert user_credits ---
