@@ -623,22 +623,32 @@ async function handleSubscriptionFailed(data: any) {
   }
 }
 
-/** payment.succeeded - Log payment record */
+/** payment.succeeded - Log payment record AND activate subscription if not yet active.
+ *  This acts as a fallback for when subscription.active webhook can't reach the server
+ *  (e.g. localhost). We fetch the subscription from Dodo and run handleSubscriptionActive.
+ */
 async function handlePaymentSucceeded(data: any, webhookId: string) {
   try {
     const paymentId = data.payment_id || data.id;
     const subscriptionId = data.subscription_id;
-    const email: string = data.customer?.email || "";
+    const email: string =
+      data.customer?.email ||
+      data.metadata?.email ||
+      data.email ||
+      "";
     const amountCents: number = data.total_amount || data.amount || 0;
     const currency: string = data.currency || "INR";
+    // product_cart may be null for subscription payments — determine plan from subscription
     const productId = data.product_cart?.[0]?.product_id || data.product_id;
-    const plan = productId ? getPlanFromProductId(productId) : null;
+    let plan = productId ? getPlanFromProductId(productId) : null;
 
     logger.info({ paymentId, subscriptionId, email, amountCents, plan }, "Payment succeeded");
 
+    // Store payment record (upsert so replaying is safe)
     await supabase.from("subscription_payments").upsert(
       {
         email,
+        user_id: data.metadata?.user_id || null,
         dodo_payment_id: paymentId,
         dodo_subscription_id: subscriptionId,
         amount_cents: amountCents,
@@ -650,8 +660,52 @@ async function handlePaymentSucceeded(data: any, webhookId: string) {
       },
       { onConflict: "dodo_payment_id" }
     );
+
+    // ── Subscription activation fallback ────────────────────────────────────
+    // subscription.active may never reach localhost; activate here if the
+    // payment belongs to a subscription and no active row exists yet.
+    if (subscriptionId) {
+      const { data: existingSub } = await supabase
+        .from("user_subscriptions")
+        .select("id, status")
+        .eq("dodo_subscription_id", subscriptionId)
+        .maybeSingle();
+
+      const alreadyActive =
+        existingSub?.status === "active" || existingSub?.status === "on_hold";
+
+      if (!alreadyActive) {
+        logger.info({ subscriptionId, email }, "payment.succeeded: no active subscription row – fetching from Dodo to activate");
+        try {
+          const dodo = getDodoPaymentsClient();
+          const sub: any = await dodo.subscriptions.retrieve(subscriptionId);
+          const customerEmail: string =
+            sub.customer?.email || sub.customer_email || email;
+
+          const subData = {
+            subscription_id: sub.id || sub.subscription_id || subscriptionId,
+            product_id: sub.product_id || productId,
+            customer_id: sub.customer_id || data.customer?.customer_id,
+            customer: sub.customer || { email: customerEmail },
+            email: customerEmail,
+            currency: sub.currency || currency,
+            current_period_start: sub.current_period_start,
+            current_period_end: sub.current_period_end,
+            recurring_pre_tax_amount: sub.recurring_pre_tax_amount ?? amountCents,
+            _callerUserId: data.metadata?.user_id || null,
+          };
+
+          await handleSubscriptionActive(subData, `payment-fallback-${webhookId}`);
+          logger.info({ subscriptionId, email }, "✅ Subscription activated via payment.succeeded fallback");
+        } catch (fetchErr: any) {
+          logger.warn({ err: fetchErr?.message, subscriptionId }, "payment.succeeded: could not fetch subscription from Dodo for fallback activation");
+        }
+      } else {
+        logger.info({ subscriptionId }, "payment.succeeded: subscription already active – skipping fallback");
+      }
+    }
   } catch (error: any) {
-    logger.error({ error: error?.message }, "Error in handlePaymentSucceeded");
+    logger.error({ error: error?.message, stack: error?.stack }, "Error in handlePaymentSucceeded");
   }
 }
 
