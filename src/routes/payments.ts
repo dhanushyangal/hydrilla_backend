@@ -166,12 +166,15 @@ paymentsRouter.get("/subscription", requireAuth, async (req: Request, res: Respo
 // ============================================================================
 // SYNC SUBSCRIPTION FROM DODO (use when webhook can't reach you, e.g. localhost)
 // POST /api/payments/sync?payment_id=xxx  OR  ?subscription_id=xxx
+// Also accepts: POST body { payment_id, subscription_id }
 // Fetches subscription from Dodo API and writes to DB (same as webhook would).
 // ============================================================================
 paymentsRouter.post("/sync", optionalAuth, async (req: Request, res: Response) => {
   try {
     const paymentId = (req.query.payment_id || req.body?.payment_id) as string | undefined;
     const subscriptionIdParam = (req.query.subscription_id || req.body?.subscription_id) as string | undefined;
+    // If the calling user is authenticated, use their userId to backfill immediately
+    const callerUserId: string | null = (req as any).userId || null;
 
     let subscriptionId: string | undefined = subscriptionIdParam;
 
@@ -181,9 +184,10 @@ paymentsRouter.post("/sync", optionalAuth, async (req: Request, res: Response) =
       try {
         const payment: any = await dodo.payments.retrieve(paymentId);
         subscriptionId = payment.subscription_id || payment.subscription?.id;
+        logger.info({ paymentId, subscriptionId }, "Resolved subscription_id from payment_id");
       } catch (err: any) {
         logger.warn({ paymentId, err: err?.message }, "Could not fetch payment from Dodo");
-        return res.status(400).json({ error: "Invalid payment_id or could not fetch from Dodo" });
+        // Don't 400 — if there's a subscription_id in the query, we'll still use it
       }
     }
 
@@ -199,22 +203,26 @@ paymentsRouter.post("/sync", optionalAuth, async (req: Request, res: Response) =
       return res.status(400).json({ error: "Invalid subscription_id or could not fetch from Dodo" });
     }
 
-    // Map Dodo API response to shape expected by handleSubscriptionActive
+    // Map Dodo API response to the shape expected by handleSubscriptionActive
+    const customerEmail: string =
+      sub.customer?.email || sub.customer_email || sub.email || "";
     const data = {
       subscription_id: sub.id || sub.subscription_id,
       product_id: sub.product_id,
       customer_id: sub.customer_id,
-      customer: sub.customer || { email: sub.customer_email, name: sub.customer_name },
-      email: sub.customer?.email || sub.customer_email,
+      customer: sub.customer || { email: customerEmail, name: sub.customer_name },
+      email: customerEmail,
       currency: sub.currency || "INR",
       current_period_start: sub.current_period_start,
       current_period_end: sub.current_period_end,
       recurring_pre_tax_amount: sub.recurring_pre_tax_amount ?? 0,
+      // Pass caller's userId so backfill happens in the same call
+      _callerUserId: callerUserId,
     };
 
     await handleSubscriptionActive(data, `sync-${Date.now()}`);
 
-    logger.info({ subscriptionId: data.subscription_id }, "Sync completed – subscription and credits updated in DB");
+    logger.info({ subscriptionId: data.subscription_id, callerUserId }, "Sync completed – subscription and credits updated in DB");
 
     res.json({ ok: true, message: "Subscription synced to database", subscription_id: data.subscription_id });
   } catch (error: any) {
@@ -231,22 +239,61 @@ paymentsRouter.get("/credits", requireAuth, async (req: Request, res: Response) 
   try {
     const userId = (req as any).userId;
 
+    // 1. Try by user_id
     let credits = (await supabase.from("user_credits").select("*").eq("user_id", userId).maybeSingle()).data;
 
     if (!credits) {
+      // 2. Look up email and try by email
       const { data: user } = await supabase.from("users").select("email").eq("id", userId).maybeSingle();
       const email = user?.email;
       if (email) {
         const result = await supabase.from("user_credits").select("*").eq("email", email).maybeSingle();
         credits = result.data;
-        if (credits && !credits.user_id) {
-          await supabase.from("user_credits").update({ user_id: userId, updated_at: new Date().toISOString() }).eq("id", credits.id);
+        if (credits) {
+          // Backfill user_id on the row so future lookups work
+          if (!credits.user_id) {
+            await supabase
+              .from("user_credits")
+              .update({ user_id: userId, updated_at: new Date().toISOString() })
+              .eq("id", credits.id);
+            credits = { ...credits, user_id: userId };
+          }
+        } else if (email) {
+          // 3. No credits row at all → create free tier (200 credits)
+          logger.info({ userId, email }, "No credits row found – creating free tier (200 credits)");
+          const { data: newRow, error: insertErr } = await supabase
+            .from("user_credits")
+            .insert({
+              user_id: userId,
+              email,
+              plan: null,
+              credits_total: 200,
+              credits_used: 0,
+            })
+            .select()
+            .single();
+
+          if (!insertErr && newRow) {
+            credits = newRow;
+          } else if (insertErr?.code === "23505") {
+            // Race – another process created it simultaneously; just fetch it
+            credits = (await supabase.from("user_credits").select("*").eq("email", email).maybeSingle()).data;
+            if (credits && !credits.user_id) {
+              await supabase
+                .from("user_credits")
+                .update({ user_id: userId, updated_at: new Date().toISOString() })
+                .eq("id", credits.id);
+            }
+          } else if (insertErr) {
+            logger.error({ error: insertErr, userId, email }, "Failed to create free credits row");
+          }
         }
       }
     }
 
     if (!credits) {
-      return res.json({ credits: { used: 0, total: 0, plan: null, remaining: 0 } });
+      // Fallback: return default free-tier values (do not error)
+      return res.json({ credits: { used: 0, total: 200, plan: null, remaining: 200 } });
     }
 
     res.json({
@@ -423,8 +470,8 @@ async function handleSubscriptionActive(data: any, webhookId: string) {
       return;
     }
 
-    // --- Find user by email ---
-    const userId = await findUserIdByEmail(email);
+    // --- Find user by email (prefer caller's userId if sync passed it) ---
+    const userId: string | null = (data._callerUserId as string | null) || await findUserIdByEmail(email);
 
     // --- Upsert user_subscriptions ---
     const { error: subErr } = await supabase.from("user_subscriptions").upsert(
@@ -729,7 +776,11 @@ async function findUserIdByEmail(email: string): Promise<string | null> {
   }
 }
 
-/** Upsert user_credits record */
+/** Upsert user_credits record.
+ *  ALWAYS looks up by EMAIL first (the stable identifier).
+ *  This avoids unique-constraint failures when the same email has a row
+ *  that was created with user_id=null (e.g. webhook fired before user signed up).
+ */
 async function upsertUserCredits(params: {
   userId: string | null;
   email: string;
@@ -742,11 +793,17 @@ async function upsertUserCredits(params: {
   const { userId, email, plan, creditsTotal, subscriptionId, resetAt, resetUsed } = params;
   const subId = subscriptionId && subscriptionId.trim() ? subscriptionId.trim() : null;
 
-  const query = userId
-    ? supabase.from("user_credits").select("id, credits_used").eq("user_id", userId).maybeSingle()
-    : supabase.from("user_credits").select("id, credits_used").eq("email", email).maybeSingle();
+  if (!email) {
+    logger.error({ userId }, "upsertUserCredits called without email – skipping");
+    return;
+  }
 
-  const { data: existing, error: selectErr } = await query;
+  // Always look up by email (handles user_id=null rows created by webhook before user sign-up)
+  const { data: existing, error: selectErr } = await supabase
+    .from("user_credits")
+    .select("id, credits_used, user_id")
+    .eq("email", email)
+    .maybeSingle();
 
   if (selectErr) {
     logger.error({ error: selectErr, email, userId }, "user_credits select failed");
@@ -754,22 +811,29 @@ async function upsertUserCredits(params: {
   }
 
   if (existing) {
+    // Row already exists – update it, backfilling user_id if we now have it
+    const updateData: Record<string, unknown> = {
+      plan,
+      credits_total: creditsTotal,
+      credits_used: resetUsed ? 0 : existing.credits_used,
+      reset_at: resetAt || null,
+      updated_at: new Date().toISOString(),
+    };
+    if (subId) updateData.subscription_id = subId;
+    if (userId && !existing.user_id) updateData.user_id = userId;
+
     const { error: updateErr } = await supabase
       .from("user_credits")
-      .update({
-        plan,
-        credits_total: creditsTotal,
-        credits_used: resetUsed ? 0 : existing.credits_used,
-        ...(subId ? { subscription_id: subId } : {}),
-        reset_at: resetAt || null,
-        updated_at: new Date().toISOString(),
-        ...(userId ? { user_id: userId } : {}),
-      })
+      .update(updateData)
       .eq("id", existing.id);
+
     if (updateErr) {
       logger.error({ error: updateErr, email, userId }, "user_credits update failed");
+    } else {
+      logger.info({ email, userId, plan, creditsTotal }, "user_credits updated");
     }
   } else {
+    // No row for this email → insert new
     const insertPayload: Record<string, unknown> = {
       user_id: userId,
       email,
@@ -782,7 +846,31 @@ async function upsertUserCredits(params: {
 
     const { error: insertErr } = await supabase.from("user_credits").insert(insertPayload);
     if (insertErr) {
-      logger.error({ error: insertErr, email, userId }, "user_credits insert failed");
+      if (insertErr.code === "23505") {
+        // Race condition: another process inserted simultaneously – retry as update
+        logger.warn({ email, userId }, "user_credits insert conflict – retrying as update");
+        const { data: raceRow } = await supabase
+          .from("user_credits")
+          .select("id, credits_used")
+          .eq("email", email)
+          .maybeSingle();
+        if (raceRow) {
+          const retryData: Record<string, unknown> = {
+            plan,
+            credits_total: creditsTotal,
+            credits_used: resetUsed ? 0 : raceRow.credits_used,
+            reset_at: resetAt || null,
+            updated_at: new Date().toISOString(),
+            ...(userId ? { user_id: userId } : {}),
+          };
+          if (subId) retryData.subscription_id = subId;
+          await supabase.from("user_credits").update(retryData).eq("id", raceRow.id);
+        }
+      } else {
+        logger.error({ error: insertErr, email, userId }, "user_credits insert failed");
+      }
+    } else {
+      logger.info({ email, userId, plan, creditsTotal }, "user_credits inserted (new row)");
     }
   }
 }
