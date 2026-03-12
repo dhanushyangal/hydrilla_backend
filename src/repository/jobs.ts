@@ -18,6 +18,7 @@ export async function createJob(params: {
   enablePBR?: boolean;
   polygonType?: PolygonType | null;
   status?: JobStatus;  // Optional initial status (defaults to "WAIT")
+  creditsUsed?: number;  // Credits consumed for this job (default 0)
 }) {
   const {
     id,
@@ -34,6 +35,7 @@ export async function createJob(params: {
     enablePBR = true,
     polygonType = null,
     status = "WAIT",
+    creditsUsed = 0,
   } = params;
 
   try {
@@ -56,6 +58,7 @@ export async function createJob(params: {
       face_count: faceCount,
       enable_pbr: enablePBR,
       polygon_type: polygonType,
+      credits_used: creditsUsed,
     });
 
     if (error) throw error;
@@ -339,6 +342,7 @@ function mapRow(row: any): JobRecord {
     errorCode: row.error_code,
     errorMessage: row.error_message,
     name: row.name || null,
+    creditsUsed: row.credits_used != null ? row.credits_used : 0,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };

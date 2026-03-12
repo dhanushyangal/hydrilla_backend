@@ -98,18 +98,6 @@ paymentsRouter.post("/create-checkout", optionalAuth, async (req: Request, res: 
 
     logger.info({ plan, email, sessionId: session.session_id }, "Checkout session created");
 
-    // Log the attempt
-    try {
-      await supabase.from("payment_attempts").insert({
-        email,
-        user_id: userId,
-        checkout_session_id: session.session_id,
-        plan,
-        status: "pending",
-        metadata: { plan, created_at: new Date().toISOString() },
-      });
-    } catch { /* non-critical */ }
-
     res.json({
       checkoutUrl: session.checkout_url,
       sessionId: session.session_id,
@@ -135,26 +123,6 @@ paymentsRouter.get("/subscription", requireAuth, async (req: Request, res: Respo
       .in("status", ["active", "on_hold"])
       .order("created_at", { ascending: false })
       .maybeSingle()).data;
-
-    if (!subscription) {
-      const { data: user } = await supabase.from("users").select("email").eq("id", userId).maybeSingle();
-      if (user?.email) {
-        const result = await supabase
-          .from("user_subscriptions")
-          .select("*")
-          .eq("email", user.email)
-          .in("status", ["active", "on_hold"])
-          .order("created_at", { ascending: false })
-          .maybeSingle();
-        subscription = result.data;
-        if (subscription && !subscription.user_id) {
-          await supabase
-            .from("user_subscriptions")
-            .update({ user_id: userId, updated_at: new Date().toISOString() })
-            .eq("id", subscription.id);
-        }
-      }
-    }
 
     res.json({ subscription: subscription || null });
   } catch (error: any) {
@@ -239,56 +207,23 @@ paymentsRouter.get("/credits", requireAuth, async (req: Request, res: Response) 
   try {
     const userId = (req as any).userId;
 
-    // 1. Try by user_id
     let credits = (await supabase.from("user_credits").select("*").eq("user_id", userId).maybeSingle()).data;
 
     if (!credits) {
-      // 2. Look up email and try by email
-      const { data: user } = await supabase.from("users").select("email").eq("id", userId).maybeSingle();
-      const email = user?.email;
-      if (email) {
-        const result = await supabase.from("user_credits").select("*").eq("email", email).maybeSingle();
-        credits = result.data;
-        if (credits) {
-          // Backfill user_id on the row so future lookups work
-          if (!credits.user_id) {
-            await supabase
-              .from("user_credits")
-              .update({ user_id: userId, updated_at: new Date().toISOString() })
-              .eq("id", credits.id);
-            credits = { ...credits, user_id: userId };
-          }
-        } else if (email) {
-          // 3. No credits row at all → create free tier (200 credits)
-          logger.info({ userId, email }, "No credits row found – creating free tier (200 credits)");
-          const { data: newRow, error: insertErr } = await supabase
-            .from("user_credits")
-            .insert({
-              user_id: userId,
-              email,
-              plan: null,
-              credits_total: 200,
-              credits_used: 0,
-            })
-            .select()
-            .single();
-
-          if (!insertErr && newRow) {
-            credits = newRow;
-          } else if (insertErr?.code === "23505") {
-            // Race – another process created it simultaneously; just fetch it
-            credits = (await supabase.from("user_credits").select("*").eq("email", email).maybeSingle()).data;
-            if (credits && !credits.user_id) {
-              await supabase
-                .from("user_credits")
-                .update({ user_id: userId, updated_at: new Date().toISOString() })
-                .eq("id", credits.id);
-            }
-          } else if (insertErr) {
-            logger.error({ error: insertErr, userId, email }, "Failed to create free credits row");
-          }
-        }
-      }
+      logger.info({ userId }, "No credits row – creating free tier (200 credits)");
+      const { data: newRow, error: insertErr } = await supabase
+        .from("user_credits")
+        .insert({
+          user_id: userId,
+          plan: null,
+          credits_total: 200,
+          credits_used: 0,
+        })
+        .select()
+        .single();
+      if (!insertErr && newRow) credits = newRow;
+      else if (insertErr?.code === "23505") credits = (await supabase.from("user_credits").select("*").eq("user_id", userId).maybeSingle()).data;
+      else if (insertErr) logger.error({ error: insertErr, userId }, "Failed to create free credits row");
     }
 
     if (!credits) {
@@ -487,7 +422,6 @@ async function handleSubscriptionActive(data: any, webhookId: string) {
     const { error: subErr } = await supabase.from("user_subscriptions").upsert(
       {
         user_id: userId,
-        email,
         plan: plan || "unknown",
         status: "active",
         dodo_subscription_id: subscriptionId,
@@ -554,18 +488,28 @@ async function handleSubscriptionRenewed(data: any, webhookId: string) {
       })
       .eq("dodo_subscription_id", subscriptionId);
 
-    // Reset credits for new cycle
-    if (plan && credits > 0 && email) {
-      const userId = await findUserIdByEmail(email);
-      await upsertUserCredits({
-        userId,
-        email,
-        plan,
-        creditsTotal: credits,
-        subscriptionId,
-        resetAt: currentPeriodEnd,
-        resetUsed: true,
-      });
+    // Reset credits for new cycle (resolve user_id from subscription, then email from users)
+    if (plan && credits > 0) {
+      const { data: subRow } = await supabase
+        .from("user_subscriptions")
+        .select("user_id")
+        .eq("dodo_subscription_id", subscriptionId)
+        .maybeSingle();
+      const userId = subRow?.user_id ?? (email ? await findUserIdByEmail(email) : null);
+      const userEmail = userId
+        ? (await supabase.from("users").select("email").eq("id", userId).maybeSingle()).data?.email ?? email
+        : email;
+      if (userId && userEmail) {
+        await upsertUserCredits({
+          userId,
+          email: userEmail,
+          plan,
+          creditsTotal: credits,
+          subscriptionId,
+          resetAt: currentPeriodEnd,
+          resetUsed: true,
+        });
+      }
     }
 
     logger.info({ subscriptionId, plan, credits }, "✅ Subscription renewed + credits reset");
@@ -772,12 +716,13 @@ async function handleCreditAdded(data: any, webhookId: string) {
     if (!resolvedEmail && subscriptionId) {
       const { data: sub } = await supabase
         .from("user_subscriptions")
-        .select("email, plan")
+        .select("user_id, plan")
         .eq("dodo_subscription_id", subscriptionId)
         .maybeSingle();
-      if (sub) {
-        resolvedEmail = sub.email;
+      if (sub?.user_id) {
         plan = sub.plan;
+        const { data: user } = await supabase.from("users").select("email").eq("id", sub.user_id).maybeSingle();
+        resolvedEmail = user?.email ?? "";
       }
     }
 
@@ -796,7 +741,7 @@ async function handleCreditAdded(data: any, webhookId: string) {
     } else if (amountIncremental > 0) {
       const existing = userId
         ? (await supabase.from("user_credits").select("credits_total, credits_used").eq("user_id", userId).maybeSingle()).data
-        : (await supabase.from("user_credits").select("credits_total, credits_used").eq("email", resolvedEmail).maybeSingle()).data;
+        : null;
       const currentTotal = existing?.credits_total ?? 0;
       creditsTotal = Math.max(currentTotal, currentTotal + Math.round(amountIncremental));
     } else {
@@ -842,42 +787,36 @@ async function findUserIdByEmail(email: string): Promise<string | null> {
   }
 }
 
-/** Upsert user_credits record.
- *  ALWAYS looks up by EMAIL first (the stable identifier).
- *  This avoids unique-constraint failures when the same email has a row
- *  that was created with user_id=null (e.g. webhook fired before user signed up).
- */
+/** Upsert user_credits by user_id only (no email). */
 async function upsertUserCredits(params: {
   userId: string | null;
-  email: string;
+  email?: string;
   plan: string;
   creditsTotal: number;
   subscriptionId?: string | null;
   resetAt?: string | null;
   resetUsed?: boolean;
 }) {
-  const { userId, email, plan, creditsTotal, subscriptionId, resetAt, resetUsed } = params;
+  const { userId, plan, creditsTotal, subscriptionId, resetAt, resetUsed } = params;
   const subId = subscriptionId && subscriptionId.trim() ? subscriptionId.trim() : null;
 
-  if (!email) {
-    logger.error({ userId }, "upsertUserCredits called without email – skipping");
+  if (!userId) {
+    logger.error({}, "upsertUserCredits called without userId – skipping");
     return;
   }
 
-  // Always look up by email (handles user_id=null rows created by webhook before user sign-up)
   const { data: existing, error: selectErr } = await supabase
     .from("user_credits")
-    .select("id, credits_used, user_id")
-    .eq("email", email)
+    .select("id, credits_used")
+    .eq("user_id", userId)
     .maybeSingle();
 
   if (selectErr) {
-    logger.error({ error: selectErr, email, userId }, "user_credits select failed");
+    logger.error({ error: selectErr, userId }, "user_credits select failed");
     return;
   }
 
   if (existing) {
-    // Row already exists – update it, backfilling user_id if we now have it
     const updateData: Record<string, unknown> = {
       plan,
       credits_total: creditsTotal,
@@ -886,23 +825,13 @@ async function upsertUserCredits(params: {
       updated_at: new Date().toISOString(),
     };
     if (subId) updateData.subscription_id = subId;
-    if (userId && !existing.user_id) updateData.user_id = userId;
 
-    const { error: updateErr } = await supabase
-      .from("user_credits")
-      .update(updateData)
-      .eq("id", existing.id);
-
-    if (updateErr) {
-      logger.error({ error: updateErr, email, userId }, "user_credits update failed");
-    } else {
-      logger.info({ email, userId, plan, creditsTotal }, "user_credits updated");
-    }
+    const { error: updateErr } = await supabase.from("user_credits").update(updateData).eq("id", existing.id);
+    if (updateErr) logger.error({ error: updateErr, userId }, "user_credits update failed");
+    else logger.info({ userId, plan, creditsTotal }, "user_credits updated");
   } else {
-    // No row for this email → insert new
     const insertPayload: Record<string, unknown> = {
       user_id: userId,
-      email,
       plan,
       credits_total: creditsTotal,
       credits_used: 0,
@@ -913,13 +842,7 @@ async function upsertUserCredits(params: {
     const { error: insertErr } = await supabase.from("user_credits").insert(insertPayload);
     if (insertErr) {
       if (insertErr.code === "23505") {
-        // Race condition: another process inserted simultaneously – retry as update
-        logger.warn({ email, userId }, "user_credits insert conflict – retrying as update");
-        const { data: raceRow } = await supabase
-          .from("user_credits")
-          .select("id, credits_used")
-          .eq("email", email)
-          .maybeSingle();
+        const { data: raceRow } = await supabase.from("user_credits").select("id, credits_used").eq("user_id", userId).maybeSingle();
         if (raceRow) {
           const retryData: Record<string, unknown> = {
             plan,
@@ -927,16 +850,15 @@ async function upsertUserCredits(params: {
             credits_used: resetUsed ? 0 : raceRow.credits_used,
             reset_at: resetAt || null,
             updated_at: new Date().toISOString(),
-            ...(userId ? { user_id: userId } : {}),
           };
           if (subId) retryData.subscription_id = subId;
           await supabase.from("user_credits").update(retryData).eq("id", raceRow.id);
         }
       } else {
-        logger.error({ error: insertErr, email, userId }, "user_credits insert failed");
+        logger.error({ error: insertErr, userId }, "user_credits insert failed");
       }
     } else {
-      logger.info({ email, userId, plan, creditsTotal }, "user_credits inserted (new row)");
+      logger.info({ userId, plan, creditsTotal }, "user_credits inserted (new row)");
     }
   }
 }

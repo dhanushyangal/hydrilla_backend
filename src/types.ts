@@ -35,6 +35,7 @@ export interface JobRecord {
   errorCode: string | null;
   errorMessage: string | null;
   name: string | null;
+  creditsUsed: number;  // Credits consumed for this job (e.g. 10 for 3D, 0 for preview)
   createdAt: Date;
   updatedAt: Date;
 }

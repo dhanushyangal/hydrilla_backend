@@ -45,8 +45,7 @@ The Dodo client (`src/lib/dodopayments.ts`) is created with:
 2. Resolves product ID from config (`creatorProductId` or `studioProductId`).
 3. Builds `return_url` from `DODO_PAYMENTS_RETURN_URL` or `FRONTEND_URL + "/checkout/success"`.
 4. Calls Dodo: `dodo.checkoutSessions.create({ product_cart, customer: { email }, return_url, metadata })`.
-5. Logs the attempt in `payment_attempts` (optional).
-6. Returns `{ checkoutUrl, sessionId }` to the frontend.
+5. Returns `{ checkoutUrl, sessionId }` to the frontend.
 
 **Frontend:** Redirects the user to `checkoutUrl` (Dodo’s hosted checkout page).
 
@@ -147,7 +146,6 @@ No Dodo keys or secrets are used in the frontend; everything goes through the ba
 - **`user_subscriptions`** – One row per Dodo subscription; keyed by `dodo_subscription_id`; stores plan, status, period, `user_id`, `email`.
 - **`user_credits`** – One row per user/email; stores `credits_total`, `credits_used`, `plan`, `reset_at`; updated by webhook/sync and when consuming credits (e.g. 3D job).
 - **`webhook_events`** – Stores `webhook_id`, `event_type`, `payload` for idempotency and debugging.
-- **`payment_attempts`** – Optional log of checkout session creation (email, plan, session_id, status).
 
 ---
 

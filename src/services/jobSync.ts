@@ -125,8 +125,16 @@ export async function syncJobFromApi(jobId: string): Promise<boolean> {
             logger.debug({ jobId }, "Preview-only job not in API (expected)");
             return true;
           }
-          logger.debug({ jobId }, "Job not found in API");
-          return false;
+          // Job is WAIT/RUN but not on API (e.g. GPU server restarted). Mark failed so we stop syncing it.
+          if (dbJob.status === "WAIT" || dbJob.status === "RUN") {
+            await updateJobStatus(jobId, {
+              status: "FAIL",
+              errorCode: null,
+              errorMessage: "Job not found on API (GPU server may have restarted).",
+            });
+            logger.info({ jobId }, "Job not on API, marked failed to stop repeated sync");
+          }
+          return true; // Handled; don't count as sync failure
         }
         // 502/503/504 = gateway/API temporarily unavailable - don't spam ERROR logs
         if (response.status === 502 || response.status === 503 || response.status === 504) {
@@ -272,7 +280,7 @@ export async function syncAllJobs(): Promise<{ synced: number; failed: number }>
       return { synced: 0, failed: 0 };
     }
 
-    logger.info({ count: activeJobs.length }, "Syncing active jobs from API");
+    logger.debug({ count: activeJobs.length }, "Syncing active jobs from API");
 
     let synced = 0;
     let failed = 0;
@@ -301,7 +309,11 @@ export async function syncAllJobs(): Promise<{ synced: number; failed: number }>
       }
     }
 
-    logger.info({ synced, failed }, "Job sync completed");
+    if (failed > 0) {
+      logger.info({ synced, failed }, "Job sync completed with failures");
+    } else {
+      logger.debug({ synced, failed }, "Job sync completed");
+    }
     return { synced, failed };
   } catch (err: any) {
     logger.error({ err }, "Failed to sync jobs");

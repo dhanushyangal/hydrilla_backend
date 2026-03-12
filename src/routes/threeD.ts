@@ -107,6 +107,20 @@ const upload = multer({
 
 const API_BASE = process.env.HUNYUAN_API_URL || "https://api.hydrilla.ai";
 
+/** Resolve relative image URL from gateway to full URL */
+function resolveGatewayImageUrl(url: string | undefined | null): string | null {
+  if (!url || typeof url !== "string") return null;
+  if (url.startsWith("http://") || url.startsWith("https://")) return url;
+  const base = API_BASE.endsWith("/") ? API_BASE.slice(0, -1) : API_BASE;
+  return url.startsWith("/") ? `${base}${url}` : `${base}/${url}`;
+}
+
+// Credits per operation (charged when user runs the operation)
+const CREDITS_IMAGE_GEN = 2;      // text-to-image (preview)
+const CREDITS_IMAGE_EDIT = 3;     // edit-image
+const CREDITS_COMBINED = 4;       // 2-image combined edit
+const CREDITS_IMAGE_TO_3D = 10;   // image-to-3d / text-to-3d
+
 // Initialize S3 client
 let s3Client: S3Client | null = null;
 let s3Enabled = false;
@@ -152,8 +166,7 @@ threeDRouter.post("/generate", requireAuth, async (req, res) => {
     await syncUserToDatabase(userId);
 
     const { deductCredit } = await import("../services/credits.js");
-    const CREDITS_PER_3D = 10;
-    const deductResult = await deductCredit(userId, CREDITS_PER_3D, true);
+    const deductResult = await deductCredit(userId, CREDITS_IMAGE_TO_3D, true);
     if (!deductResult.ok) {
       return res.status(402).json({ error: deductResult.error });
     }
@@ -218,7 +231,7 @@ threeDRouter.post("/generate", requireAuth, async (req, res) => {
       return res.status(400).json({ error: "Either prompt or imageUrl is required" });
     }
 
-    // Create job in database with user_id; store source image for image-to-3D lineage
+    // Create job in database with user_id and credits_used
     const sourceImages = body.imageUrl && (body.imageUrl.startsWith("http://") || body.imageUrl.startsWith("https://"))
       ? [body.imageUrl]
       : null;
@@ -232,12 +245,208 @@ threeDRouter.post("/generate", requireAuth, async (req, res) => {
       faceCount: null,
       enablePBR: true,
       polygonType: null,
+      creditsUsed: CREDITS_IMAGE_TO_3D,
     });
 
     res.json({ jobId });
   } catch (err: any) {
     logger.error(err, "failed to submit job");
     res.status(400).json({ error: err.message || "Failed to submit job" });
+  }
+});
+
+// ============================================
+// Text-to-image (preview) – 2 credits
+// ============================================
+threeDRouter.post("/text-to-image", requireAuth, async (req, res) => {
+  try {
+    const userId = req.userId!;
+    await syncUserToDatabase(userId);
+    const { deductCredit } = await import("../services/credits.js");
+    const deductResult = await deductCredit(userId, CREDITS_IMAGE_GEN, true);
+    if (!deductResult.ok) {
+      return res.status(402).json({ error: deductResult.error });
+    }
+    const body = req.body as { prompt?: string };
+    const prompt = body?.prompt ?? (req as any).body;
+    const promptStr = typeof prompt === "string" ? prompt : "";
+    if (!promptStr.trim()) {
+      return res.status(400).json({ error: "prompt is required" });
+    }
+    const form = new URLSearchParams();
+    form.append("prompt", promptStr);
+    const response = await fetch(`${API_BASE}/text-to-image`, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: form.toString(),
+    });
+    if (!response.ok) {
+      const errText = await response.text();
+      let errJson: any;
+      try { errJson = JSON.parse(errText); } catch { errJson = { error: errText }; }
+      return res.status(response.status).json(errJson);
+    }
+    const data = await response.json();
+    const jobId = data.preview_id ?? data.job_id;
+    if (jobId && userId) {
+      try {
+        const existing = await getJob(jobId);
+        if (!existing) {
+          const previewUrl = resolveGatewayImageUrl(data.image_url ?? data.result?.image_url);
+          await createJob({
+            id: jobId,
+            userId,
+            prompt: promptStr.trim() || null,
+            generateType: "Normal",
+            status: previewUrl ? "DONE" : "WAIT",
+            creditsUsed: CREDITS_IMAGE_GEN,
+          });
+          if (previewUrl) {
+            await updateJobResult(jobId, { previewImageUrl: previewUrl });
+          }
+        }
+      } catch (jobErr: any) {
+        logger.warn({ err: jobErr, jobId }, "Failed to create preview job record (non-critical)");
+      }
+    }
+    res.json(data);
+  } catch (err: any) {
+    logger.error({ err: err.message }, "text-to-image failed");
+    res.status(500).json({ error: err.message || "Failed to generate image" });
+  }
+});
+
+// ============================================
+// Edit image – 3 credits
+// ============================================
+threeDRouter.post("/edit-image", requireAuth, upload.single("image"), async (req, res) => {
+  try {
+    const userId = req.userId!;
+    await syncUserToDatabase(userId);
+    const { deductCredit } = await import("../services/credits.js");
+    const deductResult = await deductCredit(userId, CREDITS_IMAGE_EDIT, true);
+    if (!deductResult.ok) {
+      return res.status(402).json({ error: deductResult.error });
+    }
+    const prompt = (req.body as any)?.prompt ?? "";
+    const imageUrl = (req.body as any)?.image_url as string | undefined;
+    const file = req.file;
+    if (!prompt.trim()) {
+      return res.status(400).json({ error: "prompt is required" });
+    }
+    if (!file && !imageUrl) {
+      return res.status(400).json({ error: "Either image file or image_url is required" });
+    }
+    const form = new FormData();
+    form.append("prompt", prompt);
+    if (file?.buffer) {
+      form.append("image", new Blob([new Uint8Array(file.buffer)], { type: file.mimetype || "image/png" }), file.originalname || "image.png");
+    } else if (imageUrl) {
+      form.append("image_url", imageUrl);
+    }
+    const response = await fetch(`${API_BASE}/edit-image`, {
+      method: "POST",
+      body: form as any,
+    });
+    if (!response.ok) {
+      const errText = await response.text();
+      let errJson: any;
+      try { errJson = JSON.parse(errText); } catch { errJson = { error: errText }; }
+      return res.status(response.status).json(errJson);
+    }
+    const data = await response.json();
+    const jobId = data.edit_id ?? data.job_id;
+    if (jobId && userId) {
+      try {
+        const existing = await getJob(jobId);
+        if (!existing) {
+          const previewUrl = resolveGatewayImageUrl(data.image_url ?? data.result?.image_url);
+          await createJob({
+            id: jobId,
+            userId,
+            prompt: prompt.trim() || null,
+            generateType: "EditImage",
+            status: previewUrl ? "DONE" : "WAIT",
+            creditsUsed: CREDITS_IMAGE_EDIT,
+          });
+          if (previewUrl) {
+            await updateJobResult(jobId, { previewImageUrl: previewUrl });
+          }
+        }
+      } catch (jobErr: any) {
+        logger.warn({ err: jobErr, jobId }, "Failed to create edit job record (non-critical)");
+      }
+    }
+    res.json(data);
+  } catch (err: any) {
+    logger.error({ err: err.message }, "edit-image failed");
+    res.status(500).json({ error: err.message || "Failed to edit image" });
+  }
+});
+
+// ============================================
+// Combined edit (2 images) – 4 credits
+// ============================================
+threeDRouter.post("/combined-edit", requireAuth, upload.fields([{ name: "image_1", maxCount: 1 }, { name: "image_2", maxCount: 1 }]), async (req, res) => {
+  try {
+    const userId = req.userId!;
+    await syncUserToDatabase(userId);
+    const { deductCredit } = await import("../services/credits.js");
+    const deductResult = await deductCredit(userId, CREDITS_COMBINED, true);
+    if (!deductResult.ok) {
+      return res.status(402).json({ error: deductResult.error });
+    }
+    const prompt = (req.body as any)?.prompt ?? "";
+    const files = req.files as { image_1?: Express.Multer.File[]; image_2?: Express.Multer.File[] };
+    const file1 = files?.image_1?.[0];
+    const file2 = files?.image_2?.[0];
+    if (!prompt.trim()) {
+      return res.status(400).json({ error: "prompt is required" });
+    }
+    if (!file1 || !file2) {
+      return res.status(400).json({ error: "Both image_1 and image_2 files are required" });
+    }
+    const form = new FormData();
+    form.append("prompt", prompt);
+    form.append("image_1", new Blob([new Uint8Array(file1.buffer)], { type: file1.mimetype || "image/png" }), file1.originalname || "image1.png");
+    form.append("image_2", new Blob([new Uint8Array(file2.buffer)], { type: file2.mimetype || "image/png" }), file2.originalname || "image2.png");
+    const response = await fetch(`${API_BASE}/combined-edit`, {
+      method: "POST",
+      body: form as any,
+    });
+    if (!response.ok) {
+      const errText = await response.text();
+      let errJson: any;
+      try { errJson = JSON.parse(errText); } catch { errJson = { error: errText }; }
+      return res.status(response.status).json(errJson);
+    }
+    const data = await response.json();
+    const jobId = data.combined_id ?? data.job_id;
+    if (jobId && userId) {
+      try {
+        const existing = await getJob(jobId);
+        if (!existing) {
+          const previewUrl = resolveGatewayImageUrl(data.image_url ?? data.result?.image_url);
+          await createJob({
+            id: jobId,
+            userId,
+            prompt: prompt.trim() || null,
+            generateType: "Combined",
+            status: previewUrl ? "DONE" : "WAIT",
+            creditsUsed: CREDITS_COMBINED,
+          });
+          if (previewUrl) {
+            await updateJobResult(jobId, { previewImageUrl: previewUrl });
+          }
+        }
+      } catch (jobErr: any) {
+        logger.warn({ err: jobErr, jobId }, "Failed to create combined-edit job record (non-critical)");
+      }
+    }
+    res.json(data);
+  } catch (err: any) {
+    logger.error({ err: err.message }, "combined-edit failed");
+    res.status(500).json({ error: err.message || "Failed to combine images" });
   }
 });
 
@@ -1361,6 +1570,18 @@ threeDRouter.post("/register-job", optionalAuth, async (req, res) => {
           ? [imageUrl]
           : null;
 
+    // Deduct credits when creating a new 3D job (WAIT, no preview-only); preview-only jobs use 0 credits
+    const isNew3DJob = initialStatus === "WAIT" && !previewImageUrl;
+    let creditsToSet = 0;
+    if (isNew3DJob && userId) {
+      const { deductCredit } = await import("../services/credits.js");
+      const deductResult = await deductCredit(userId, CREDITS_IMAGE_TO_3D, true);
+      if (!deductResult.ok) {
+        return res.status(402).json({ error: deductResult.error });
+      }
+      creditsToSet = CREDITS_IMAGE_TO_3D;
+    }
+
     await createJob({
       id: job_id,
       userId: userId || null,
@@ -1376,6 +1597,7 @@ threeDRouter.post("/register-job", optionalAuth, async (req, res) => {
       enablePBR: true,
       polygonType: null,
       status: initialStatus,
+      creditsUsed: creditsToSet,
     });
     
     if (finalChatId) {
