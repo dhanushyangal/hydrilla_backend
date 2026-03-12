@@ -13,7 +13,12 @@ export const config = {
     secretKey: process.env.CLERK_SECRET_KEY || "",
   },
   hunyuanApi: {
-    url: process.env.HUNYUAN_API_URL || "https://api.hydrilla.ai",
+    /** Primary gateway (text-to-image, edit, combined, text-to-3d, image-to-3d, status, queue, cancel) */
+    url: (process.env.HUNYUAN_API_URL || "https://api.hydrilla.ai").replace(/\/$/, ""),
+    /** Alternative gateway when primary is down (same endpoints; try after primary fails) */
+    urlAlternative: process.env.HUNYUAN_API_URL_ALTERNATIVE
+      ? process.env.HUNYUAN_API_URL_ALTERNATIVE.replace(/\/$/, "")
+      : "https://api.hydrilla.co",
   },
   s3: {
     bucket: process.env.S3_BUCKET || "hunyuan3d-outputs",

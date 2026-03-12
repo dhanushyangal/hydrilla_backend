@@ -105,14 +105,49 @@ const upload = multer({
   },
 });
 
-const API_BASE = process.env.HUNYUAN_API_URL || "https://api.hydrilla.ai";
+/** Primary and alternative gateway base URLs (no trailing slash) */
+const GATEWAY_PRIMARY = config.hunyuanApi.url;
+const GATEWAY_ALTERNATIVE = config.hunyuanApi.urlAlternative || GATEWAY_PRIMARY;
 
-/** Resolve relative image URL from gateway to full URL */
-function resolveGatewayImageUrl(url: string | undefined | null): string | null {
+/** Resolve relative image URL from gateway to full URL (uses provided baseUrl or primary) */
+function resolveGatewayImageUrl(url: string | undefined | null, baseUrl?: string): string | null {
   if (!url || typeof url !== "string") return null;
   if (url.startsWith("http://") || url.startsWith("https://")) return url;
-  const base = API_BASE.endsWith("/") ? API_BASE.slice(0, -1) : API_BASE;
+  const base = (baseUrl || GATEWAY_PRIMARY).replace(/\/$/, "");
   return url.startsWith("/") ? `${base}${url}` : `${base}/${url}`;
+}
+
+/**
+ * Fetch from gateway with primary + alternative fallback.
+ * Tries primary first; on network error or 5xx, tries alternative. Returns response and baseUrl used.
+ */
+async function fetchGateway(path: string, init: RequestInit): Promise<{ response: Response; baseUrl: string }> {
+  const pathStr = path.startsWith("/") ? path : `/${path}`;
+  const urls = GATEWAY_ALTERNATIVE !== GATEWAY_PRIMARY ? [GATEWAY_PRIMARY, GATEWAY_ALTERNATIVE] : [GATEWAY_PRIMARY];
+  let lastErr: unknown = null;
+  for (const baseUrl of urls) {
+    const url = `${baseUrl}${pathStr}`;
+    try {
+      const response = await fetch(url, init);
+      if (response.ok || response.status < 500) {
+        return { response, baseUrl };
+      }
+      lastErr = new Error(`Gateway returned ${response.status}`);
+      if (response.status >= 500 && baseUrl === GATEWAY_PRIMARY) {
+        logger.warn({ status: response.status, url }, "Primary gateway error, trying alternative");
+        continue;
+      }
+      return { response, baseUrl };
+    } catch (err) {
+      lastErr = err;
+      if (baseUrl === GATEWAY_PRIMARY) {
+        logger.warn({ err: (err as Error)?.message, url }, "Primary gateway failed, trying alternative");
+        continue;
+      }
+      throw lastErr;
+    }
+  }
+  throw lastErr || new Error("Gateway request failed");
 }
 
 // Credits per operation (charged when user runs the operation)
@@ -179,7 +214,7 @@ threeDRouter.post("/generate", requireAuth, async (req, res) => {
       formData.append("prompt", body.prompt);
       formData.append("user_id", userId);  // Pass user_id to Python API
 
-      const response = await fetch(`${API_BASE}/text-to-3d`, {
+      const { response } = await fetchGateway("/text-to-3d", {
         method: "POST",
         headers: { "Content-Type": "application/x-www-form-urlencoded" },
         body: formData.toString(),
@@ -208,7 +243,7 @@ threeDRouter.post("/generate", requireAuth, async (req, res) => {
       }
       formData.append("user_id", userId);  // Pass user_id to Python API
 
-      const response = await fetch(`${API_BASE}/image-to-3d`, {
+      const { response } = await fetchGateway("/image-to-3d", {
         method: "POST",
         headers: { "Content-Type": "application/x-www-form-urlencoded" },
         body: formData.toString(),
@@ -275,7 +310,7 @@ threeDRouter.post("/text-to-image", requireAuth, async (req, res) => {
     }
     const form = new URLSearchParams();
     form.append("prompt", promptStr);
-    const response = await fetch(`${API_BASE}/text-to-image`, {
+    const { response, baseUrl } = await fetchGateway("/text-to-image", {
       method: "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
       body: form.toString(),
@@ -292,7 +327,7 @@ threeDRouter.post("/text-to-image", requireAuth, async (req, res) => {
       try {
         const existing = await getJob(jobId);
         if (!existing) {
-          const previewUrl = resolveGatewayImageUrl(data.image_url ?? data.result?.image_url);
+          const previewUrl = resolveGatewayImageUrl(data.image_url ?? data.result?.image_url, baseUrl);
           await createJob({
             id: jobId,
             userId,
@@ -344,7 +379,7 @@ threeDRouter.post("/edit-image", requireAuth, upload.single("image"), async (req
     } else if (imageUrl) {
       form.append("image_url", imageUrl);
     }
-    const response = await fetch(`${API_BASE}/edit-image`, {
+    const { response, baseUrl } = await fetchGateway("/edit-image", {
       method: "POST",
       body: form as any,
     });
@@ -360,7 +395,7 @@ threeDRouter.post("/edit-image", requireAuth, upload.single("image"), async (req
       try {
         const existing = await getJob(jobId);
         if (!existing) {
-          const previewUrl = resolveGatewayImageUrl(data.image_url ?? data.result?.image_url);
+          const previewUrl = resolveGatewayImageUrl(data.image_url ?? data.result?.image_url, baseUrl);
           await createJob({
             id: jobId,
             userId,
@@ -410,7 +445,7 @@ threeDRouter.post("/combined-edit", requireAuth, upload.fields([{ name: "image_1
     form.append("prompt", prompt);
     form.append("image_1", new Blob([new Uint8Array(file1.buffer)], { type: file1.mimetype || "image/png" }), file1.originalname || "image1.png");
     form.append("image_2", new Blob([new Uint8Array(file2.buffer)], { type: file2.mimetype || "image/png" }), file2.originalname || "image2.png");
-    const response = await fetch(`${API_BASE}/combined-edit`, {
+    const { response, baseUrl } = await fetchGateway("/combined-edit", {
       method: "POST",
       body: form as any,
     });
@@ -426,7 +461,7 @@ threeDRouter.post("/combined-edit", requireAuth, upload.fields([{ name: "image_1
       try {
         const existing = await getJob(jobId);
         if (!existing) {
-          const previewUrl = resolveGatewayImageUrl(data.image_url ?? data.result?.image_url);
+          const previewUrl = resolveGatewayImageUrl(data.image_url ?? data.result?.image_url, baseUrl);
           await createJob({
             id: jobId,
             userId,
@@ -488,7 +523,7 @@ threeDRouter.get("/status/:jobId", optionalAuth, async (req, res) => {
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), 15000); // 15 second timeout
       
-      const response = await fetch(`${API_BASE}/status/${jobId}`, {
+      const { response } = await fetchGateway(`/status/${jobId}`, {
         signal: controller.signal,
       });
       
@@ -655,7 +690,7 @@ threeDRouter.post("/cancel/:jobId", optionalAuth, async (req, res) => {
       return res.status(403).json({ error: "You don't have permission to cancel this job" });
     }
 
-    const response = await fetch(`${API_BASE}/cancel/${jobId}`, { method: "POST" });
+    const { response } = await fetchGateway(`/cancel/${jobId}`, { method: "POST" });
     const data = await response.json().catch(() => ({}));
 
     if (!response.ok) {
@@ -691,7 +726,7 @@ threeDRouter.get("/result/:jobId", optionalAuth, async (req, res) => {
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), 10000); // 10 second timeout
       
-      const response = await fetch(`${API_BASE}/status/${jobId}`, {
+      const { response } = await fetchGateway(`/status/${jobId}`, {
         signal: controller.signal,
       });
       clearTimeout(timeoutId);
@@ -763,7 +798,7 @@ threeDRouter.get("/queue/info", async (_req, res) => {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), 1500);
 
-    const response = await fetch(`${API_BASE}/queue/info`, {
+    const { response } = await fetchGateway("/queue/info", {
       signal: controller.signal,
     });
 
