@@ -61,13 +61,14 @@ paymentsRouter.get("/test", (_req: Request, res: Response) => {
 // ============================================================================
 paymentsRouter.post("/create-checkout", optionalAuth, async (req: Request, res: Response) => {
   try {
-    const { plan, email } = req.body;
+    // Validate early so invalid requests fail fast (better TTFB for client)
+    const { plan, email } = req.body ?? {};
     const userId = (req as any).userId || null;
 
     if (!plan || !["creator", "studio"].includes(plan)) {
       return res.status(400).json({ error: "plan must be 'creator' or 'studio'" });
     }
-    if (!email || !email.includes("@")) {
+    if (!email || typeof email !== "string" || !email.includes("@")) {
       return res.status(400).json({ error: "Valid email is required" });
     }
 

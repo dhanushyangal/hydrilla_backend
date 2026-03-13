@@ -94,7 +94,8 @@ export async function getWorkspaceForUser(workspaceId: string, userId: string): 
 }
 
 /**
- * List all workspaces for a specific user, with first job preview image
+ * List all workspaces for a specific user, with first job preview image.
+ * Uses batched queries (2 extra queries total) instead of N+1 for better performance.
  */
 export async function listWorkspacesForUser(userId: string, limit = 50): Promise<(WorkspaceRecord & { firstJobPreviewImageUrl?: string | null; firstJobPrompt?: string | null; jobCount?: number })[]> {
   try {
@@ -114,54 +115,64 @@ export async function listWorkspacesForUser(userId: string, limit = 50): Promise
       }
       throw error;
     }
-    if (!data) return [];
+    if (!data || data.length === 0) return [];
 
-    // For each workspace, get preview info from first job
-    const workspacesWithPreview = await Promise.all(
-      data.map(async (ws) => {
-        const record = mapRow(ws);
+    const workspaceIds = data.map((ws) => ws.id);
 
-        // Get the first job for this workspace
-        const { data: firstJob, error: jobError } = await supabase
-          .from("jobs")
-          .select("preview_image_url, image_url, prompt")
-          .eq("workspace_id", ws.id)
-          .order("created_at", { ascending: true })
-          .limit(1)
-          .maybeSingle();
+    // Single batched query: all jobs in these workspaces, ordered by created_at (for "first job" per workspace)
+    const { data: jobsData, error: jobsError } = await supabase
+      .from("jobs")
+      .select("workspace_id, preview_image_url, image_url, prompt, created_at")
+      .in("workspace_id", workspaceIds)
+      .order("created_at", { ascending: true });
 
-        if (jobError && jobError.code !== "PGRST116") {
-          logger.warn({ err: jobError, workspaceId: ws.id }, "Error fetching first job for workspace");
+    if (jobsError) {
+      logger.warn({ err: jobsError }, "Error fetching jobs for workspaces batch");
+    }
+
+    // First job per workspace (already ordered by created_at asc)
+    const firstJobByWorkspace: Record<string, { preview_image_url?: string; image_url?: string; prompt?: string }> = {};
+    if (jobsData) {
+      for (const job of jobsData) {
+        const wid = job.workspace_id;
+        if (wid && !firstJobByWorkspace[wid]) {
+          firstJobByWorkspace[wid] = {
+            preview_image_url: job.preview_image_url,
+            image_url: job.image_url,
+            prompt: job.prompt,
+          };
         }
+      }
+    }
 
-        // Count total jobs in workspace
-        const { count, error: countError } = await supabase
-          .from("jobs")
-          .select("id", { count: "exact", head: true })
-          .eq("workspace_id", ws.id);
+    // Job counts per workspace (single query then group in memory)
+    const jobCountByWorkspace: Record<string, number> = {};
+    if (jobsData) {
+      for (const job of jobsData) {
+        const wid = job.workspace_id;
+        if (wid) jobCountByWorkspace[wid] = (jobCountByWorkspace[wid] || 0) + 1;
+      }
+    }
 
-        if (countError) {
-          logger.warn({ err: countError, workspaceId: ws.id }, "Error counting jobs for workspace");
+    const workspacesWithPreview = data.map((ws) => {
+      const record = mapRow(ws);
+      const firstJob = firstJobByWorkspace[ws.id];
+      let previewImageUrl = firstJob?.preview_image_url || firstJob?.image_url || null;
+      if (previewImageUrl) {
+        const jobIdMatch = previewImageUrl.match(/\/(preview|image|edit|combined)\/([^\/\?]+)/);
+        if (jobIdMatch && jobIdMatch[2]) {
+          previewImageUrl = normalizePreviewUrl(jobIdMatch[2], previewImageUrl);
+        } else if (previewImageUrl.includes("amazonaws.com")) {
+          previewImageUrl = previewImageUrl.split("?")[0];
         }
-
-        let previewImageUrl = firstJob?.preview_image_url || firstJob?.image_url || null;
-        if (previewImageUrl) {
-          const jobIdMatch = previewImageUrl.match(/\/(preview|image|edit|combined)\/([^\/\?]+)/);
-          if (jobIdMatch && jobIdMatch[2]) {
-            previewImageUrl = normalizePreviewUrl(jobIdMatch[2], previewImageUrl);
-          } else if (previewImageUrl.includes("amazonaws.com")) {
-            previewImageUrl = previewImageUrl.split("?")[0];
-          }
-        }
-
-        return {
-          ...record,
-          firstJobPreviewImageUrl: previewImageUrl,
-          firstJobPrompt: firstJob?.prompt || null,
-          jobCount: count || 0,
-        };
-      })
-    );
+      }
+      return {
+        ...record,
+        firstJobPreviewImageUrl: previewImageUrl,
+        firstJobPrompt: firstJob?.prompt || null,
+        jobCount: jobCountByWorkspace[ws.id] ?? 0,
+      };
+    });
 
     return workspacesWithPreview;
   } catch (err: any) {

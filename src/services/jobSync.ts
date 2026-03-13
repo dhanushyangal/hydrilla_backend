@@ -4,7 +4,8 @@ import { getJob, listJobs, updateJobStatus, updateJobResult } from "../repositor
 import { JobStatus } from "../types.js";
 import { normalizeGlbUrl, normalizePreviewUrl } from "../utils/s3Urls.js";
 
-const API_BASE = config.hunyuanApi.url;
+const GATEWAY_PRIMARY = config.hunyuanApi.url;
+const GATEWAY_ALTERNATIVE = config.hunyuanApi.urlAlternative || config.hunyuanApi.url;
 
 // Circuit breaker state to prevent continuous API calls when API is offline
 let circuitBreakerState = {
@@ -107,16 +108,45 @@ export async function syncJobFromApi(jobId: string): Promise<boolean> {
       return true; // Return true since job is already in correct state
     }
     
-    // Fetch from API with timeout (generous when gateway is busy processing another job)
+    // Fetch from API with timeout (generous when gateway is busy processing another job).
+    // Try primary gateway first, then alternative (same as threeD route).
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), 25000); // 25 second timeout
-    
-    let response: Response;
+
+    const path = `/status/${jobId}`;
+    const urls = GATEWAY_ALTERNATIVE !== GATEWAY_PRIMARY ? [GATEWAY_PRIMARY, GATEWAY_ALTERNATIVE] : [GATEWAY_PRIMARY];
+    let response: Response | null = null;
+    let lastErr: unknown = null;
+
     try {
-      response = await fetch(`${API_BASE}/status/${jobId}`, {
-        signal: controller.signal,
-      });
+      for (const baseUrl of urls) {
+        const url = `${baseUrl}${path}`;
+        try {
+          const res = await fetch(url, { signal: controller.signal });
+          if (res.ok || res.status === 404 || res.status < 500) {
+            response = res;
+            break;
+          }
+          lastErr = new Error(`API returned ${res.status}`);
+          if (res.status >= 500 && baseUrl === GATEWAY_PRIMARY) {
+            logger.debug({ jobId, status: res.status }, "Primary gateway error, trying alternative");
+            continue;
+          }
+          response = res;
+          break;
+        } catch (err) {
+          lastErr = err;
+          if (baseUrl === GATEWAY_PRIMARY) {
+            logger.debug({ jobId, err: (err as Error)?.message }, "Primary gateway failed, trying alternative");
+            continue;
+          }
+          throw err;
+        }
+      }
       clearTimeout(timeoutId);
+      if (!response) {
+        throw lastErr || new Error("Gateway request failed");
+      }
       
       if (!response.ok) {
         if (response.status === 404) {
@@ -145,7 +175,7 @@ export async function syncJobFromApi(jobId: string): Promise<boolean> {
         throw new Error(`API returned ${response.status}`);
       }
     } catch (fetchErr: any) {
-      clearTimeout(timeoutId);
+      try { clearTimeout(timeoutId); } catch (_) {}
       if (fetchErr.name === "AbortError") {
         logger.warn({ jobId }, "API request timeout");
         // Record API failure for circuit breaker
@@ -310,7 +340,12 @@ export async function syncAllJobs(): Promise<{ synced: number; failed: number }>
     }
 
     if (failed > 0) {
-      logger.info({ synced, failed }, "Job sync completed with failures");
+      // When all attempts failed (API likely unavailable), log at DEBUG to avoid spam
+      if (synced === 0) {
+        logger.debug({ synced, failed }, "Job sync skipped: API unavailable (all attempts failed)");
+      } else {
+        logger.info({ synced, failed }, "Job sync completed with failures");
+      }
     } else {
       logger.debug({ synced, failed }, "Job sync completed");
     }

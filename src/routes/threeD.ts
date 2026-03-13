@@ -2030,12 +2030,14 @@ threeDRouter.post("/notify-gpu-offline", optionalAuth, async (req, res) => {
 // ============================================
 
 /**
- * List all workspaces for the current user
+ * List all workspaces for the current user.
+ * Short cache (5s) reduces repeat requests when navigating back to /app/studio.
  */
 threeDRouter.get("/workspaces", requireAuth, async (req, res) => {
   try {
     const userId = req.userId!;
     const workspaces = await listWorkspacesForUser(userId);
+    res.setHeader("Cache-Control", "private, max-age=5, stale-while-revalidate=10");
     res.json({ workspaces });
   } catch (err: any) {
     if (err.code === "TABLE_NOT_FOUND" || err.message?.includes("does not exist")) {
