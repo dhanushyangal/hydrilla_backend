@@ -248,6 +248,110 @@ paymentsRouter.get("/credits", requireAuth, async (req: Request, res: Response) 
 });
 
 // ============================================================================
+// GET USAGE BREAKDOWN BY JOB TYPE
+// GET /api/payments/usage
+// Returns credits used per category (3D, image gen, edit, combined) from jobs table.
+// ============================================================================
+paymentsRouter.get("/usage", requireAuth, async (req: Request, res: Response) => {
+  try {
+    const userId = (req as any).userId;
+
+    const { data: jobs, error } = await supabase
+      .from("jobs")
+      .select("generate_type, credits_used, result_glb_url")
+      .eq("user_id", userId)
+      .gt("credits_used", 0);
+
+    if (error) {
+      logger.error({ error: error.message }, "Error fetching usage breakdown");
+      return res.status(500).json({ error: "Failed to load usage" });
+    }
+
+    type BreakdownItem = { type: string; label: string; credits: number; count: number };
+    const map: Record<string, BreakdownItem> = {
+      "3d": { type: "3d", label: "3D model generation", credits: 0, count: 0 },
+      image: { type: "image", label: "Image generation", credits: 0, count: 0 },
+      edit: { type: "edit", label: "Edit image", credits: 0, count: 0 },
+      combined: { type: "combined", label: "Combine images", credits: 0, count: 0 },
+    };
+
+    for (const j of jobs || []) {
+      const credits = Number(j.credits_used) || 0;
+      const gen = (j.generate_type || "Normal") as string;
+      const hasGlb = !!(j.result_glb_url && String(j.result_glb_url).trim());
+
+      if (gen === "EditImage") {
+        map.edit.credits += credits;
+        map.edit.count += 1;
+      } else if (gen === "Combined") {
+        map.combined.credits += credits;
+        map.combined.count += 1;
+      } else if (gen === "Normal" && hasGlb) {
+        map["3d"].credits += credits;
+        map["3d"].count += 1;
+      } else {
+        map.image.credits += credits;
+        map.image.count += 1;
+      }
+    }
+
+    const breakdown = Object.values(map)
+      .filter((b) => b.credits > 0)
+      .sort((a, b) => b.credits - a.credits);
+
+    res.json({ breakdown });
+  } catch (error: any) {
+    logger.error({ error: error?.message }, "Error fetching usage");
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// ============================================================================
+// GET USAGE HISTORY (per-job rows for table / CSV)
+// GET /api/payments/usage/history?limit=100
+// ============================================================================
+paymentsRouter.get("/usage/history", requireAuth, async (req: Request, res: Response) => {
+  try {
+    const userId = (req as any).userId;
+    const limit = Math.min(500, Math.max(1, parseInt(String(req.query.limit), 10) || 100));
+
+    const { data: jobs, error } = await supabase
+      .from("jobs")
+      .select("id, created_at, generate_type, credits_used, result_glb_url, status")
+      .eq("user_id", userId)
+      .gt("credits_used", 0)
+      .order("created_at", { ascending: false })
+      .limit(limit);
+
+    if (error) {
+      logger.error({ error: error.message }, "Error fetching usage history");
+      return res.status(500).json({ error: "Failed to load usage history" });
+    }
+
+    const rows = (jobs || []).map((j) => {
+      const gen = (j.generate_type || "Normal") as string;
+      const hasGlb = !!(j.result_glb_url && String(j.result_glb_url).trim());
+      let label = "Image generation";
+      if (gen === "EditImage") label = "Edit image";
+      else if (gen === "Combined") label = "Combine images";
+      else if (gen === "Normal" && hasGlb) label = "3D model";
+      return {
+        id: j.id,
+        date: j.created_at,
+        type: label,
+        credits: Number(j.credits_used) || 0,
+        status: j.status === "DONE" ? "Included" : j.status === "FAIL" ? "Failed" : "Included",
+      };
+    });
+
+    res.json({ usage: rows });
+  } catch (error: any) {
+    logger.error({ error: error?.message }, "Error fetching usage history");
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// ============================================================================
 // WEBHOOK ENDPOINT
 // POST /api/payments/webhook/dodo
 // Handles subscription lifecycle events from Dodo Payments
