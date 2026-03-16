@@ -150,6 +150,14 @@ async function fetchGateway(path: string, init: RequestInit): Promise<{ response
   throw lastErr || new Error("Gateway request failed");
 }
 
+/** Map gateway/network errors to a user-facing message when both APIs have failed. */
+function gatewayErrorToUserMessage(err: unknown): string {
+  const msg = err && typeof (err as any).message === "string" ? (err as any).message : "";
+  if (/fetch failed|timeout|ECONNREFUSED|ECONNRESET|network|Gateway request failed|Gateway returned 5/i.test(msg))
+    return "GPU is unavailable";
+  return msg || "GPU is unavailable";
+}
+
 // Credits per operation (charged when user runs the operation)
 const CREDITS_IMAGE_GEN = 2;      // text-to-image (preview)
 const CREDITS_IMAGE_EDIT = 3;     // edit-image
@@ -347,7 +355,7 @@ threeDRouter.post("/text-to-image", requireAuth, async (req, res) => {
     res.json(data);
   } catch (err: any) {
     logger.error({ err: err.message }, "text-to-image failed");
-    res.status(500).json({ error: err.message || "Failed to generate image" });
+    res.status(500).json({ error: gatewayErrorToUserMessage(err) });
   }
 });
 
@@ -415,7 +423,7 @@ threeDRouter.post("/edit-image", requireAuth, upload.single("image"), async (req
     res.json(data);
   } catch (err: any) {
     logger.error({ err: err.message }, "edit-image failed");
-    res.status(500).json({ error: err.message || "Failed to edit image" });
+    res.status(500).json({ error: gatewayErrorToUserMessage(err) });
   }
 });
 
@@ -481,7 +489,7 @@ threeDRouter.post("/combined-edit", requireAuth, upload.fields([{ name: "image_1
     res.json(data);
   } catch (err: any) {
     logger.error({ err: err.message }, "combined-edit failed");
-    res.status(500).json({ error: err.message || "Failed to combine images" });
+    res.status(500).json({ error: gatewayErrorToUserMessage(err) });
   }
 });
 
@@ -574,7 +582,7 @@ threeDRouter.get("/status/:jobId", optionalAuth, async (req, res) => {
       
       // If no job in DB and API is unreachable, return error
       return res.status(503).json({ 
-        error: "External service unavailable. Please try again later." 
+        error: "GPU is unavailable" 
       });
     }
 
@@ -672,7 +680,7 @@ threeDRouter.get("/status/:jobId", optionalAuth, async (req, res) => {
     res.json(response_data);
   } catch (err: any) {
     logger.error(err, "failed to query job");
-    res.status(500).json({ error: err.message || "Failed to query job" });
+    res.status(500).json({ error: gatewayErrorToUserMessage(err) });
   }
 });
 
@@ -701,7 +709,7 @@ threeDRouter.post("/cancel/:jobId", optionalAuth, async (req, res) => {
     res.json({ job_id: jobId, status: "cancelled", message: data.message || "Job cancelled" });
   } catch (err: any) {
     logger.error(err, "cancel job");
-    res.status(500).json({ error: err.message || "Failed to cancel job" });
+    res.status(500).json({ error: gatewayErrorToUserMessage(err) });
   }
 });
 
@@ -765,7 +773,7 @@ threeDRouter.get("/result/:jobId", optionalAuth, async (req, res) => {
 
     res.json({ job });
   } catch (err: any) {
-    res.status(500).json({ error: err.message || "Failed to fetch result" });
+    res.status(500).json({ error: gatewayErrorToUserMessage(err) });
   }
 });
 
