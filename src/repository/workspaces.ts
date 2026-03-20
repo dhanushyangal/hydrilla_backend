@@ -3,6 +3,15 @@ import { logger } from "../logger.js";
 import { WorkspaceRecord } from "../types.js";
 import { normalizePreviewUrl } from "../utils/s3Urls.js";
 
+// Soft-delete marker.
+// We keep the workspace row so jobs.workspace_id does NOT become NULL (DB uses ON DELETE SET NULL),
+// which would otherwise affect credits calculations.
+const DELETED_WORKSPACE_NAME_PREFIX = "__DELETED_WORKSPACE__:";
+
+function isSoftDeletedWorkspaceName(name: unknown): boolean {
+  return typeof name === "string" && name.startsWith(DELETED_WORKSPACE_NAME_PREFIX);
+}
+
 /**
  * Create a new workspace
  */
@@ -62,6 +71,7 @@ export async function getWorkspace(workspaceId: string): Promise<WorkspaceRecord
       throw error;
     }
     if (!data) return null;
+    if (isSoftDeletedWorkspaceName((data as any).name)) return null;
     return mapRow(data);
   } catch (err: any) {
     logger.error(err, "Failed to get workspace from database");
@@ -86,6 +96,7 @@ export async function getWorkspaceForUser(workspaceId: string, userId: string): 
       throw error;
     }
     if (!data) return null;
+    if (isSoftDeletedWorkspaceName((data as any).name)) return null;
     return mapRow(data);
   } catch (err: any) {
     logger.error(err, "Failed to get workspace for user");
@@ -117,7 +128,11 @@ export async function listWorkspacesForUser(userId: string, limit = 50): Promise
     }
     if (!data || data.length === 0) return [];
 
-    const workspaceIds = data.map((ws) => ws.id);
+    // Hide soft-deleted workspaces (so "deleted workspace" doesn't reappear in My Library).
+    const activeWorkspaces = data.filter((ws) => !isSoftDeletedWorkspaceName((ws as any).name));
+    if (activeWorkspaces.length === 0) return [];
+
+    const workspaceIds = activeWorkspaces.map((ws) => ws.id);
 
     // Single batched query: all jobs in these workspaces, ordered by created_at (for "first job" per workspace)
     const { data: jobsData, error: jobsError } = await supabase
@@ -154,7 +169,7 @@ export async function listWorkspacesForUser(userId: string, limit = 50): Promise
       }
     }
 
-    const workspacesWithPreview = data.map((ws) => {
+    const workspacesWithPreview = activeWorkspaces.map((ws) => {
       const record = mapRow(ws);
       const firstJob = firstJobByWorkspace[ws.id];
       let previewImageUrl = firstJob?.preview_image_url || firstJob?.image_url || null;
@@ -209,6 +224,18 @@ export async function listJobsForWorkspace(workspaceId: string, userId: string, 
  */
 export async function updateWorkspaceName(workspaceId: string, name: string, userId: string): Promise<void> {
   try {
+    // Prevent updates to soft-deleted workspaces (otherwise they could be "resurrected").
+    const { data: current } = await supabase
+      .from("workspaces")
+      .select("name")
+      .eq("id", workspaceId)
+      .eq("user_id", userId)
+      .maybeSingle();
+
+    if (current && isSoftDeletedWorkspaceName((current as any).name)) {
+      throw new Error("Workspace is deleted");
+    }
+
     const { error } = await supabase
       .from("workspaces")
       .update({
@@ -244,13 +271,19 @@ export async function updateWorkspaceUpdatedAt(workspaceId: string): Promise<voi
 
 /**
  * Delete a workspace (only if it belongs to the user)
- * Jobs in this workspace will have workspace_id set to NULL (ON DELETE SET NULL)
+ * Soft-deletes (renames) instead of deleting to avoid ON DELETE SET NULL on jobs.workspace_id,
+ * which can otherwise cause credits to appear restored.
  */
 export async function deleteWorkspace(workspaceId: string, userId: string): Promise<boolean> {
   try {
+    // Soft-delete to avoid ON DELETE SET NULL on jobs.workspace_id.
+    // Real deletion would detach jobs from the workspace and can lead to credits appearing restored.
     const { error } = await supabase
       .from("workspaces")
-      .delete()
+      .update({
+        name: `${DELETED_WORKSPACE_NAME_PREFIX}${workspaceId}`,
+        updated_at: new Date().toISOString(),
+      })
       .eq("id", workspaceId)
       .eq("user_id", userId);
 
