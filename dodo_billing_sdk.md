@@ -11,6 +11,7 @@ description: Complete guide to the Billing SDK CLI for project setup and compone
 
 import { Callout } from 'fumadocs-ui/components/callout'
 import { Tab, Tabs } from 'fumadocs-ui/components/tabs'
+
 import { Cards, Card } from 'fumadocs-ui/components/card'
 
 The Billing SDK CLI is a powerful command-line tool that helps you initialize new billing projects, add components, and manage your billing infrastructure with ease.
