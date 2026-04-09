@@ -150,6 +150,105 @@ async function fetchGateway(path: string, init: RequestInit): Promise<{ response
   throw lastErr || new Error("Gateway request failed");
 }
 
+/** Hosts the remote GPU worker cannot reach (it would try localhost on its own machine). */
+function isHostnameUnreachableFromExternalGateway(hostname: string): boolean {
+  const h = hostname.toLowerCase();
+  if (h === "localhost" || h === "127.0.0.1" || h === "::1" || h === "0.0.0.0") return true;
+  if (/^10\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(h)) return true;
+  if (/^192\.168\.\d{1,3}\.\d{1,3}$/.test(h)) return true;
+  if (/^172\.(1[6-9]|2\d|3[0-1])\.\d{1,3}\.\d{1,3}$/.test(h)) return true;
+  return false;
+}
+
+function isImageUrlUnreachableByRemoteWorker(imageUrl: string): boolean {
+  try {
+    const u = new URL(imageUrl);
+    return isHostnameUnreachableFromExternalGateway(u.hostname);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Load image bytes for URLs that only this backend can read (e.g. disk under /uploads/ or loopback).
+ * Used so we can POST multipart image_file to the gateway instead of image_url.
+ */
+async function loadImageBytesForLocalBackendUrl(imageUrl: string): Promise<{ buffer: Buffer; contentType: string; filename: string }> {
+  let pathname: string;
+  try {
+    pathname = new URL(imageUrl).pathname;
+  } catch {
+    throw new Error("Invalid image URL");
+  }
+  const uploadsMatch = pathname.match(/\/uploads\/([^/]+)$/);
+  if (uploadsMatch) {
+    const filename = uploadsMatch[1];
+    const filePath = path.join(process.cwd(), "uploads", filename);
+    if (fs.existsSync(filePath)) {
+      const buffer = fs.readFileSync(filePath);
+      const ext = path.extname(filename).toLowerCase();
+      const contentType =
+        ext === ".png"
+          ? "image/png"
+          : ext === ".jpg" || ext === ".jpeg"
+            ? "image/jpeg"
+            : ext === ".webp"
+              ? "image/webp"
+              : ext === ".gif"
+                ? "image/gif"
+                : "application/octet-stream";
+      return { buffer, contentType, filename };
+    }
+  }
+  const res = await fetch(imageUrl);
+  if (!res.ok) {
+    throw new Error(`Could not download image (${res.status})`);
+  }
+  const buffer = Buffer.from(await res.arrayBuffer());
+  const contentType = res.headers.get("content-type") || "image/jpeg";
+  const basename = path.basename(pathname) || "image.jpg";
+  return { buffer, contentType, filename: basename };
+}
+
+/**
+ * image-to-3d with file body (fresh FormData per gateway attempt — body is not reusable across retries).
+ */
+async function fetchGatewayImageTo3DMultipart(
+  image: { buffer: Buffer; contentType: string; filename: string },
+  userId: string
+): Promise<{ response: Response; baseUrl: string }> {
+  const pathStr = "/image-to-3d";
+  const urls = GATEWAY_ALTERNATIVE !== GATEWAY_PRIMARY ? [GATEWAY_PRIMARY, GATEWAY_ALTERNATIVE] : [GATEWAY_PRIMARY];
+  let lastErr: unknown = null;
+  for (const baseUrl of urls) {
+    const formData = new FormData();
+    const blob = new Blob([new Uint8Array(image.buffer)], { type: image.contentType });
+    formData.append("image_file", blob, image.filename);
+    formData.append("user_id", userId);
+    const url = `${baseUrl.replace(/\/$/, "")}${pathStr}`;
+    try {
+      const response = await fetch(url, { method: "POST", body: formData });
+      if (response.ok || response.status < 500) {
+        return { response, baseUrl };
+      }
+      lastErr = new Error(`Gateway returned ${response.status}`);
+      if (response.status >= 500 && baseUrl === GATEWAY_PRIMARY) {
+        logger.warn({ status: response.status, url }, "Primary gateway error, trying alternative");
+        continue;
+      }
+      return { response, baseUrl };
+    } catch (err) {
+      lastErr = err;
+      if (baseUrl === GATEWAY_PRIMARY) {
+        logger.warn({ err: (err as Error)?.message, url }, "Primary gateway failed, trying alternative");
+        continue;
+      }
+      throw lastErr;
+    }
+  }
+  throw lastErr || new Error("Gateway request failed");
+}
+
 /** Map gateway/network errors to a user-facing message when both APIs have failed. */
 function gatewayErrorToUserMessage(err: unknown): string {
   const msg = err && typeof (err as any).message === "string" ? (err as any).message : "";
@@ -209,14 +308,13 @@ threeDRouter.post("/generate", requireAuth, async (req, res) => {
     await syncUserToDatabase(userId);
 
     const { deductCredit } = await import("../services/credits.js");
-    const deductResult = await deductCredit(userId, CREDITS_IMAGE_TO_3D, true);
-    if (!deductResult.ok) {
-      return res.status(402).json({ error: deductResult.error });
-    }
-
     let jobId: string;
 
     if (body.prompt) {
+      const deductResult = await deductCredit(userId, CREDITS_IMAGE_TO_3D, true);
+      if (!deductResult.ok) {
+        return res.status(402).json({ error: deductResult.error });
+      }
       // Text-to-3D
       const formData = new URLSearchParams();
       formData.append("prompt", body.prompt);
@@ -242,34 +340,57 @@ threeDRouter.post("/generate", requireAuth, async (req, res) => {
       const data = await response.json();
       jobId = data.job_id;
     } else if (body.imageUrl || body.imageBase64) {
-      // Image-to-3D
-      const formData = new URLSearchParams();
-      if (body.imageUrl) {
-        formData.append("image_url", body.imageUrl);
-      } else if (body.imageBase64) {
+      if (body.imageBase64) {
         return res.status(400).json({ error: "Please provide imageUrl instead of imageBase64" });
       }
-      formData.append("user_id", userId);  // Pass user_id to Python API
+      const imageUrl = body.imageUrl!;
 
-      const { response } = await fetchGateway("/image-to-3d", {
-        method: "POST",
-        headers: { "Content-Type": "application/x-www-form-urlencoded" },
-        body: formData.toString(),
-      });
-
-      if (!response.ok) {
-        let errorText: string;
+      // Remote GPU cannot fetch localhost/private URLs — load bytes here and POST multipart (same as api.hydrilla.co file upload).
+      let multipartForImage: { buffer: Buffer; contentType: string; filename: string } | null = null;
+      if (isImageUrlUnreachableByRemoteWorker(imageUrl)) {
         try {
-          const errorData = await response.json();
-          errorText = errorData.error || "Failed to submit image-to-3d job";
-        } catch {
-          errorText = await response.text() || "Failed to submit image-to-3d job";
+          multipartForImage = await loadImageBytesForLocalBackendUrl(imageUrl);
+        } catch (e: any) {
+          return res.status(400).json({ error: e?.message || "Could not load image for 3D generation" });
         }
-        throw new Error(errorText);
       }
 
-      const data = await response.json();
-      jobId = data.job_id;
+      const deductResult = await deductCredit(userId, CREDITS_IMAGE_TO_3D, true);
+      if (!deductResult.ok) {
+        return res.status(402).json({ error: deductResult.error });
+      }
+
+      const parseImageTo3dError = async (response: Response): Promise<string> => {
+        try {
+          const errorData = await response.json();
+          return errorData.error || "Failed to submit image-to-3d job";
+        } catch {
+          return (await response.text()) || "Failed to submit image-to-3d job";
+        }
+      };
+
+      if (multipartForImage) {
+        const { response } = await fetchGatewayImageTo3DMultipart(multipartForImage, userId);
+        if (!response.ok) {
+          throw new Error(await parseImageTo3dError(response));
+        }
+        const data = await response.json();
+        jobId = data.job_id;
+      } else {
+        const formData = new URLSearchParams();
+        formData.append("image_url", imageUrl);
+        formData.append("user_id", userId);
+        const { response } = await fetchGateway("/image-to-3d", {
+          method: "POST",
+          headers: { "Content-Type": "application/x-www-form-urlencoded" },
+          body: formData.toString(),
+        });
+        if (!response.ok) {
+          throw new Error(await parseImageTo3dError(response));
+        }
+        const data = await response.json();
+        jobId = data.job_id;
+      }
     } else {
       return res.status(400).json({ error: "Either prompt or imageUrl is required" });
     }
