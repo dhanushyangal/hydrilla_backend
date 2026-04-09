@@ -90,3 +90,13 @@ if (!config.dodoPayment.studioProductId) {
 if (!config.dodoPayment.returnUrl) {
   console.warn("[config] DODO_PAYMENTS_RETURN_URL is missing. Payment redirects will not work correctly.");
 }
+
+const onVercel = process.env.VERCEL === "1" || !!process.env.VERCEL_ENV;
+if (
+  onVercel &&
+  (!process.env.AWS_ACCESS_KEY_ID || !process.env.AWS_SECRET_ACCESS_KEY)
+) {
+  console.warn(
+    "[config] Vercel: AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY missing — image uploads will fail until set (with S3_BUCKET, S3_REGION)."
+  );
+}

@@ -3,7 +3,7 @@ import multer from "multer";
 import path from "path";
 import fs from "fs";
 import { Readable } from "stream";
-import { S3Client, PutObjectCommand, GetObjectCommand } from "@aws-sdk/client-s3";
+import { S3Client, PutObjectCommand, GetObjectCommand, type PutObjectCommandInput } from "@aws-sdk/client-s3";
 import { logger } from "../logger.js";
 import { config } from "../config.js";
 import { supabase } from "../db.js";
@@ -263,25 +263,41 @@ const CREDITS_IMAGE_EDIT = 3;     // edit-image
 const CREDITS_COMBINED = 4;       // 2-image combined edit
 const CREDITS_IMAGE_TO_3D = 10;   // image-to-3d / text-to-3d
 
-// Initialize S3 client
+// Initialize S3 client (Vercel/serverless has no writable disk — uploads must use S3 with valid AWS creds)
 let s3Client: S3Client | null = null;
 let s3Enabled = false;
 
 try {
-  const hasExplicitCredentials = !!(process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY);
+  const hasAwsCreds = !!(process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY);
   s3Client = new S3Client({
     region: config.s3.region,
   });
-  s3Enabled = true;
-  logger.info({
-    bucket: config.s3.bucket,
-    region: config.s3.region,
-    hasExplicitCredentials,
-  }, "S3 client initialized");
+  // On Vercel, do not attempt S3 without keys (PutObject would fail anyway)
+  s3Enabled = hasAwsCreds || !isVercel;
+  if (!s3Enabled) {
+    s3Client = null;
+    if (isVercel) {
+      logger.warn("S3 disabled on Vercel: set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY for image uploads.");
+    }
+  } else {
+    logger.info(
+      { bucket: config.s3.bucket, region: config.s3.region, hasAwsCreds },
+      "S3 client initialized"
+    );
+  }
 } catch (err: any) {
   logger.warn({ err }, "Failed to initialize S3 client. S3 uploads disabled.");
   s3Enabled = false;
   s3Client = null;
+}
+
+/** Public URL for an uploaded object (virtual-hosted style, or override via S3_PUBLIC_BASE_URL). */
+function publicUrlForS3Key(key: string): string {
+  const base = process.env.S3_PUBLIC_BASE_URL?.replace(/\/$/, "");
+  if (base) {
+    return `${base}/${key}`;
+  }
+  return `https://${config.s3.bucket}.s3.${config.s3.region}.amazonaws.com/${key}`;
 }
 
 // Helper functions for status conversion
@@ -1955,17 +1971,21 @@ threeDRouter.post("/upload-image", optionalAuth, upload.single("image"), async (
         const contentType = req.file.mimetype || `image/${fileExtension.slice(1)}`;
         const s3Key = `uploads/${Date.now()}-${Math.round(Math.random() * 1e9)}${fileExtension}`;
 
-        await s3Client.send(
-          new PutObjectCommand({
-            Bucket: config.s3.bucket,
-            Key: s3Key,
-            Body: fileBuffer,
-            ContentType: contentType,
-            ACL: "public-read",
-          })
-        );
+        // Omit ACL by default: many buckets use "Bucket owner enforced" and reject ACLs (PutObject fails with AccessControlListNotSupported).
+        // Use a bucket policy for s3:GetObject on uploads/* so the GPU can fetch the URL. Set S3_PUT_ACL=public-read only if the bucket allows ACLs.
+        const putInput: PutObjectCommandInput = {
+          Bucket: config.s3.bucket,
+          Key: s3Key,
+          Body: fileBuffer,
+          ContentType: contentType,
+        };
+        const acl = process.env.S3_PUT_ACL?.trim();
+        if (acl === "public-read" || acl === "private") {
+          putInput.ACL = acl;
+        }
+        await s3Client.send(new PutObjectCommand(putInput));
 
-        imageUrl = `https://${config.s3.bucket}.s3.${config.s3.region}.amazonaws.com/${s3Key}`;
+        imageUrl = publicUrlForS3Key(s3Key);
         
         // Clean up local file if it exists (disk storage)
         if (req.file.path && fs.existsSync(req.file.path)) {
@@ -1978,10 +1998,17 @@ threeDRouter.post("/upload-image", optionalAuth, upload.single("image"), async (
         
         logger.info({ s3Key, url: imageUrl }, "Image uploaded to S3");
       } catch (s3Err: any) {
-        logger.error({ err: s3Err }, "S3 upload failed");
+        const code = s3Err?.Code || s3Err?.name;
+        logger.error({ err: s3Err, code }, "S3 upload failed");
         // In serverless, we can't serve local files, so S3 is required
         if (isVercel) {
-          return res.status(500).json({ error: "S3 upload failed. S3 is required in serverless environment." });
+          const hint =
+            code === "AccessControlListNotSupported"
+              ? " Bucket has ACLs disabled — do not set S3_PUT_ACL; add a bucket policy for GetObject on uploads/*."
+              : " Add AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, S3_BUCKET, S3_REGION on Vercel; IAM user needs s3:PutObject.";
+          return res.status(500).json({
+            error: `S3 upload failed.${hint}`,
+          });
         }
         const baseUrl = process.env.BACKEND_URL || `${req.protocol}://${req.get("host")}`;
         imageUrl = `${baseUrl}/uploads/${req.file.filename}`;
@@ -1989,7 +2016,10 @@ threeDRouter.post("/upload-image", optionalAuth, upload.single("image"), async (
     } else {
       // In serverless/Vercel, we need S3 for file storage
       if (isVercel) {
-        return res.status(500).json({ error: "S3 storage is required in serverless environment. Please configure S3." });
+        return res.status(500).json({
+          error:
+            "S3 is required on Vercel. Set AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, S3_BUCKET, and S3_REGION on the backend project.",
+        });
       }
       const baseUrl = process.env.BACKEND_URL || `${req.protocol}://${req.get("host")}`;
       imageUrl = `${baseUrl}/uploads/${req.file.filename}`;
