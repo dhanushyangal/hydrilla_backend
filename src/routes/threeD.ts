@@ -317,7 +317,15 @@ function convertStatus(apiStatus: string): "WAIT" | "RUN" | "FAIL" | "DONE" {
 // ============================================
 threeDRouter.post("/generate", requireAuth, async (req, res) => {
   try {
-    const body = req.body as { prompt?: string; imageUrl?: string; imageBase64?: string };
+    const body = req.body as {
+      prompt?: string;
+      imageUrl?: string;
+      imageBase64?: string;
+      chatId?: string;
+      workspaceId?: string;
+      parentJobId?: string;
+      parentJobIds?: string[];
+    };
     const userId = req.userId!;
 
     // Sync user to database on first request
@@ -415,13 +423,23 @@ threeDRouter.post("/generate", requireAuth, async (req, res) => {
     const sourceImages = body.imageUrl && (body.imageUrl.startsWith("http://") || body.imageUrl.startsWith("https://"))
       ? [body.imageUrl]
       : null;
+    const detectedGenerateType: GenerateType = body.prompt ? "TextTo3D" : "ImageTo3D";
+    const finalParentJobId = body.parentJobId || (body.parentJobIds && body.parentJobIds.length > 0 ? body.parentJobIds[0] : null);
+    const finalParentJobIds = body.parentJobIds && body.parentJobIds.length > 0
+      ? body.parentJobIds
+      : (finalParentJobId ? [finalParentJobId] : []);
+
     await createJob({
       id: jobId,
       userId,
+      chatId: body.chatId || null,
+      workspaceId: body.workspaceId || null,
+      parentJobId: finalParentJobId,
+      parentJobIds: finalParentJobIds,
       prompt: body.prompt || null,
       imageUrl: body.imageUrl || null,
       sourceImages,
-      generateType: "Normal",
+      generateType: detectedGenerateType,
       faceCount: null,
       enablePBR: true,
       polygonType: null,
@@ -447,7 +465,13 @@ threeDRouter.post("/text-to-image", requireAuth, async (req, res) => {
     if (!deductResult.ok) {
       return res.status(402).json({ error: deductResult.error });
     }
-    const body = req.body as { prompt?: string };
+    const body = req.body as {
+      prompt?: string;
+      chatId?: string;
+      workspaceId?: string;
+      parentJobId?: string;
+      parentJobIds?: string[];
+    };
     const prompt = body?.prompt ?? (req as any).body;
     const promptStr = typeof prompt === "string" ? prompt : "";
     if (!promptStr.trim()) {
@@ -476,8 +500,14 @@ threeDRouter.post("/text-to-image", requireAuth, async (req, res) => {
           await createJob({
             id: jobId,
             userId,
+            chatId: body.chatId || null,
+            workspaceId: body.workspaceId || null,
+            parentJobId: body.parentJobId || (body.parentJobIds?.[0] ?? null),
+            parentJobIds: body.parentJobIds && body.parentJobIds.length > 0
+              ? body.parentJobIds
+              : (body.parentJobId ? [body.parentJobId] : []),
             prompt: promptStr.trim() || null,
-            generateType: "Normal",
+            generateType: "TextToImage",
             status: previewUrl ? "DONE" : "WAIT",
             creditsUsed: CREDITS_IMAGE_GEN,
           });
@@ -510,6 +540,25 @@ threeDRouter.post("/edit-image", requireAuth, upload.single("image"), async (req
     }
     const prompt = (req.body as any)?.prompt ?? "";
     const imageUrl = (req.body as any)?.image_url as string | undefined;
+    const chatId = ((req.body as any)?.chatId as string | undefined) ?? null;
+    const workspaceId = ((req.body as any)?.workspaceId as string | undefined) ?? null;
+    const parentJobId = ((req.body as any)?.parentJobId as string | undefined) ?? null;
+    const parentJobIdsRaw = ((req.body as any)?.parentJobIds as string | undefined) ?? null;
+    const sourceImagesRaw = ((req.body as any)?.sourceImages as string | undefined) ?? null;
+    let parentJobIds: string[] = [];
+    let sourceImages: string[] | null = null;
+    if (parentJobIdsRaw) {
+      try {
+        const parsed = JSON.parse(parentJobIdsRaw);
+        if (Array.isArray(parsed)) parentJobIds = parsed.filter((x) => typeof x === "string");
+      } catch { /* ignore */ }
+    }
+    if (sourceImagesRaw) {
+      try {
+        const parsed = JSON.parse(sourceImagesRaw);
+        if (Array.isArray(parsed)) sourceImages = parsed.filter((x) => typeof x === "string");
+      } catch { /* ignore */ }
+    }
     const file = req.file;
     if (!prompt.trim()) {
       return res.status(400).json({ error: "prompt is required" });
@@ -544,7 +593,13 @@ threeDRouter.post("/edit-image", requireAuth, upload.single("image"), async (req
           await createJob({
             id: jobId,
             userId,
+            chatId,
+            workspaceId,
+            parentJobId: parentJobId || (parentJobIds[0] ?? null),
+            parentJobIds: parentJobIds.length > 0 ? parentJobIds : (parentJobId ? [parentJobId] : []),
             prompt: prompt.trim() || null,
+            imageUrl: imageUrl || null,
+            sourceImages,
             generateType: "EditImage",
             status: previewUrl ? "DONE" : "WAIT",
             creditsUsed: CREDITS_IMAGE_EDIT,
@@ -577,6 +632,25 @@ threeDRouter.post("/combined-edit", requireAuth, upload.fields([{ name: "image_1
       return res.status(402).json({ error: deductResult.error });
     }
     const prompt = (req.body as any)?.prompt ?? "";
+    const chatId = ((req.body as any)?.chatId as string | undefined) ?? null;
+    const workspaceId = ((req.body as any)?.workspaceId as string | undefined) ?? null;
+    const parentJobId = ((req.body as any)?.parentJobId as string | undefined) ?? null;
+    const parentJobIdsRaw = ((req.body as any)?.parentJobIds as string | undefined) ?? null;
+    const sourceImagesRaw = ((req.body as any)?.sourceImages as string | undefined) ?? null;
+    let parentJobIds: string[] = [];
+    let sourceImages: string[] | null = null;
+    if (parentJobIdsRaw) {
+      try {
+        const parsed = JSON.parse(parentJobIdsRaw);
+        if (Array.isArray(parsed)) parentJobIds = parsed.filter((x) => typeof x === "string");
+      } catch { /* ignore */ }
+    }
+    if (sourceImagesRaw) {
+      try {
+        const parsed = JSON.parse(sourceImagesRaw);
+        if (Array.isArray(parsed)) sourceImages = parsed.filter((x) => typeof x === "string");
+      } catch { /* ignore */ }
+    }
     const files = req.files as { image_1?: Express.Multer.File[]; image_2?: Express.Multer.File[] };
     const file1 = files?.image_1?.[0];
     const file2 = files?.image_2?.[0];
@@ -610,7 +684,12 @@ threeDRouter.post("/combined-edit", requireAuth, upload.fields([{ name: "image_1
           await createJob({
             id: jobId,
             userId,
+            chatId,
+            workspaceId,
+            parentJobId: parentJobId || (parentJobIds[0] ?? null),
+            parentJobIds: parentJobIds.length > 0 ? parentJobIds : (parentJobId ? [parentJobId] : []),
             prompt: prompt.trim() || null,
+            sourceImages,
             generateType: "Combined",
             status: previewUrl ? "DONE" : "WAIT",
             creditsUsed: CREDITS_COMBINED,
@@ -747,12 +826,14 @@ threeDRouter.get("/status/:jobId", optionalAuth, async (req, res) => {
     // Get or create job in database
     if (!job) {
       // Create job if it doesn't exist (for legacy support)
+      const legacyMode = String(apiJob?.result?.mode || apiJob?.mode || "").toLowerCase();
+      const inferredGenerateType: GenerateType = legacyMode.includes("text-to-3d") ? "TextTo3D" : "ImageTo3D";
       await createJob({
         id: jobId,
         userId: userId || null,
         prompt: apiJob.result?.prompt || null,
         imageUrl: null,
-        generateType: "Normal",
+        generateType: inferredGenerateType,
         faceCount: null,
         enablePBR: true,
         polygonType: null,
@@ -1582,6 +1663,22 @@ threeDRouter.post("/register-job", optionalAuth, async (req, res) => {
       }
     }
 
+    // Validate and use provided generateType, fallback to explicit operation types
+    const validGenerateTypes: GenerateType[] = [
+      "Normal",
+      "LowPoly",
+      "Geometry",
+      "Sketch",
+      "TextToImage",
+      "TextTo3D",
+      "ImageTo3D",
+      "EditImage",
+      "Combined",
+    ];
+    const finalGenerateType: GenerateType = (reqGenerateType && validGenerateTypes.includes(reqGenerateType as GenerateType))
+      ? (reqGenerateType as GenerateType)
+      : (previewImageUrl ? "TextToImage" : "ImageTo3D");
+
     const existingJob = await getJob(job_id);
     if (existingJob) {
       // Check ownership - don't allow updating jobs owned by other users
@@ -1654,6 +1751,18 @@ threeDRouter.post("/register-job", optionalAuth, async (req, res) => {
           await supabase.from("jobs").update({ source_images: JSON.stringify(resolvedSourceImages) }).eq("id", job_id);
         } catch (srcErr) {
           logger.warn({ err: srcErr }, "Failed to update source_images for existing job");
+        }
+      }
+
+      if (!existingJob.generateType || existingJob.generateType === "Normal") {
+        try {
+          await supabase
+            .from("jobs")
+            .update({ generate_type: finalGenerateType, updated_at: new Date().toISOString() })
+            .eq("id", job_id);
+          logger.info({ jobId: job_id, generateType: finalGenerateType }, "Updated existing job generate_type");
+        } catch (typeErr) {
+          logger.warn({ err: typeErr, jobId: job_id }, "Failed to update generate_type for existing job");
         }
       }
 
@@ -1730,12 +1839,6 @@ threeDRouter.post("/register-job", optionalAuth, async (req, res) => {
     // If previewImageUrl is provided, this is a preview-only job (image already generated)
     // Set status to DONE since the preview is complete
     const initialStatus: JobStatus = previewImageUrl ? "DONE" : "WAIT";
-    
-    // Validate and use provided generateType, fallback to "Normal"
-    const validGenerateTypes: GenerateType[] = ["Normal", "LowPoly", "Geometry", "Sketch", "EditImage", "Combined"];
-    const finalGenerateType: GenerateType = (reqGenerateType && validGenerateTypes.includes(reqGenerateType as GenerateType))
-      ? (reqGenerateType as GenerateType)
-      : "Normal";
     
     // Resolve parent: explicit parentJobId takes priority, then previewJobId (for 3D from image)
     const finalParentJobId = parentJobId || previewJobId || null;
@@ -1855,12 +1958,14 @@ threeDRouter.post("/webhook/job-update", async (req, res) => {
 
     let job = await getJob(job_id);
     if (!job) {
+      const webhookMode = String(result?.mode || "").toLowerCase();
+      const inferredGenerateType: GenerateType = webhookMode.includes("text-to-3d") ? "TextTo3D" : "ImageTo3D";
       await createJob({
         id: job_id,
         userId: user_id || null,
         prompt: result?.prompt || null,
         imageUrl: null,
-        generateType: "Normal",
+        generateType: inferredGenerateType,
         faceCount: null,
         enablePBR: true,
         polygonType: null,

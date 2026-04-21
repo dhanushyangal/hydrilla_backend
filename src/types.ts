@@ -1,6 +1,15 @@
 export type JobStatus = "WAIT" | "RUN" | "FAIL" | "DONE";
 
-export type GenerateType = "Normal" | "LowPoly" | "Geometry" | "Sketch" | "EditImage" | "Combined";
+export type GenerateType =
+  | "Normal"
+  | "LowPoly"
+  | "Geometry"
+  | "Sketch"
+  | "TextToImage"
+  | "TextTo3D"
+  | "ImageTo3D"
+  | "EditImage"
+  | "Combined";
 
 export type PolygonType = "triangle" | "quadrilateral";
 
