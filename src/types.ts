@@ -11,17 +11,13 @@ export type GenerateType =
   | "EditImage"
   | "Combined";
 
-export type PolygonType = "triangle" | "quadrilateral";
-
 export interface CreateJobInput {
   prompt?: string;
   imageUrl?: string;
   imageBase64?: string;
   multiViewImages?: Array<{ viewType: "left" | "right" | "back"; viewImageUrl: string }>;
   enablePBR?: boolean;
-  faceCount?: number;
   generateType?: GenerateType;
-  polygonType?: PolygonType;
 }
 
 export interface JobRecord {
@@ -36,14 +32,11 @@ export interface JobRecord {
   imageUrl: string | null;
   sourceImages: string[] | null; // Actual source image URLs used as input (e.g. 2 URLs for combined edit)
   generateType: GenerateType;
-  faceCount: number | null;
   enablePBR: boolean;
-  polygonType: PolygonType | null;
   resultGlbUrl: string | null;
   previewImageUrl: string | null;
   errorCode: string | null;
   errorMessage: string | null;
-  name: string | null;
   creditsUsed: number;  // Credits consumed for this job (e.g. 10 for 3D, 0 for preview)
   createdAt: Date;
   updatedAt: Date;

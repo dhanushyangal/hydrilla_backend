@@ -7,7 +7,7 @@ import { S3Client, PutObjectCommand, GetObjectCommand, type PutObjectCommandInpu
 import { logger } from "../logger.js";
 import { config } from "../config.js";
 import { supabase } from "../db.js";
-import { createJob, getJob, listJobs, listJobsForUser, updateJobResult, updateJobStatus, updateJobName, deleteJob, getJobForUser, getJobLineage, upsertJobParents, getJobParentIds } from "../repository/jobs.js";
+import { createJob, getJob, listJobs, listJobsForUser, updateJobResult, updateJobStatus, deleteJob, getJobForUser, getJobLineage, upsertJobParents, getJobParentIds } from "../repository/jobs.js";
 import { createChat, getChat, getChatForUser, listChatsForUser, updateChatName, updateChatUpdatedAt, deleteChat, getOrCreateActiveChat } from "../repository/chats.js";
 import { createWorkspace, getWorkspace, getWorkspaceForUser, listWorkspacesForUser, listJobsForWorkspace, updateWorkspaceName, updateWorkspaceUpdatedAt, deleteWorkspace } from "../repository/workspaces.js";
 import { optionalAuth, requireAuth, syncUserToDatabase } from "../middleware/auth.js";
@@ -440,9 +440,7 @@ threeDRouter.post("/generate", requireAuth, async (req, res) => {
       imageUrl: body.imageUrl || null,
       sourceImages,
       generateType: detectedGenerateType,
-      faceCount: null,
       enablePBR: true,
-      polygonType: null,
       creditsUsed: CREDITS_IMAGE_TO_3D,
     });
 
@@ -834,9 +832,7 @@ threeDRouter.get("/status/:jobId", optionalAuth, async (req, res) => {
         prompt: apiJob.result?.prompt || null,
         imageUrl: null,
         generateType: inferredGenerateType,
-        faceCount: null,
         enablePBR: true,
-        polygonType: null,
       });
       job = await getJob(jobId);
     }
@@ -1295,37 +1291,6 @@ threeDRouter.get("/history", optionalAuth, async (req, res) => {
 });
 
 // ============================================
-// Update Job Name (requires auth)
-// ============================================
-threeDRouter.patch("/jobs/:jobId/name", requireAuth, async (req, res) => {
-  const { jobId } = req.params;
-  const userId = req.userId!;
-  const { name } = req.body as { name?: string };
-
-  try {
-    if (!name || typeof name !== "string") {
-      return res.status(400).json({ error: "Name is required and must be a string" });
-    }
-
-    const job = await getJob(jobId);
-    if (!job) {
-      return res.status(404).json({ error: "Job not found" });
-    }
-
-    // Check ownership
-    if (job.userId && job.userId !== userId) {
-      return res.status(403).json({ error: "You don't have permission to update this job" });
-    }
-
-    await updateJobName(jobId, name.trim(), userId);
-    res.json({ success: true, message: "Job name updated" });
-  } catch (err: any) {
-    logger.error(err, "failed to update job name");
-    res.status(500).json({ error: err.message || "Failed to update job name" });
-  }
-});
-
-// ============================================
 // Delete a Job (requires auth)
 // ============================================
 threeDRouter.delete("/jobs/:jobId", requireAuth, async (req, res) => {
@@ -1475,14 +1440,11 @@ threeDRouter.get("/chats/:chatId", requireAuth, async (req, res) => {
         prompt: row.prompt,
         imageUrl: imageUrl,
         generateType: row.generate_type,
-        faceCount: row.face_count,
         enablePBR: row.enable_pbr,
-        polygonType: row.polygon_type,
         resultGlbUrl: resultGlbUrl,
         previewImageUrl: previewImageUrl,
         errorCode: row.error_code,
         errorMessage: row.error_message,
-        name: row.name || null,
         createdAt: row.created_at,
         updatedAt: row.updated_at,
       };
@@ -1600,10 +1562,9 @@ threeDRouter.post("/register-job", optionalAuth, async (req, res) => {
       }
     }
 
-    // If previewJobId is provided, fetch the preview job to copy name and prompt
+    // If previewJobId is provided, fetch the preview job to copy prompt
     let previewJob: JobRecord | null = null;
     let finalPrompt = prompt || null;
-    let finalName: string | null = null;
     
     logger.info({ jobId: job_id, previewJobId, hasPrompt: !!prompt, hasImageUrl: !!imageUrl }, "Register job request received");
     
@@ -1611,17 +1572,13 @@ threeDRouter.post("/register-job", optionalAuth, async (req, res) => {
       logger.info({ jobId: job_id, previewJobId }, "Preview job ID provided, fetching preview job");
       previewJob = await getJob(previewJobId);
       if (previewJob) {
-        logger.info({ jobId: job_id, previewJobId, previewJobPrompt: previewJob.prompt?.slice(0, 50), previewJobName: previewJob.name }, "Preview job found");
-        // Copy name and prompt from preview job (preview job prompt takes priority)
+        logger.info({ jobId: job_id, previewJobId, previewJobPrompt: previewJob.prompt?.slice(0, 50) }, "Preview job found");
+        // Copy prompt from preview job (preview job prompt takes priority)
         if (previewJob.prompt !== null && previewJob.prompt !== undefined) {
           finalPrompt = previewJob.prompt;
           logger.info({ jobId: job_id, previewJobId, prompt: finalPrompt?.slice(0, 50) }, "Copied prompt from preview job");
         } else {
           logger.warn({ jobId: job_id, previewJobId }, "Preview job has no prompt to copy");
-        }
-        if (previewJob.name !== null && previewJob.name !== undefined) {
-          finalName = previewJob.name;
-          logger.info({ jobId: job_id, previewJobId, name: finalName }, "Copied name from preview job");
         }
       } else {
         logger.warn({ jobId: job_id, previewJobId }, "Preview job not found");
@@ -1635,7 +1592,7 @@ threeDRouter.post("/register-job", optionalAuth, async (req, res) => {
         try {
           const { data: previewJobs, error: previewError } = await supabase
             .from("jobs")
-            .select("id, prompt, name")
+            .select("id, prompt")
             .eq("preview_image_url", imageUrl)
             .eq("user_id", userId)
             .is("result_glb_url", null) // Only preview jobs (no 3D result)
@@ -1645,12 +1602,9 @@ threeDRouter.post("/register-job", optionalAuth, async (req, res) => {
             const foundPreviewJob = previewJobs[0];
             logger.info({ jobId: job_id, foundPreviewJobId: foundPreviewJob.id, prompt: foundPreviewJob.prompt?.slice(0, 50) }, "Found preview job by matching imageUrl");
             
-            // Use the found preview job's prompt and name
+            // Use the found preview job's prompt
             if (foundPreviewJob.prompt !== null && foundPreviewJob.prompt !== undefined) {
               finalPrompt = foundPreviewJob.prompt;
-            }
-            if (foundPreviewJob.name !== null && foundPreviewJob.name !== undefined) {
-              finalName = foundPreviewJob.name;
             }
             // Set previewJobId for later use
             const foundPreviewJobId = foundPreviewJob.id;
@@ -1766,7 +1720,7 @@ threeDRouter.post("/register-job", optionalAuth, async (req, res) => {
         }
       }
 
-      // Update prompt and name from preview job if provided
+      // Update prompt from preview job if provided
       if (previewJob) {
         try {
           const updateData: any = { updated_at: new Date().toISOString() };
@@ -1781,11 +1735,6 @@ threeDRouter.post("/register-job", optionalAuth, async (req, res) => {
             logger.warn({ jobId: job_id, previewJobId, previewJobPrompt: previewJob.prompt }, "Preview job has no prompt to copy");
           }
           
-          if (finalName !== null && finalName !== undefined) {
-            updateData.name = finalName;
-            hasUpdates = true;
-          }
-          
           // Update the job if we have changes
           if (hasUpdates) {
             const { error: updateError } = await supabase
@@ -1797,15 +1746,15 @@ threeDRouter.post("/register-job", optionalAuth, async (req, res) => {
               throw updateError;
             }
             
-            logger.info({ jobId: job_id, name: finalName, prompt: finalPrompt?.slice(0, 50) }, "Successfully updated existing job with preview job name/prompt");
+            logger.info({ jobId: job_id, prompt: finalPrompt?.slice(0, 50) }, "Successfully updated existing job with preview job prompt");
           } else {
             logger.warn({ jobId: job_id, previewJobId }, "No updates to apply from preview job");
           }
         } catch (updateErr: any) {
-          logger.error({ err: updateErr, jobId: job_id, previewJobId, finalPrompt: finalPrompt?.slice(0, 50) }, "Failed to update job with preview job name/prompt");
+          logger.error({ err: updateErr, jobId: job_id, previewJobId, finalPrompt: finalPrompt?.slice(0, 50) }, "Failed to update job with preview job prompt");
         }
       } else if (previewJobId) {
-        logger.warn({ jobId: job_id, previewJobId }, "Preview job not found, cannot copy prompt/name");
+        logger.warn({ jobId: job_id, previewJobId }, "Preview job not found, cannot copy prompt");
       }
       
       // Update preview image if provided
@@ -1876,9 +1825,7 @@ threeDRouter.post("/register-job", optionalAuth, async (req, res) => {
       imageUrl: imageUrl || null,
       sourceImages: resolvedSourceImages,
       generateType: finalGenerateType,
-      faceCount: null,
       enablePBR: true,
-      polygonType: null,
       status: initialStatus,
       creditsUsed: creditsToSet,
     });
@@ -1891,17 +1838,12 @@ threeDRouter.post("/register-job", optionalAuth, async (req, res) => {
       await updateWorkspaceUpdatedAt(workspaceId);
     }
     
-    // Update name if we got it from preview job
-    if (finalName) {
-      await updateJobName(job_id, finalName, userId || undefined);
-    }
-    
     // Update preview image if provided
     if (previewImageUrl) {
       await updateJobResult(job_id, { previewImageUrl });
     }
 
-    logger.info({ jobId: job_id, userId, prompt: finalPrompt?.slice(0, 50), name: finalName }, "Job registered successfully");
+    logger.info({ jobId: job_id, userId, prompt: finalPrompt?.slice(0, 50) }, "Job registered successfully");
     res.json({ success: true, job_id });
   } catch (err: any) {
     logger.error(err, "failed to register job");
@@ -1966,9 +1908,7 @@ threeDRouter.post("/webhook/job-update", async (req, res) => {
         prompt: result?.prompt || null,
         imageUrl: null,
         generateType: inferredGenerateType,
-        faceCount: null,
         enablePBR: true,
-        polygonType: null,
       });
       job = await getJob(job_id);
     }
@@ -2033,7 +1973,7 @@ threeDRouter.post("/webhook/job-update", async (req, res) => {
             sendCompletionEmailForJob(
               job_id,
               job.userId,
-              job.name || null,
+              job.prompt || null,
               glbUrl,
               previewUrl
             ).catch((err) => {
@@ -2389,14 +2329,11 @@ threeDRouter.get("/workspaces/:workspaceId/jobs", requireAuth, async (req, res) 
         prompt: row.prompt,
         imageUrl: imageUrl,
         generateType: row.generate_type,
-        faceCount: row.face_count,
         enablePBR: row.enable_pbr,
-        polygonType: row.polygon_type,
         resultGlbUrl: resultGlbUrl,
         previewImageUrl: previewImageUrl,
         errorCode: row.error_code,
         errorMessage: row.error_message,
-        name: row.name || null,
         createdAt: row.created_at,
         updatedAt: row.updated_at,
       };

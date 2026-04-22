@@ -243,7 +243,7 @@ export async function syncJobFromApi(jobId: string): Promise<boolean> {
               sendCompletionEmailForJob(
                 jobId,
                 dbJob.userId,
-                dbJob.name || null,
+                dbJob.prompt || null,
                 glbUrl,
                 previewUrl
               ).catch((err) => {

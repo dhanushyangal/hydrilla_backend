@@ -1,5 +1,5 @@
 import { supabase } from "../db.js";
-import { GenerateType, JobRecord, JobStatus, PolygonType } from "../types.js";
+import { GenerateType, JobRecord, JobStatus } from "../types.js";
 import { logger } from "../logger.js";
 import { normalizeGlbUrl, normalizePreviewUrl } from "../utils/s3Urls.js";
 
@@ -14,9 +14,7 @@ export async function createJob(params: {
   imageUrl?: string | null;
   sourceImages?: string[] | null; // Actual source image URLs used as input
   generateType: GenerateType;
-  faceCount?: number | null;
   enablePBR?: boolean;
-  polygonType?: PolygonType | null;
   status?: JobStatus;  // Optional initial status (defaults to "WAIT")
   creditsUsed?: number;  // Credits consumed for this job (default 0)
 }) {
@@ -31,9 +29,7 @@ export async function createJob(params: {
     imageUrl = null,
     sourceImages = null,
     generateType,
-    faceCount = null,
     enablePBR = true,
-    polygonType = null,
     status = "WAIT",
     creditsUsed = 0,
   } = params;
@@ -55,9 +51,7 @@ export async function createJob(params: {
       image_url: imageUrl,
       source_images: sourceImages && sourceImages.length > 0 ? JSON.stringify(sourceImages) : null,
       generate_type: generateType,
-      face_count: faceCount,
       enable_pbr: enablePBR,
-      polygon_type: polygonType,
       credits_used: creditsUsed,
     });
 
@@ -147,32 +141,6 @@ export async function updateJobResult(jobId: string, data: { resultGlbUrl?: stri
     if (error) throw error;
   } catch (err: any) {
     logger.error(err, "Failed to update job result");
-    throw new Error(`Database error: ${err.message}`);
-  }
-}
-
-export async function updateJobName(jobId: string, name: string, userId?: string | null): Promise<void> {
-  try {
-    const updateData: any = {
-      name,
-      updated_at: new Date().toISOString(),
-    };
-
-    // If userId is provided, ensure the job belongs to the user
-    const query = supabase
-      .from("jobs")
-      .update(updateData)
-      .eq("id", jobId);
-
-    if (userId) {
-      query.eq("user_id", userId);
-    }
-
-    const { error } = await query;
-
-    if (error) throw error;
-  } catch (err: any) {
-    logger.error(err, "Failed to update job name");
     throw new Error(`Database error: ${err.message}`);
   }
 }
@@ -334,14 +302,11 @@ function mapRow(row: any): JobRecord {
     imageUrl: imageUrl,
     sourceImages,
     generateType: row.generate_type,
-    faceCount: row.face_count,
     enablePBR: row.enable_pbr,
-    polygonType: row.polygon_type,
     resultGlbUrl: resultGlbUrl,
     previewImageUrl: previewImageUrl,
     errorCode: row.error_code,
     errorMessage: row.error_message,
-    name: row.name || null,
     creditsUsed: row.credits_used != null ? row.credits_used : 0,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
