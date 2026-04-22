@@ -5,15 +5,16 @@ Comprehensive guide for the Hydrilla Node.js/Express backend server. This docume
 ## Table of Contents
 
 1. [Overview](#overview)
-2. [Tech Stack](#tech-stack)
-3. [Project Structure](#project-structure)
-4. [Getting Started](#getting-started)
-5. [Environment Variables](#environment-variables)
-6. [API Endpoints](#api-endpoints)
-7. [Payment Integration (Dodo Payments)](#payment-integration-dodo-payments)
-8. [Database Schema](#database-schema)
-9. [Deployment](#deployment)
-10. [Troubleshooting](#troubleshooting)
+2. 
+3. [Tech Stack](#tech-stack)
+4. [Project Structure](#project-structure)
+5. [Getting Started](#getting-started)
+6. [Environment Variables](#environment-variables)
+7. [API Endpoints](#api-endpoints)
+8. [Payment Integration (Dodo Payments)](#payment-integration-dodo-payments)
+9. [Database Schema](#database-schema)
+10. [Deployment](#deployment)
+11. [Troubleshooting](#troubleshooting)
 
 ---
 
