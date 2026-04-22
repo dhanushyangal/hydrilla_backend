@@ -21,6 +21,7 @@ Comprehensive guide for the Hydrilla Node.js/Express backend server. This docume
 
 ## Overview
 
+
 The Hydrilla backend serves as the middleware between the frontend and the Python GPU server. It manages:
 
 - **User Authentication** via Clerk
