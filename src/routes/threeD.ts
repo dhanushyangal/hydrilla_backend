@@ -96,14 +96,44 @@ const upload = multer({
     fileSize: 10 * 1024 * 1024,
   },
   fileFilter: (_req: any, file: any, cb: any) => {
-    const allowedMimes = ["image/jpeg", "image/jpg", "image/png", "image/webp", "image/gif"];
-    if (allowedMimes.includes(file.mimetype)) {
+    // Accept any image/* mimetype, or generic/empty mimetypes when filename has an image extension.
+    // Browsers / S3 sometimes report "application/octet-stream" or empty type for canvas blobs and
+    // S3 objects uploaded without ContentType — those are still valid images.
+    const allowedExt = [".jpg", ".jpeg", ".png", ".webp", ".gif"];
+    const mimetype = (file.mimetype || "").toLowerCase();
+    const originalName = (file.originalname || "").toLowerCase();
+    const ext = path.extname(originalName);
+    const isImageMime = mimetype.startsWith("image/");
+    const isGenericMime = mimetype === "" || mimetype === "application/octet-stream" || mimetype === "binary/octet-stream";
+    const hasImageExt = allowedExt.includes(ext);
+    if (isImageMime || (isGenericMime && hasImageExt)) {
       cb(null, true);
     } else {
-      cb(new Error("Invalid file type. Only images are allowed."));
+      cb(new Error(`Invalid file type. Only images are allowed. (received mimetype="${file.mimetype}", filename="${file.originalname}")`));
     }
   },
 });
+
+/**
+ * Read uploaded file bytes regardless of multer storage backend.
+ * - With memory storage (Vercel): file.buffer is set.
+ * - With disk storage (local dev): file.path is set, file.buffer is undefined.
+ *
+ * Repacking via `new Uint8Array(file.buffer)` when the buffer is undefined
+ * produces an empty Uint8Array, which silently uploads a 0-byte file —
+ * causing downstream errors like FLUX's "cannot identify image file".
+ */
+function readMulterFile(file: Express.Multer.File): Buffer {
+  if (file.buffer && file.buffer.length > 0) return file.buffer;
+  if (file.path) return fs.readFileSync(file.path);
+  throw new Error("Uploaded file has neither buffer nor path");
+}
+
+/** Build a Blob from a multer file that works with both memory and disk storage. */
+function multerFileToBlob(file: Express.Multer.File, fallbackMime = "image/png"): Blob {
+  const buf = readMulterFile(file);
+  return new Blob([new Uint8Array(buf)], { type: file.mimetype || fallbackMime });
+}
 
 /** Primary and alternative gateway base URLs (no trailing slash) */
 const GATEWAY_PRIMARY = config.hunyuanApi.url;
@@ -566,8 +596,8 @@ threeDRouter.post("/edit-image", requireAuth, upload.single("image"), async (req
     }
     const form = new FormData();
     form.append("prompt", prompt);
-    if (file?.buffer) {
-      form.append("image", new Blob([new Uint8Array(file.buffer)], { type: file.mimetype || "image/png" }), file.originalname || "image.png");
+    if (file) {
+      form.append("image", multerFileToBlob(file), file.originalname || "image.png");
     } else if (imageUrl) {
       form.append("image_url", imageUrl);
     }
@@ -660,8 +690,8 @@ threeDRouter.post("/combined-edit", requireAuth, upload.fields([{ name: "image_1
     }
     const form = new FormData();
     form.append("prompt", prompt);
-    form.append("image_1", new Blob([new Uint8Array(file1.buffer)], { type: file1.mimetype || "image/png" }), file1.originalname || "image1.png");
-    form.append("image_2", new Blob([new Uint8Array(file2.buffer)], { type: file2.mimetype || "image/png" }), file2.originalname || "image2.png");
+    form.append("image_1", multerFileToBlob(file1), file1.originalname || "image1.png");
+    form.append("image_2", multerFileToBlob(file2), file2.originalname || "image2.png");
     const { response, baseUrl } = await fetchGateway("/combined-edit", {
       method: "POST",
       body: form as any,
