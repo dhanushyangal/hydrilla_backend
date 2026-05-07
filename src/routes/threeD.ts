@@ -1089,6 +1089,55 @@ threeDRouter.get("/queue/info", async (_req, res) => {
 });
 
 // ============================================
+// Health check
+// Aggregates the gateway /health endpoint, which itself probes FLUX,
+// Trellis, the worker heartbeat, Redis, and queue depth. The frontend
+// (or anyone else) can hit `GET /api/3d/health` to know whether the GPU
+// pipeline is actually ready instead of guessing from a failed job.
+// ============================================
+threeDRouter.get("/health", async (_req, res) => {
+  const offlineResponse = {
+    status: "down",
+    gateway: "unreachable",
+    redis: "unknown",
+    flux: { reachable: false, model_loaded: false },
+    trellis: { reachable: false, model_loaded: false },
+    worker: { alive: false },
+    queues: { "3d": 0, preview: 0, edit: 0, combined: 0 },
+  };
+  try {
+    // Don't let a slow/dead gateway hang the backend response.
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 5000);
+
+    const { response } = await fetchGateway("/health", {
+      signal: controller.signal,
+    });
+    clearTimeout(timeoutId);
+
+    let body: any = null;
+    try {
+      body = await response.json();
+    } catch {
+      body = null;
+    }
+    if (!body) {
+      return res.status(200).json({ ...offlineResponse, error: "Gateway returned no JSON" });
+    }
+    // Mirror the gateway's HTTP status when we can.
+    const code = response.status === 503 ? 503 : 200;
+    return res.status(code).json(body);
+  } catch (err: any) {
+    const isAbort = err?.name === "AbortError";
+    logger.warn({ err: err?.message, isAbort }, "Health check failed");
+    return res.status(200).json({
+      ...offlineResponse,
+      error: isAbort ? "Gateway timed out" : err?.message || "Gateway unreachable",
+    });
+  }
+});
+
+// ============================================
 // Proxy GLB file from S3 (to avoid CORS issues)
 // ============================================
 threeDRouter.get("/glb/:jobId", optionalAuth, async (req, res) => {
