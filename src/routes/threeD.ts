@@ -241,6 +241,57 @@ async function loadImageBytesForLocalBackendUrl(imageUrl: string): Promise<{ buf
 }
 
 /**
+ * Load image bytes directly from our S3 bucket URL (works even when the bucket/object is private),
+ * so image-to-3d can proceed without requiring public read on uploads/*.
+ */
+async function loadImageBytesFromOwnedS3Url(
+  imageUrl: string
+): Promise<{ buffer: Buffer; contentType: string; filename: string } | null> {
+  if (!s3Enabled || !s3Client || !config.s3.bucket) return null;
+  if (!imageUrl.includes(config.s3.bucket)) return null;
+  try {
+    const u = new URL(imageUrl);
+    // Supports both:
+    // - https://<bucket>.s3.<region>.amazonaws.com/<key>
+    // - https://s3.<region>.amazonaws.com/<bucket>/<key>
+    let key = "";
+    const host = u.hostname.toLowerCase();
+    const pathNoSlash = u.pathname.replace(/^\/+/, "");
+    if (host.startsWith(`${config.s3.bucket.toLowerCase()}.s3.`)) {
+      key = pathNoSlash;
+    } else if (pathNoSlash.startsWith(`${config.s3.bucket}/`)) {
+      key = pathNoSlash.slice(config.s3.bucket.length + 1);
+    } else {
+      const marker = `${config.s3.bucket}/`;
+      const idx = imageUrl.indexOf(marker);
+      if (idx >= 0) key = imageUrl.slice(idx + marker.length).split("?")[0];
+    }
+    key = decodeURIComponent((key || "").split("?")[0]);
+    if (!key) return null;
+    const out = await s3Client.send(
+      new GetObjectCommand({
+        Bucket: config.s3.bucket,
+        Key: key,
+      })
+    );
+    if (!out.Body) throw new Error("S3 object body missing");
+    const stream = out.Body as Readable;
+    const chunks: Buffer[] = [];
+    for await (const chunk of stream) {
+      chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as any));
+    }
+    const buffer = Buffer.concat(chunks);
+    const filename = path.basename(key) || "image.jpg";
+    const contentType = out.ContentType || "image/jpeg";
+    if (!buffer.length) throw new Error("S3 object was empty");
+    return { buffer, contentType, filename };
+  } catch (err: any) {
+    logger.warn({ err: err?.message, imageUrl }, "Failed to fetch owned S3 image directly");
+    return null;
+  }
+}
+
+/**
  * image-to-3d with file body (fresh FormData per gateway attempt — body is not reusable across retries).
  */
 async function fetchGatewayImageTo3DMultipart(
@@ -408,6 +459,8 @@ threeDRouter.post("/generate", requireAuth, async (req, res) => {
 
       // Remote GPU cannot fetch localhost/private URLs — load bytes here and POST multipart (same as api.hydrilla.co file upload).
       let multipartForImage: { buffer: Buffer; contentType: string; filename: string } | null = null;
+      // If this is our bucket URL (possibly private uploads/*), read via IAM and send multipart.
+      multipartForImage = await loadImageBytesFromOwnedS3Url(imageUrl);
       if (isImageUrlUnreachableByRemoteWorker(imageUrl)) {
         try {
           multipartForImage = await loadImageBytesForLocalBackendUrl(imageUrl);
