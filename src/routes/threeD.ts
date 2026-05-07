@@ -398,6 +398,13 @@ threeDRouter.post("/generate", requireAuth, async (req, res) => {
         return res.status(400).json({ error: "Please provide imageUrl instead of imageBase64" });
       }
       const imageUrl = body.imageUrl!;
+      const trimmedUrl = (imageUrl || "").trim();
+      if (/^(blob:|data:)/i.test(trimmedUrl)) {
+        return res.status(400).json({
+          error:
+            "That image link only exists in your browser. Re-upload the file or choose the image from your library, then try Generate 3D again.",
+        });
+      }
 
       // Remote GPU cannot fetch localhost/private URLs — load bytes here and POST multipart (same as api.hydrilla.co file upload).
       let multipartForImage: { buffer: Buffer; contentType: string; filename: string } | null = null;
