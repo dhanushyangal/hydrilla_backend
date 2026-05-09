@@ -21,7 +21,7 @@ export const config = {
       : "https://api.hydrilla.co",
   },
   s3: {
-    bucket: process.env.S3_BUCKET || "hunyuan3d-outputs",
+    bucket: process.env.S3_BUCKET || "hydrilla-outputs-1",
     region: process.env.S3_REGION || "us-east-1",
     presignedUrlExpiry: parseInt(process.env.S3_PRESIGNED_URL_EXPIRY || "3600", 10),
   },
