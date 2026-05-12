@@ -138,6 +138,10 @@ function multerFileToBlob(file: Express.Multer.File, fallbackMime = "image/png")
 /** Primary and alternative gateway base URLs (no trailing slash) */
 const GATEWAY_PRIMARY = config.hunyuanApi.url;
 const GATEWAY_ALTERNATIVE = config.hunyuanApi.urlAlternative || GATEWAY_PRIMARY;
+const LEGACY_S3_BUCKETS = (process.env.LEGACY_S3_BUCKETS || "hydrilla-outputs")
+  .split(",")
+  .map((bucket) => bucket.trim().toLowerCase())
+  .filter(Boolean);
 
 /** Resolve relative image URL from gateway to full URL (uses provided baseUrl or primary) */
 function resolveGatewayImageUrl(url: string | undefined | null, baseUrl?: string): string | null {
@@ -199,8 +203,13 @@ function isImageUrlUnreachableByRemoteWorker(imageUrl: string): boolean {
   }
 }
 
+function isKnownS3Bucket(bucket: string): boolean {
+  const normalized = bucket.toLowerCase();
+  return normalized === config.s3.bucket.toLowerCase() || LEGACY_S3_BUCKETS.includes(normalized);
+}
+
 function extractOwnedS3KeyFromUrl(fileUrl: string): string | null {
-  if (!config.s3.bucket || !fileUrl.includes(config.s3.bucket)) return null;
+  if (!config.s3.bucket) return null;
   try {
     const u = new URL(fileUrl);
     const host = u.hostname.toLowerCase();
@@ -210,20 +219,35 @@ function extractOwnedS3KeyFromUrl(fileUrl: string): string | null {
     // Supports virtual-hosted and path-style S3 URLs:
     // - https://<bucket>.s3.<region>.amazonaws.com/<key>
     // - https://s3.<region>.amazonaws.com/<bucket>/<key>
-    if (host.startsWith(`${bucket}.s3.`)) {
+    const virtualHostedBucket = host.split(".s3.")[0];
+    if (host.includes(".s3.") && isKnownS3Bucket(virtualHostedBucket)) {
       return decodeURIComponent(pathNoSlash.split("?")[0]);
     }
-    if (pathNoSlash.startsWith(`${config.s3.bucket}/`)) {
-      return decodeURIComponent(pathNoSlash.slice(config.s3.bucket.length + 1).split("?")[0]);
+    const [pathBucket, ...keyParts] = pathNoSlash.split("/");
+    if (pathBucket && keyParts.length > 0 && isKnownS3Bucket(pathBucket)) {
+      return decodeURIComponent(keyParts.join("/").split("?")[0]);
     }
   } catch {
-    const marker = `${config.s3.bucket}/`;
-    const idx = fileUrl.indexOf(marker);
-    if (idx >= 0) {
-      return decodeURIComponent(fileUrl.slice(idx + marker.length).split("?")[0]);
+    for (const bucket of [config.s3.bucket, ...LEGACY_S3_BUCKETS]) {
+      const marker = `${bucket}/`;
+      const idx = fileUrl.indexOf(marker);
+      if (idx >= 0) {
+        return decodeURIComponent(fileUrl.slice(idx + marker.length).split("?")[0]);
+      }
     }
   }
   return null;
+}
+
+function contentTypeForImageKey(key: string, fallback?: string): string {
+  const ext = path.extname(key).toLowerCase();
+  if (ext === ".jpg" || ext === ".jpeg") return "image/jpeg";
+  if (ext === ".png") return "image/png";
+  if (ext === ".webp") return "image/webp";
+  if (ext === ".gif") return "image/gif";
+  return fallback && fallback !== "binary/octet-stream" && fallback !== "application/octet-stream"
+    ? fallback
+    : "image/png";
 }
 
 function getJobIdFromS3Key(key: string): string | null {
@@ -333,7 +357,6 @@ async function loadImageBytesFromOwnedS3Url(
   imageUrl: string
 ): Promise<{ buffer: Buffer; contentType: string; filename: string } | null> {
   if (!s3Enabled || !s3Client || !config.s3.bucket) return null;
-  if (!imageUrl.includes(config.s3.bucket)) return null;
   try {
     const key = extractOwnedS3KeyFromUrl(imageUrl);
     if (!key) return null;
@@ -351,7 +374,7 @@ async function loadImageBytesFromOwnedS3Url(
     }
     const buffer = Buffer.concat(chunks);
     const filename = path.basename(key) || "image.jpg";
-    const contentType = out.ContentType || "image/jpeg";
+    const contentType = contentTypeForImageKey(key, out.ContentType || "image/jpeg");
     if (!buffer.length) throw new Error("S3 object was empty");
     return { buffer, contentType, filename };
   } catch (err: any) {
@@ -1297,37 +1320,37 @@ threeDRouter.get("/glb/:jobId", optionalAuth, async (req, res) => {
       return res.status(404).json({ error: "GLB file not found for this job" });
     }
 
-    // If it's an S3 URL, try to fetch from S3 directly
-    if (glbUrl.includes(config.s3.bucket) && s3Enabled && s3Client) {
+    // If it's one of our current or legacy S3 URLs, fetch from the configured bucket.
+    // Old DB rows may still point at hydrilla-outputs/ap-south-1, but the object keys
+    // were migrated to the new bucket.
+    const glbS3Key = extractOwnedS3KeyFromUrl(glbUrl);
+    if (glbS3Key && s3Enabled && s3Client) {
       try {
-        const s3Key = extractOwnedS3KeyFromUrl(glbUrl);
-        if (s3Key) {
-          const { key: resolvedKey, out: s3Response } = await getFirstExistingS3Object(glbKeyCandidates(s3Key));
+        const { key: resolvedKey, out: s3Response } = await getFirstExistingS3Object(glbKeyCandidates(glbS3Key));
           
-          // Get content length for progress tracking
-          const contentLength = s3Response.ContentLength || s3Response.ContentLength || 0;
+        // Get content length for progress tracking
+        const contentLength = s3Response.ContentLength || s3Response.ContentLength || 0;
           
-          // Set CORS and cache headers (browser can cache GLB for 1 hour)
-          res.setHeader("Access-Control-Allow-Origin", "*");
-          res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
-          res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
-          res.setHeader("Content-Type", "model/gltf-binary");
-          res.setHeader("Content-Disposition", `inline; filename="mesh.glb"`);
-          res.setHeader("Cache-Control", "public, max-age=3600");
-          if (contentLength > 0) {
-            res.setHeader("Content-Length", contentLength.toString());
-          }
+        // Set CORS and cache headers (browser can cache GLB for 1 hour)
+        res.setHeader("Access-Control-Allow-Origin", "*");
+        res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
+        res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+        res.setHeader("Content-Type", "model/gltf-binary");
+        res.setHeader("Content-Disposition", `inline; filename="mesh.glb"`);
+        res.setHeader("Cache-Control", "public, max-age=3600");
+        if (contentLength > 0) {
+          res.setHeader("Content-Length", contentLength.toString());
+        }
           
-          // Pipe S3 stream directly to response (no buffering = faster first byte)
-          if (s3Response.Body) {
-            const stream = s3Response.Body as Readable;
-            stream.on("error", (err: Error) => {
-              logger.error({ jobId, s3Key: resolvedKey, err: err.message }, "Error streaming from S3");
-              if (!res.headersSent) res.status(500).json({ error: "Failed to stream GLB file" });
-            });
-            stream.pipe(res);
-            return;
-          }
+        // Pipe S3 stream directly to response (no buffering = faster first byte)
+        if (s3Response.Body) {
+          const stream = s3Response.Body as Readable;
+          stream.on("error", (err: Error) => {
+            logger.error({ jobId, s3Key: resolvedKey, err: err.message }, "Error streaming from S3");
+            if (!res.headersSent) res.status(500).json({ error: "Failed to stream GLB file" });
+          });
+          stream.pipe(res);
+          return;
         }
       } catch (s3Err: any) {
         logger.warn({ jobId, err: s3Err.message }, "Failed to fetch from S3, trying direct URL");
@@ -1386,28 +1409,26 @@ threeDRouter.get("/image-proxy", optionalAuth, async (req, res) => {
   }
 
   try {
-    // If it's an S3 URL, try to fetch from S3 directly
-    if (imageUrl.includes(config.s3.bucket) && s3Enabled && s3Client) {
+    // If it's one of our current or legacy S3 URLs, fetch from the configured bucket.
+    const imageS3Key = extractOwnedS3KeyFromUrl(imageUrl);
+    if (imageS3Key && s3Enabled && s3Client) {
       try {
-        const s3Key = extractOwnedS3KeyFromUrl(imageUrl);
-        if (s3Key) {
-          const { key: resolvedKey, out: s3Response } = await getFirstExistingS3Object(imageKeyCandidates(s3Key));
-          const contentLength = s3Response.ContentLength || 0;
+        const { key: resolvedKey, out: s3Response } = await getFirstExistingS3Object(imageKeyCandidates(imageS3Key));
+        const contentLength = s3Response.ContentLength || 0;
 
-          res.setHeader("Access-Control-Allow-Origin", "*");
-          res.setHeader("Content-Type", s3Response.ContentType || "image/png");
-          res.setHeader("Cache-Control", "public, max-age=3600");
-          if (contentLength > 0) res.setHeader("Content-Length", contentLength.toString());
+        res.setHeader("Access-Control-Allow-Origin", "*");
+        res.setHeader("Content-Type", contentTypeForImageKey(resolvedKey, s3Response.ContentType || undefined));
+        res.setHeader("Cache-Control", "public, max-age=3600");
+        if (contentLength > 0) res.setHeader("Content-Length", contentLength.toString());
 
-          if (s3Response.Body) {
-            const stream = s3Response.Body as Readable;
-            stream.on("error", (err: Error) => {
-              logger.error({ s3Key: resolvedKey, err: err.message }, "Error streaming image from S3");
-              if (!res.headersSent) res.status(500).json({ error: "Failed to stream image" });
-            });
-            stream.pipe(res);
-            return;
-          }
+        if (s3Response.Body) {
+          const stream = s3Response.Body as Readable;
+          stream.on("error", (err: Error) => {
+            logger.error({ s3Key: resolvedKey, err: err.message }, "Error streaming image from S3");
+            if (!res.headersSent) res.status(500).json({ error: "Failed to stream image" });
+          });
+          stream.pipe(res);
+          return;
         }
       } catch (s3Err: any) {
         logger.warn({ err: s3Err.message }, "Failed to fetch image from S3, trying direct URL");
