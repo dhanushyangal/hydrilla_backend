@@ -199,6 +199,91 @@ function isImageUrlUnreachableByRemoteWorker(imageUrl: string): boolean {
   }
 }
 
+function extractOwnedS3KeyFromUrl(fileUrl: string): string | null {
+  if (!config.s3.bucket || !fileUrl.includes(config.s3.bucket)) return null;
+  try {
+    const u = new URL(fileUrl);
+    const host = u.hostname.toLowerCase();
+    const bucket = config.s3.bucket.toLowerCase();
+    const pathNoSlash = u.pathname.replace(/^\/+/, "");
+
+    // Supports virtual-hosted and path-style S3 URLs:
+    // - https://<bucket>.s3.<region>.amazonaws.com/<key>
+    // - https://s3.<region>.amazonaws.com/<bucket>/<key>
+    if (host.startsWith(`${bucket}.s3.`)) {
+      return decodeURIComponent(pathNoSlash.split("?")[0]);
+    }
+    if (pathNoSlash.startsWith(`${config.s3.bucket}/`)) {
+      return decodeURIComponent(pathNoSlash.slice(config.s3.bucket.length + 1).split("?")[0]);
+    }
+  } catch {
+    const marker = `${config.s3.bucket}/`;
+    const idx = fileUrl.indexOf(marker);
+    if (idx >= 0) {
+      return decodeURIComponent(fileUrl.slice(idx + marker.length).split("?")[0]);
+    }
+  }
+  return null;
+}
+
+function getJobIdFromS3Key(key: string): string | null {
+  const [prefix, jobId] = key.split("/");
+  if (!jobId) return null;
+  return ["preview", "image", "text", "edit", "combined"].includes(prefix) ? jobId : null;
+}
+
+function uniqueKeys(keys: string[]): string[] {
+  return Array.from(new Set(keys.filter(Boolean)));
+}
+
+function imageKeyCandidates(key: string): string[] {
+  const jobId = getJobIdFromS3Key(key);
+  if (!jobId) return [key];
+  return uniqueKeys([
+    key,
+    `preview/${jobId}/preview_image.png`,
+    `image/${jobId}/processed_image.png`,
+    `text/${jobId}/processed_image.png`,
+    `text/${jobId}/generated_image.png`,
+    `edit/${jobId}/edited.png`,
+    `combined/${jobId}/combined.png`,
+  ]);
+}
+
+function glbKeyCandidates(key: string): string[] {
+  const jobId = getJobIdFromS3Key(key);
+  if (!jobId) return [key];
+  return uniqueKeys([
+    key,
+    `image/${jobId}/mesh.glb`,
+    `text/${jobId}/mesh.glb`,
+  ]);
+}
+
+async function getFirstExistingS3Object(keys: string[]) {
+  if (!s3Client) throw new Error("S3 client is not initialized");
+  let lastErr: any = null;
+  for (const key of keys) {
+    try {
+      const out = await s3Client.send(
+        new GetObjectCommand({
+          Bucket: config.s3.bucket,
+          Key: key,
+        })
+      );
+      return { key, out };
+    } catch (err: any) {
+      lastErr = err;
+      const code = err?.Code || err?.name || err?.$metadata?.httpStatusCode;
+      if (code === "NoSuchKey" || code === "NotFound" || code === 404) {
+        continue;
+      }
+      throw err;
+    }
+  }
+  throw lastErr || new Error("S3 object not found");
+}
+
 /**
  * Load image bytes for URLs that only this backend can read (e.g. disk under /uploads/ or loopback).
  * Used so we can POST multipart image_file to the gateway instead of image_url.
@@ -250,23 +335,7 @@ async function loadImageBytesFromOwnedS3Url(
   if (!s3Enabled || !s3Client || !config.s3.bucket) return null;
   if (!imageUrl.includes(config.s3.bucket)) return null;
   try {
-    const u = new URL(imageUrl);
-    // Supports both:
-    // - https://<bucket>.s3.<region>.amazonaws.com/<key>
-    // - https://s3.<region>.amazonaws.com/<bucket>/<key>
-    let key = "";
-    const host = u.hostname.toLowerCase();
-    const pathNoSlash = u.pathname.replace(/^\/+/, "");
-    if (host.startsWith(`${config.s3.bucket.toLowerCase()}.s3.`)) {
-      key = pathNoSlash;
-    } else if (pathNoSlash.startsWith(`${config.s3.bucket}/`)) {
-      key = pathNoSlash.slice(config.s3.bucket.length + 1);
-    } else {
-      const marker = `${config.s3.bucket}/`;
-      const idx = imageUrl.indexOf(marker);
-      if (idx >= 0) key = imageUrl.slice(idx + marker.length).split("?")[0];
-    }
-    key = decodeURIComponent((key || "").split("?")[0]);
+    const key = extractOwnedS3KeyFromUrl(imageUrl);
     if (!key) return null;
     const out = await s3Client.send(
       new GetObjectCommand({
@@ -673,11 +742,14 @@ threeDRouter.post("/edit-image", requireAuth, upload.single("image"), async (req
     }
     const data = await response.json();
     const jobId = data.edit_id ?? data.job_id;
+    const previewUrl = resolveGatewayImageUrl(data.image_url ?? data.result?.image_url, baseUrl);
+    if (previewUrl) {
+      data.image_url = previewUrl;
+    }
     if (jobId && userId) {
       try {
         const existing = await getJob(jobId);
         if (!existing) {
-          const previewUrl = resolveGatewayImageUrl(data.image_url ?? data.result?.image_url, baseUrl);
           await createJob({
             id: jobId,
             userId,
@@ -764,11 +836,14 @@ threeDRouter.post("/combined-edit", requireAuth, upload.fields([{ name: "image_1
     }
     const data = await response.json();
     const jobId = data.combined_id ?? data.job_id;
+    const previewUrl = resolveGatewayImageUrl(data.image_url ?? data.result?.image_url, baseUrl);
+    if (previewUrl) {
+      data.image_url = previewUrl;
+    }
     if (jobId && userId) {
       try {
         const existing = await getJob(jobId);
         if (!existing) {
-          const previewUrl = resolveGatewayImageUrl(data.image_url ?? data.result?.image_url, baseUrl);
           await createJob({
             id: jobId,
             userId,
@@ -1225,18 +1300,9 @@ threeDRouter.get("/glb/:jobId", optionalAuth, async (req, res) => {
     // If it's an S3 URL, try to fetch from S3 directly
     if (glbUrl.includes(config.s3.bucket) && s3Enabled && s3Client) {
       try {
-        // Extract S3 key from URL
-        const urlParts = glbUrl.split(`${config.s3.bucket}/`);
-        if (urlParts.length > 1) {
-          const s3Key = urlParts[1].split('?')[0]; // Remove query params
-          
-          // Fetch from S3
-          const command = new GetObjectCommand({
-            Bucket: config.s3.bucket,
-            Key: s3Key,
-          });
-          
-          const s3Response = await s3Client.send(command);
+        const s3Key = extractOwnedS3KeyFromUrl(glbUrl);
+        if (s3Key) {
+          const { key: resolvedKey, out: s3Response } = await getFirstExistingS3Object(glbKeyCandidates(s3Key));
           
           // Get content length for progress tracking
           const contentLength = s3Response.ContentLength || s3Response.ContentLength || 0;
@@ -1256,7 +1322,7 @@ threeDRouter.get("/glb/:jobId", optionalAuth, async (req, res) => {
           if (s3Response.Body) {
             const stream = s3Response.Body as Readable;
             stream.on("error", (err: Error) => {
-              logger.error({ jobId, err: err.message }, "Error streaming from S3");
+              logger.error({ jobId, s3Key: resolvedKey, err: err.message }, "Error streaming from S3");
               if (!res.headersSent) res.status(500).json({ error: "Failed to stream GLB file" });
             });
             stream.pipe(res);
@@ -1323,14 +1389,9 @@ threeDRouter.get("/image-proxy", optionalAuth, async (req, res) => {
     // If it's an S3 URL, try to fetch from S3 directly
     if (imageUrl.includes(config.s3.bucket) && s3Enabled && s3Client) {
       try {
-        const urlParts = imageUrl.split(`${config.s3.bucket}/`);
-        if (urlParts.length > 1) {
-          const s3Key = urlParts[1].split("?")[0];
-          const command = new GetObjectCommand({
-            Bucket: config.s3.bucket,
-            Key: s3Key,
-          });
-          const s3Response = await s3Client.send(command);
+        const s3Key = extractOwnedS3KeyFromUrl(imageUrl);
+        if (s3Key) {
+          const { key: resolvedKey, out: s3Response } = await getFirstExistingS3Object(imageKeyCandidates(s3Key));
           const contentLength = s3Response.ContentLength || 0;
 
           res.setHeader("Access-Control-Allow-Origin", "*");
@@ -1341,7 +1402,7 @@ threeDRouter.get("/image-proxy", optionalAuth, async (req, res) => {
           if (s3Response.Body) {
             const stream = s3Response.Body as Readable;
             stream.on("error", (err: Error) => {
-              logger.error({ err: err.message }, "Error streaming image from S3");
+              logger.error({ s3Key: resolvedKey, err: err.message }, "Error streaming image from S3");
               if (!res.headersSent) res.status(500).json({ error: "Failed to stream image" });
             });
             stream.pipe(res);
