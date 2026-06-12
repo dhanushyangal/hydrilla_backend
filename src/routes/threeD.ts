@@ -10,7 +10,8 @@ import { supabase } from "../db.js";
 import { createJob, getJob, listJobs, listJobsForUser, updateJobResult, updateJobStatus, deleteJob, getJobForUser, getJobLineage, upsertJobParents, getJobParentIds } from "../repository/jobs.js";
 import { createChat, getChat, getChatForUser, listChatsForUser, updateChatName, updateChatUpdatedAt, deleteChat, getOrCreateActiveChat } from "../repository/chats.js";
 import { createWorkspace, getWorkspace, getWorkspaceForUser, listWorkspacesForUser, listJobsForWorkspace, updateWorkspaceName, updateWorkspaceUpdatedAt, deleteWorkspace } from "../repository/workspaces.js";
-import { optionalAuth, requireAuth, syncUserToDatabase } from "../middleware/auth.js";
+import { optionalAuth, requireAuth, requireApprovedAccess, syncUserToDatabase } from "../middleware/auth.js";
+import { getUserIsApproved, isAdminEmail } from "../services/accessControl.js";
 import { normalizeGlbUrl, normalizePreviewUrl } from "../utils/s3Urls.js";
 import { JobStatus, JobRecord, ChatRecord, WorkspaceRecord, GenerateType } from "../types.js";
 
@@ -135,30 +136,66 @@ function multerFileToBlob(file: Express.Multer.File, fallbackMime = "image/png")
   return new Blob([new Uint8Array(buf)], { type: file.mimetype || fallbackMime });
 }
 
-/** Primary and alternative gateway base URLs (no trailing slash) */
+/** Dual GPU gateways (no trailing slash) */
+const FLUX_GATEWAY = config.fluxGateway.url;
+const FLUX_GATEWAY_ALT = config.fluxGateway.urlAlternative || FLUX_GATEWAY;
+const TRELLIS_GATEWAY = config.trellisGateway.url;
+const TRELLIS_GATEWAY_ALT = config.trellisGateway.urlAlternative || TRELLIS_GATEWAY;
+/** @deprecated Use FLUX_GATEWAY / TRELLIS_GATEWAY */
 const GATEWAY_PRIMARY = config.hunyuanApi.url;
 const GATEWAY_ALTERNATIVE = config.hunyuanApi.urlAlternative || GATEWAY_PRIMARY;
+
+const FLUX_GENERATE_TYPES: GenerateType[] = ["TextToImage", "EditImage", "Combined"];
+
+function isFluxJobType(generateType: GenerateType | null | undefined): boolean {
+  return !!generateType && FLUX_GENERATE_TYPES.includes(generateType);
+}
+
+function gatewayBasesForPath(path: string, job?: JobRecord | null): string[] {
+  const p = path.startsWith("/") ? path : `/${path}`;
+  if (/^\/text-to-image|^\/edit-image|^\/combined-edit/.test(p)) {
+    return FLUX_GATEWAY_ALT !== FLUX_GATEWAY ? [FLUX_GATEWAY, FLUX_GATEWAY_ALT] : [FLUX_GATEWAY];
+  }
+  if (/^\/text-to-3d|^\/image-to-3d/.test(p)) {
+    return TRELLIS_GATEWAY_ALT !== TRELLIS_GATEWAY ? [TRELLIS_GATEWAY, TRELLIS_GATEWAY_ALT] : [TRELLIS_GATEWAY];
+  }
+  if ((/^\/status\//.test(p) || /^\/cancel\//.test(p)) && job?.generateType) {
+    const bases = isFluxJobType(job.generateType)
+      ? [FLUX_GATEWAY, FLUX_GATEWAY_ALT]
+      : [TRELLIS_GATEWAY, TRELLIS_GATEWAY_ALT];
+    return bases[0] === bases[1] ? [bases[0]] : bases;
+  }
+  return TRELLIS_GATEWAY_ALT !== TRELLIS_GATEWAY ? [TRELLIS_GATEWAY, TRELLIS_GATEWAY_ALT] : [TRELLIS_GATEWAY];
+}
+
+function defaultBaseForPath(path: string, job?: JobRecord | null): string {
+  return gatewayBasesForPath(path, job)[0];
+}
 const LEGACY_S3_BUCKETS = (process.env.LEGACY_S3_BUCKETS || "hydrilla-outputs")
   .split(",")
   .map((bucket) => bucket.trim().toLowerCase())
   .filter(Boolean);
 
-/** Resolve relative image URL from gateway to full URL (uses provided baseUrl or primary) */
-function resolveGatewayImageUrl(url: string | undefined | null, baseUrl?: string): string | null {
+/** Resolve relative image URL from gateway to full URL (uses provided baseUrl or path default) */
+function resolveGatewayImageUrl(url: string | undefined | null, baseUrl?: string, pathHint = "/text-to-image"): string | null {
   if (!url || typeof url !== "string") return null;
   if (url.startsWith("http://") || url.startsWith("https://")) return url;
-  const base = (baseUrl || GATEWAY_PRIMARY).replace(/\/$/, "");
+  const base = (baseUrl || defaultBaseForPath(pathHint)).replace(/\/$/, "");
   return url.startsWith("/") ? `${base}${url}` : `${base}/${url}`;
 }
 
 /**
- * Fetch from gateway with primary + alternative fallback.
- * Tries primary first; on network error or 5xx, tries alternative. Returns response and baseUrl used.
+ * Fetch from the correct GPU gateway (Flux vs Trellis) with optional alternative fallback.
  */
-async function fetchGateway(path: string, init: RequestInit): Promise<{ response: Response; baseUrl: string }> {
+async function fetchGateway(
+  path: string,
+  init: RequestInit,
+  options?: { job?: JobRecord | null }
+): Promise<{ response: Response; baseUrl: string }> {
   const pathStr = path.startsWith("/") ? path : `/${path}`;
-  const urls = GATEWAY_ALTERNATIVE !== GATEWAY_PRIMARY ? [GATEWAY_PRIMARY, GATEWAY_ALTERNATIVE] : [GATEWAY_PRIMARY];
+  const urls = gatewayBasesForPath(pathStr, options?.job);
   let lastErr: unknown = null;
+  const primary = urls[0];
   for (const baseUrl of urls) {
     const url = `${baseUrl}${pathStr}`;
     try {
@@ -167,14 +204,14 @@ async function fetchGateway(path: string, init: RequestInit): Promise<{ response
         return { response, baseUrl };
       }
       lastErr = new Error(`Gateway returned ${response.status}`);
-      if (response.status >= 500 && baseUrl === GATEWAY_PRIMARY) {
+      if (response.status >= 500 && baseUrl === primary && urls.length > 1) {
         logger.warn({ status: response.status, url }, "Primary gateway error, trying alternative");
         continue;
       }
       return { response, baseUrl };
     } catch (err) {
       lastErr = err;
-      if (baseUrl === GATEWAY_PRIMARY) {
+      if (baseUrl === primary && urls.length > 1) {
         logger.warn({ err: (err as Error)?.message, url }, "Primary gateway failed, trying alternative");
         continue;
       }
@@ -391,8 +428,9 @@ async function fetchGatewayImageTo3DMultipart(
   userId: string
 ): Promise<{ response: Response; baseUrl: string }> {
   const pathStr = "/image-to-3d";
-  const urls = GATEWAY_ALTERNATIVE !== GATEWAY_PRIMARY ? [GATEWAY_PRIMARY, GATEWAY_ALTERNATIVE] : [GATEWAY_PRIMARY];
+  const urls = gatewayBasesForPath(pathStr);
   let lastErr: unknown = null;
+  const primary = urls[0];
   for (const baseUrl of urls) {
     const formData = new FormData();
     const blob = new Blob([new Uint8Array(image.buffer)], { type: image.contentType });
@@ -405,14 +443,14 @@ async function fetchGatewayImageTo3DMultipart(
         return { response, baseUrl };
       }
       lastErr = new Error(`Gateway returned ${response.status}`);
-      if (response.status >= 500 && baseUrl === GATEWAY_PRIMARY) {
+      if (response.status >= 500 && baseUrl === primary && urls.length > 1) {
         logger.warn({ status: response.status, url }, "Primary gateway error, trying alternative");
         continue;
       }
       return { response, baseUrl };
     } catch (err) {
       lastErr = err;
-      if (baseUrl === GATEWAY_PRIMARY) {
+      if (baseUrl === primary && urls.length > 1) {
         logger.warn({ err: (err as Error)?.message, url }, "Primary gateway failed, trying alternative");
         continue;
       }
@@ -488,7 +526,7 @@ function convertStatus(apiStatus: string): "WAIT" | "RUN" | "FAIL" | "DONE" {
 // ============================================
 // Generate 3D Model Endpoint (requires auth)
 // ============================================
-threeDRouter.post("/generate", requireAuth, async (req, res) => {
+threeDRouter.post("/generate", requireAuth, requireApprovedAccess, async (req, res) => {
   try {
     const body = req.body as {
       prompt?: string;
@@ -636,7 +674,7 @@ threeDRouter.post("/generate", requireAuth, async (req, res) => {
 // ============================================
 // Text-to-image (preview) – 2 credits
 // ============================================
-threeDRouter.post("/text-to-image", requireAuth, async (req, res) => {
+threeDRouter.post("/text-to-image", requireAuth, requireApprovedAccess, async (req, res) => {
   try {
     const userId = req.userId!;
     await syncUserToDatabase(userId);
@@ -709,7 +747,7 @@ threeDRouter.post("/text-to-image", requireAuth, async (req, res) => {
 // ============================================
 // Edit image – 3 credits
 // ============================================
-threeDRouter.post("/edit-image", requireAuth, upload.single("image"), async (req, res) => {
+threeDRouter.post("/edit-image", requireAuth, requireApprovedAccess, upload.single("image"), async (req, res) => {
   try {
     const userId = req.userId!;
     await syncUserToDatabase(userId);
@@ -805,7 +843,7 @@ threeDRouter.post("/edit-image", requireAuth, upload.single("image"), async (req
 // ============================================
 // Combined edit (2 images) – 4 credits
 // ============================================
-threeDRouter.post("/combined-edit", requireAuth, upload.fields([{ name: "image_1", maxCount: 1 }, { name: "image_2", maxCount: 1 }]), async (req, res) => {
+threeDRouter.post("/combined-edit", requireAuth, requireApprovedAccess, upload.fields([{ name: "image_1", maxCount: 1 }, { name: "image_2", maxCount: 1 }]), async (req, res) => {
   try {
     const userId = req.userId!;
     await syncUserToDatabase(userId);
@@ -935,7 +973,7 @@ threeDRouter.get("/status/:jobId", optionalAuth, async (req, res) => {
       
       const { response } = await fetchGateway(`/status/${jobId}`, {
         signal: controller.signal,
-      });
+      }, { job: job ?? undefined });
       
       clearTimeout(timeoutId);
       if (response.ok) {
@@ -1100,7 +1138,7 @@ threeDRouter.post("/cancel/:jobId", optionalAuth, async (req, res) => {
       return res.status(403).json({ error: "You don't have permission to cancel this job" });
     }
 
-    const { response } = await fetchGateway(`/cancel/${jobId}`, { method: "POST" });
+    const { response } = await fetchGateway(`/cancel/${jobId}`, { method: "POST" }, { job });
     const data = await response.json().catch(() => ({}));
 
     if (!response.ok) {
@@ -1138,7 +1176,7 @@ threeDRouter.get("/result/:jobId", optionalAuth, async (req, res) => {
       
       const { response } = await fetchGateway(`/status/${jobId}`, {
         signal: controller.signal,
-      });
+      }, { job });
       clearTimeout(timeoutId);
       
       if (response.ok) {
@@ -1208,20 +1246,28 @@ threeDRouter.get("/queue/info", async (_req, res) => {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), 1500);
 
-    const { response } = await fetchGateway("/queue/info", {
-      signal: controller.signal,
-    });
-
+    const init = { signal: controller.signal };
+    const [trellisSettled, fluxSettled] = await Promise.allSettled([
+      fetch(`${TRELLIS_GATEWAY}/queue/info`, init),
+      fetch(`${FLUX_GATEWAY}/queue/info`, init),
+    ]);
     clearTimeout(timeoutId);
 
-    if (response.ok) {
-      const queueInfo = await response.json();
+    let queueInfo: Record<string, unknown> = {};
+    if (trellisSettled.status === "fulfilled" && trellisSettled.value.ok) {
+      queueInfo = { ...(await trellisSettled.value.json()) };
+    }
+    if (fluxSettled.status === "fulfilled" && fluxSettled.value.ok) {
+      const fluxQi = await fluxSettled.value.json();
+      queueInfo = { ...queueInfo, ...fluxQi };
+    }
+    if (Object.keys(queueInfo).length > 0) {
       if (!res.headersSent) {
         return res.json({ ...queueInfo, api_available: true });
       }
       return;
     }
-    logger.warn({ status: response.status }, "Python API returned error status for queue info");
+    logger.warn("Python API returned no queue info from Flux or Trellis gateways");
     // Return 200 with fallback so 3D form is not blocked; only actual submit failure shows GPU offline
     if (!res.headersSent) {
       return res.status(200).json({ ...QUEUE_INFO_FALLBACK, api_available: false });
@@ -1257,34 +1303,65 @@ threeDRouter.get("/health", async (_req, res) => {
   const offlineResponse = {
     status: "down",
     gateway: "unreachable",
-    redis: "unknown",
     flux: { reachable: false, model_loaded: false },
     trellis: { reachable: false, model_loaded: false },
-    worker: { alive: false },
     queues: { "3d": 0, preview: 0, edit: 0, combined: 0 },
   };
   try {
-    // Don't let a slow/dead gateway hang the backend response.
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), 5000);
+    const init = { signal: controller.signal };
 
-    const { response } = await fetchGateway("/health", {
-      signal: controller.signal,
-    });
+    const [fluxRes, trellisRes] = await Promise.allSettled([
+      fetch(`${FLUX_GATEWAY}/health`, init),
+      fetch(`${TRELLIS_GATEWAY}/health`, init),
+    ]);
     clearTimeout(timeoutId);
 
-    let body: any = null;
-    try {
-      body = await response.json();
-    } catch {
-      body = null;
+    let fluxBody: any = null;
+    let trellisBody: any = null;
+    if (fluxRes.status === "fulfilled" && fluxRes.value.ok) {
+      try {
+        fluxBody = await fluxRes.value.json();
+      } catch {
+        fluxBody = null;
+      }
     }
-    if (!body) {
-      return res.status(200).json({ ...offlineResponse, error: "Gateway returned no JSON" });
+    if (trellisRes.status === "fulfilled" && trellisRes.value.ok) {
+      try {
+        trellisBody = await trellisRes.value.json();
+      } catch {
+        trellisBody = null;
+      }
     }
-    // Mirror the gateway's HTTP status when we can.
-    const code = response.status === 503 ? 503 : 200;
-    return res.status(code).json(body);
+
+    if (!fluxBody && !trellisBody) {
+      return res.status(200).json({ ...offlineResponse, error: "Both GPU APIs unreachable" });
+    }
+
+    const fluxLoaded = fluxBody?.flux?.model_loaded ?? fluxBody?.model_loaded ?? false;
+    const trellisLoaded = trellisBody?.trellis?.model_loaded ?? trellisBody?.model_loaded ?? false;
+    const status =
+      fluxLoaded && trellisLoaded ? "ok" : fluxLoaded || trellisLoaded ? "degraded" : "down";
+
+    return res.status(200).json({
+      status,
+      flux: {
+        reachable: !!fluxBody,
+        model_loaded: fluxLoaded,
+        raw: fluxBody,
+      },
+      trellis: {
+        reachable: !!trellisBody,
+        model_loaded: trellisLoaded,
+        flux_remote: trellisBody?.flux_remote,
+        raw: trellisBody,
+      },
+      queues: {
+        preview: fluxBody?.queues?.preview_queue_length ?? 0,
+        "3d": trellisBody?.queues?.queue_length ?? 0,
+      },
+    });
   } catch (err: any) {
     const isAbort = err?.name === "AbortError";
     logger.warn({ err: err?.message, isAbort }, "Health check failed");
@@ -1514,7 +1591,7 @@ threeDRouter.get("/history", optionalAuth, async (req, res) => {
 // ============================================
 // Delete a Job (requires auth)
 // ============================================
-threeDRouter.delete("/jobs/:jobId", requireAuth, async (req, res) => {
+threeDRouter.delete("/jobs/:jobId", requireAuth, requireApprovedAccess, async (req, res) => {
   const { jobId } = req.params;
   const userId = req.userId!;
 
@@ -1542,7 +1619,7 @@ threeDRouter.delete("/jobs/:jobId", requireAuth, async (req, res) => {
 // ============================================
 
 // Get all chats for user
-threeDRouter.get("/chats", requireAuth, async (req, res) => {
+threeDRouter.get("/chats", requireAuth, requireApprovedAccess, async (req, res) => {
   try {
     const userId = req.userId!;
     const chats = await listChatsForUser(userId, 100);
@@ -1562,7 +1639,7 @@ threeDRouter.get("/chats", requireAuth, async (req, res) => {
 
 // Get or create active chat (most recent chat, or create new one)
 // IMPORTANT: This must come BEFORE /chats/:chatId to avoid route conflicts
-threeDRouter.get("/chats/active", requireAuth, async (req, res) => {
+threeDRouter.get("/chats/active", requireAuth, requireApprovedAccess, async (req, res) => {
   try {
     const userId = req.userId!;
     
@@ -1616,7 +1693,7 @@ threeDRouter.get("/chats/active", requireAuth, async (req, res) => {
 });
 
 // Get a specific chat with its jobs
-threeDRouter.get("/chats/:chatId", requireAuth, async (req, res) => {
+threeDRouter.get("/chats/:chatId", requireAuth, requireApprovedAccess, async (req, res) => {
   try {
     const { chatId } = req.params;
     const userId = req.userId!;
@@ -1679,7 +1756,7 @@ threeDRouter.get("/chats/:chatId", requireAuth, async (req, res) => {
 });
 
 // Create a new chat
-threeDRouter.post("/chats", requireAuth, async (req, res) => {
+threeDRouter.post("/chats", requireAuth, requireApprovedAccess, async (req, res) => {
   try {
     const userId = req.userId!;
     const { name } = req.body as { name?: string };
@@ -1700,7 +1777,7 @@ threeDRouter.post("/chats", requireAuth, async (req, res) => {
 });
 
 // Update chat name
-threeDRouter.patch("/chats/:chatId/name", requireAuth, async (req, res) => {
+threeDRouter.patch("/chats/:chatId/name", requireAuth, requireApprovedAccess, async (req, res) => {
   try {
     const { chatId } = req.params;
     const userId = req.userId!;
@@ -1719,7 +1796,7 @@ threeDRouter.patch("/chats/:chatId/name", requireAuth, async (req, res) => {
 });
 
 // Delete a chat
-threeDRouter.delete("/chats/:chatId", requireAuth, async (req, res) => {
+threeDRouter.delete("/chats/:chatId", requireAuth, requireApprovedAccess, async (req, res) => {
   try {
     const { chatId } = req.params;
     const userId = req.userId!;
@@ -2374,6 +2451,8 @@ threeDRouter.get("/me", requireAuth, async (req, res) => {
       .eq("user_id", userId)
       .eq("status", "DONE");
     
+    const isApproved = (await getUserIsApproved(userId)) || isAdminEmail(user.email);
+
     res.json({
       user: {
         id: user.id,
@@ -2382,6 +2461,7 @@ threeDRouter.get("/me", requireAuth, async (req, res) => {
         lastName: user.last_name,
         imageUrl: user.image_url,
         createdAt: user.created_at,
+        isApproved,
       },
       stats: {
         totalJobs: totalJobs || 0,
@@ -2458,7 +2538,7 @@ threeDRouter.post("/notify-gpu-offline", optionalAuth, async (req, res) => {
  * List all workspaces for the current user.
  * Short cache (5s) reduces repeat requests when navigating back to /app/studio.
  */
-threeDRouter.get("/workspaces", requireAuth, async (req, res) => {
+threeDRouter.get("/workspaces", requireAuth, requireApprovedAccess, async (req, res) => {
   try {
     const userId = req.userId!;
     const workspaces = await listWorkspacesForUser(userId);
@@ -2476,7 +2556,7 @@ threeDRouter.get("/workspaces", requireAuth, async (req, res) => {
 /**
  * Create a new workspace
  */
-threeDRouter.post("/workspaces", requireAuth, async (req, res) => {
+threeDRouter.post("/workspaces", requireAuth, requireApprovedAccess, async (req, res) => {
   try {
     const userId = req.userId!;
     const { name } = req.body as { name?: string };
@@ -2494,7 +2574,7 @@ threeDRouter.post("/workspaces", requireAuth, async (req, res) => {
 /**
  * Get a workspace by ID
  */
-threeDRouter.get("/workspaces/:workspaceId", requireAuth, async (req, res) => {
+threeDRouter.get("/workspaces/:workspaceId", requireAuth, requireApprovedAccess, async (req, res) => {
   try {
     const userId = req.userId!;
     const { workspaceId } = req.params;
@@ -2512,7 +2592,7 @@ threeDRouter.get("/workspaces/:workspaceId", requireAuth, async (req, res) => {
 /**
  * Get all jobs for a specific workspace
  */
-threeDRouter.get("/workspaces/:workspaceId/jobs", requireAuth, async (req, res) => {
+threeDRouter.get("/workspaces/:workspaceId/jobs", requireAuth, requireApprovedAccess, async (req, res) => {
   try {
     const userId = req.userId!;
     const { workspaceId } = req.params;
@@ -2570,7 +2650,7 @@ threeDRouter.get("/workspaces/:workspaceId/jobs", requireAuth, async (req, res) 
 /**
  * Update workspace name
  */
-threeDRouter.patch("/workspaces/:workspaceId/name", requireAuth, async (req, res) => {
+threeDRouter.patch("/workspaces/:workspaceId/name", requireAuth, requireApprovedAccess, async (req, res) => {
   try {
     const userId = req.userId!;
     const { workspaceId } = req.params;
@@ -2591,7 +2671,7 @@ threeDRouter.patch("/workspaces/:workspaceId/name", requireAuth, async (req, res
 /**
  * Delete a workspace
  */
-threeDRouter.delete("/workspaces/:workspaceId", requireAuth, async (req, res) => {
+threeDRouter.delete("/workspaces/:workspaceId", requireAuth, requireApprovedAccess, async (req, res) => {
   try {
     const userId = req.userId!;
     const { workspaceId } = req.params;

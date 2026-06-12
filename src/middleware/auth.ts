@@ -2,9 +2,20 @@ import { Request, Response, NextFunction } from "express";
 import { createClerkClient } from "@clerk/clerk-sdk-node";
 import { config } from "../config.js";
 import { logger } from "../logger.js";
+import {
+  getUserIsApproved,
+  isAdminEmail,
+  resolveUserApproval,
+} from "../services/accessControl.js";
 
 // Initialize Clerk client
 const clerk = createClerkClient({ secretKey: config.clerk.secretKey });
+
+function setCorsErrorHeaders(res: Response) {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+}
 
 // Extend Express Request to include user info
 declare global {
@@ -64,19 +75,14 @@ export async function requireAuth(req: Request, res: Response, next: NextFunctio
     const authHeader = req.headers.authorization;
     
     if (!authHeader || !authHeader.startsWith("Bearer ")) {
-      // Set CORS headers before sending error
-      res.setHeader("Access-Control-Allow-Origin", "*");
-      res.setHeader("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
-      res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+      setCorsErrorHeaders(res);
       return res.status(401).json({ error: "Authentication required" });
     }
 
     const token = authHeader.substring(7);
     
     if (!token || token === "undefined" || token === "null") {
-      res.setHeader("Access-Control-Allow-Origin", "*");
-      res.setHeader("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
-      res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+      setCorsErrorHeaders(res);
       return res.status(401).json({ error: "Invalid authentication token" });
     }
 
@@ -84,9 +90,7 @@ export async function requireAuth(req: Request, res: Response, next: NextFunctio
     const payload = await clerk.verifyToken(token);
     
     if (!payload || !payload.sub) {
-      res.setHeader("Access-Control-Allow-Origin", "*");
-      res.setHeader("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
-      res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+      setCorsErrorHeaders(res);
       return res.status(401).json({ error: "Invalid authentication token" });
     }
 
@@ -96,11 +100,75 @@ export async function requireAuth(req: Request, res: Response, next: NextFunctio
     next();
   } catch (err: any) {
     logger.error({ err: err.message }, "Authentication failed");
-    // Set CORS headers before sending error
-    res.setHeader("Access-Control-Allow-Origin", "*");
-    res.setHeader("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
-    res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+    setCorsErrorHeaders(res);
     return res.status(401).json({ error: "Authentication failed" });
+  }
+}
+
+/**
+ * Middleware that requires admin privileges.
+ * Must be used after requireAuth.
+ */
+export async function requireAdmin(req: Request, res: Response, next: NextFunction) {
+  try {
+    const userId = req.userId;
+    if (!userId) {
+      setCorsErrorHeaders(res);
+      return res.status(401).json({ error: "Authentication required" });
+    }
+
+    const user = await clerk.users.getUser(userId);
+    const primary = user.emailAddresses.find((e) => e.id === user.primaryEmailAddressId);
+    const email = primary?.emailAddress || user.emailAddresses[0]?.emailAddress || null;
+    const role = user.publicMetadata?.role;
+
+    if (role === "admin" || isAdminEmail(email)) {
+      return next();
+    }
+
+    setCorsErrorHeaders(res);
+    return res.status(403).json({ error: "Admin access required" });
+  } catch (err: any) {
+    logger.error({ err: err.message, userId: req.userId }, "Admin check failed");
+    setCorsErrorHeaders(res);
+    return res.status(403).json({ error: "Admin access required" });
+  }
+}
+
+/**
+ * Middleware that requires the user to be approved for app access.
+ * Must be used after requireAuth.
+ */
+export async function requireApprovedAccess(req: Request, res: Response, next: NextFunction) {
+  try {
+    const userId = req.userId;
+    if (!userId) {
+      setCorsErrorHeaders(res);
+      return res.status(401).json({ error: "Authentication required" });
+    }
+
+    const userData = await syncUserToDatabase(userId);
+    if (userData?.email) {
+      await resolveUserApproval(userId, userData.email);
+    }
+
+    const approved = await getUserIsApproved(userId);
+    if (!approved) {
+      setCorsErrorHeaders(res);
+      return res.status(403).json({
+        error: "access_not_granted",
+        message: "Contact the website admin for access.",
+      });
+    }
+
+    next();
+  } catch (err: any) {
+    logger.error({ err: err.message, userId: req.userId }, "Approval check failed");
+    setCorsErrorHeaders(res);
+    return res.status(403).json({
+      error: "access_not_granted",
+      message: "Contact the website admin for access.",
+    });
   }
 }
 
@@ -120,9 +188,12 @@ export async function syncUserToDatabase(userId: string) {
     // Import supabase here to avoid circular dependency
     const { supabase } = await import("../db.js");
     
+    const primary = user.emailAddresses.find((e) => e.id === user.primaryEmailAddressId);
+    const primaryEmail = primary?.emailAddress || user.emailAddresses[0]?.emailAddress || null;
+
     const userData = {
       id: user.id,
-      email: user.emailAddresses[0]?.emailAddress || null,
+      email: primaryEmail,
       first_name: user.firstName || null,
       last_name: user.lastName || null,
       image_url: user.imageUrl || null,
@@ -178,7 +249,13 @@ export async function syncUserToDatabase(userId: string) {
         return null;
       }
       logger.info({ userId, email: userData.email }, "New user created in database");
-      
+    }
+
+    if (userData.email) {
+      await resolveUserApproval(userId, userData.email);
+    }
+
+    if (!existingUser) {
       // Send welcome email to new user (non-blocking)
       if (userData.email) {
         // Import email service here to avoid circular dependency

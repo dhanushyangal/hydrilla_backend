@@ -13,12 +13,35 @@ export const config = {
     secretKey: process.env.CLERK_SECRET_KEY || "",
   },
   hunyuanApi: {
-    /** Primary gateway (text-to-image, edit, combined, text-to-3d, image-to-3d, status, queue, cancel) */
+    /** Legacy single gateway URL (fallback when dual URLs unset) */
     url: (process.env.HUNYUAN_API_URL || "https://api.hydrilla.ai").replace(/\/$/, ""),
-    /** Alternative gateway when primary is down (same endpoints; try after primary fails) */
     urlAlternative: process.env.HUNYUAN_API_URL_ALTERNATIVE
       ? process.env.HUNYUAN_API_URL_ALTERNATIVE.replace(/\/$/, "")
       : "https://api.hydrilla.co",
+  },
+  fluxGateway: {
+    /** hydrilla_dual/flux — text-to-image, edit-image, combined-edit */
+    url: (
+      process.env.FLUX_GATEWAY_URL ||
+      process.env.FLUX_API_URL ||
+      process.env.HUNYUAN_API_URL ||
+      "https://api.hydrilla.ai"
+    ).replace(/\/$/, ""),
+    urlAlternative: process.env.FLUX_GATEWAY_URL_ALTERNATIVE
+      ? process.env.FLUX_GATEWAY_URL_ALTERNATIVE.replace(/\/$/, "")
+      : "",
+  },
+  trellisGateway: {
+    /** hydrilla_dual/trellis — text-to-3d, image-to-3d */
+    url: (
+      process.env.TRELLIS_GATEWAY_URL ||
+      process.env.TRELLIS_API_URL ||
+      process.env.HUNYUAN_API_URL ||
+      "https://api.hydrilla.ai"
+    ).replace(/\/$/, ""),
+    urlAlternative: process.env.TRELLIS_GATEWAY_URL_ALTERNATIVE
+      ? process.env.TRELLIS_GATEWAY_URL_ALTERNATIVE.replace(/\/$/, "")
+      : "",
   },
   s3: {
     bucket: process.env.S3_BUCKET || "hydrilla-outputs-1",
@@ -33,6 +56,13 @@ export const config = {
     fromName: process.env.ZEPTOMAIL_FROM_NAME || "Hydrilla",
     frontendUrl: process.env.FRONTEND_URL || "https://hydrilla.co",
   },
+  adminEmails: (process.env.ADMIN_EMAILS || "dhanushyangal@gmail.com,dhanushyangal1@gmail.com,tharak.nagaveti@gmail.com")
+    .split(",")
+    .map((e) => e.trim())
+    .filter(Boolean),
+  inviteExpiryDays: parseInt(process.env.INVITE_EXPIRY_DAYS || "7", 10),
+  frontendUrl: process.env.FRONTEND_URL || "https://hydrilla.co",
+  databaseUrl: process.env.DATABASE_URL || "",
   dodoPayment: {
     apiKey: process.env.DODO_PAYMENT_API_KEY || "",
     mode: process.env.DODO_PAYMENT_MODE || "test",  // "test" or "live"
