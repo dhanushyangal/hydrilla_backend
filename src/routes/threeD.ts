@@ -221,6 +221,25 @@ async function fetchGateway(
   throw lastErr || new Error("Gateway request failed");
 }
 
+/** Fetch /queue/info from the first reachable gateway base (primary + alternative in parallel). */
+async function fetchQueueInfoFromGateways(
+  bases: string[],
+  init: RequestInit
+): Promise<Record<string, unknown> | null> {
+  const unique = [...new Set(bases.filter(Boolean))];
+  const results = await Promise.allSettled(
+    unique.map(async (base) => {
+      const response = await fetch(`${base}/queue/info`, init);
+      if (!response.ok) throw new Error(`queue/info ${response.status}`);
+      return response.json() as Promise<Record<string, unknown>>;
+    })
+  );
+  for (const result of results) {
+    if (result.status === "fulfilled") return result.value;
+  }
+  return null;
+}
+
 /** Hosts the remote GPU worker cannot reach (it would try localhost on its own machine). */
 function isHostnameUnreachableFromExternalGateway(hostname: string): boolean {
   const h = hostname.toLowerCase();
@@ -1247,20 +1266,15 @@ threeDRouter.get("/queue/info", async (_req, res) => {
     const timeoutId = setTimeout(() => controller.abort(), 1500);
 
     const init = { signal: controller.signal };
-    const [trellisSettled, fluxSettled] = await Promise.allSettled([
-      fetch(`${TRELLIS_GATEWAY}/queue/info`, init),
-      fetch(`${FLUX_GATEWAY}/queue/info`, init),
+    const [trellisQi, fluxQi] = await Promise.all([
+      fetchQueueInfoFromGateways([TRELLIS_GATEWAY, TRELLIS_GATEWAY_ALT], init),
+      fetchQueueInfoFromGateways([FLUX_GATEWAY, FLUX_GATEWAY_ALT], init),
     ]);
     clearTimeout(timeoutId);
 
     let queueInfo: Record<string, unknown> = {};
-    if (trellisSettled.status === "fulfilled" && trellisSettled.value.ok) {
-      queueInfo = { ...(await trellisSettled.value.json()) };
-    }
-    if (fluxSettled.status === "fulfilled" && fluxSettled.value.ok) {
-      const fluxQi = await fluxSettled.value.json();
-      queueInfo = { ...queueInfo, ...fluxQi };
-    }
+    if (trellisQi) queueInfo = { ...trellisQi };
+    if (fluxQi) queueInfo = { ...queueInfo, ...fluxQi };
     if (Object.keys(queueInfo).length > 0) {
       if (!res.headersSent) {
         return res.json({ ...queueInfo, api_available: true });

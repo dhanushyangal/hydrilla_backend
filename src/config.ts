@@ -2,6 +2,20 @@ import dotenv from "dotenv";
 
 dotenv.config();
 
+const GATEWAY_CO = "https://api.hydrilla.co";
+const GATEWAY_AI = "https://api.hydrilla.ai";
+
+function stripTrailingSlash(url: string): string {
+  return url.replace(/\/$/, "");
+}
+
+/** When only one gateway URL is configured, default to the other hydrilla host. */
+function defaultGatewayAlternative(primary: string): string {
+  if (primary.includes("api.hydrilla.co")) return GATEWAY_AI;
+  if (primary.includes("api.hydrilla.ai")) return GATEWAY_CO;
+  return GATEWAY_AI;
+}
+
 export const config = {
   port: parseInt(process.env.PORT || "4000", 10),
   supabase: {
@@ -14,34 +28,48 @@ export const config = {
   },
   hunyuanApi: {
     /** Legacy single gateway URL (fallback when dual URLs unset) */
-    url: (process.env.HUNYUAN_API_URL || "https://api.hydrilla.ai").replace(/\/$/, ""),
-    urlAlternative: process.env.HUNYUAN_API_URL_ALTERNATIVE
-      ? process.env.HUNYUAN_API_URL_ALTERNATIVE.replace(/\/$/, "")
-      : "https://api.hydrilla.co",
+    url: stripTrailingSlash(process.env.HUNYUAN_API_URL || GATEWAY_CO),
+    urlAlternative: stripTrailingSlash(
+      process.env.HUNYUAN_API_URL_ALTERNATIVE || GATEWAY_AI
+    ),
   },
   fluxGateway: {
     /** hydrilla_dual/flux — text-to-image, edit-image, combined-edit */
-    url: (
+    url: stripTrailingSlash(
       process.env.FLUX_GATEWAY_URL ||
-      process.env.FLUX_API_URL ||
-      process.env.HUNYUAN_API_URL ||
-      "https://api.hydrilla.ai"
-    ).replace(/\/$/, ""),
-    urlAlternative: process.env.FLUX_GATEWAY_URL_ALTERNATIVE
-      ? process.env.FLUX_GATEWAY_URL_ALTERNATIVE.replace(/\/$/, "")
-      : "",
+        process.env.FLUX_API_URL ||
+        process.env.HUNYUAN_API_URL ||
+        GATEWAY_CO
+    ),
+    urlAlternative: stripTrailingSlash(
+      process.env.FLUX_GATEWAY_URL_ALTERNATIVE ||
+        process.env.HUNYUAN_API_URL_ALTERNATIVE ||
+        defaultGatewayAlternative(
+          process.env.FLUX_GATEWAY_URL ||
+            process.env.FLUX_API_URL ||
+            process.env.HUNYUAN_API_URL ||
+            GATEWAY_CO
+        )
+    ),
   },
   trellisGateway: {
     /** hydrilla_dual/trellis — text-to-3d, image-to-3d */
-    url: (
+    url: stripTrailingSlash(
       process.env.TRELLIS_GATEWAY_URL ||
-      process.env.TRELLIS_API_URL ||
-      process.env.HUNYUAN_API_URL ||
-      "https://api.hydrilla.ai"
-    ).replace(/\/$/, ""),
-    urlAlternative: process.env.TRELLIS_GATEWAY_URL_ALTERNATIVE
-      ? process.env.TRELLIS_GATEWAY_URL_ALTERNATIVE.replace(/\/$/, "")
-      : "",
+        process.env.TRELLIS_API_URL ||
+        process.env.HUNYUAN_API_URL ||
+        GATEWAY_CO
+    ),
+    urlAlternative: stripTrailingSlash(
+      process.env.TRELLIS_GATEWAY_URL_ALTERNATIVE ||
+        process.env.HUNYUAN_API_URL_ALTERNATIVE ||
+        defaultGatewayAlternative(
+          process.env.TRELLIS_GATEWAY_URL ||
+            process.env.TRELLIS_API_URL ||
+            process.env.HUNYUAN_API_URL ||
+            GATEWAY_CO
+        )
+    ),
   },
   s3: {
     bucket: process.env.S3_BUCKET || "hydrilla-outputs-1",
