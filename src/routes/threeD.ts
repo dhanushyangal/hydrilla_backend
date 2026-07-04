@@ -2465,7 +2465,11 @@ threeDRouter.get("/me", requireAuth, async (req, res) => {
       .eq("user_id", userId)
       .eq("status", "DONE");
     
-    const isApproved = (await getUserIsApproved(userId)) || isAdminEmail(user.email);
+    // When access control is on hold, report approved so clients never block.
+    const isApproved =
+      !config.accessControlEnabled ||
+      (await getUserIsApproved(userId)) ||
+      isAdminEmail(user.email);
 
     res.json({
       user: {
@@ -2573,6 +2577,8 @@ threeDRouter.get("/workspaces", requireAuth, requireApprovedAccess, async (req, 
 threeDRouter.post("/workspaces", requireAuth, requireApprovedAccess, async (req, res) => {
   try {
     const userId = req.userId!;
+    // Ensure users row exists (FK) — avoids create failures right after first login.
+    await syncUserToDatabase(userId);
     const { name } = req.body as { name?: string };
     const workspace = await createWorkspace({ userId, name: name || "Untitled Workspace" });
     res.json({ workspace });

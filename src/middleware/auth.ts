@@ -138,8 +138,16 @@ export async function requireAdmin(req: Request, res: Response, next: NextFuncti
 /**
  * Middleware that requires the user to be approved for app access.
  * Must be used after requireAuth.
+ *
+ * ON HOLD: when config.accessControlEnabled is false (default), this is a no-op
+ * so any authenticated user can generate / use workspaces. Flip ACCESS_CONTROL_ENABLED=true
+ * to enforce invite approval again — code below is unchanged.
  */
 export async function requireApprovedAccess(req: Request, res: Response, next: NextFunction) {
+  if (!config.accessControlEnabled) {
+    return next();
+  }
+
   try {
     const userId = req.userId;
     if (!userId) {

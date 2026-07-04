@@ -1,6 +1,8 @@
 import dotenv from "dotenv";
 
+// Load .env then .env.local (local overrides — matches Next.js convention)
 dotenv.config();
+dotenv.config({ path: ".env.local", override: true });
 
 const GATEWAY_CO = "https://api.hydrilla.co";
 const GATEWAY_AI = "https://api.hydrilla.ai";
@@ -88,6 +90,12 @@ export const config = {
     .split(",")
     .map((e) => e.trim())
     .filter(Boolean),
+  /**
+   * Invite / approval gate. OFF by default (on hold) so any signed-in user
+   * can use workspace + generate. Set ACCESS_CONTROL_ENABLED=true to re-enable.
+   * Invite/admin routes stay in the codebase either way.
+   */
+  accessControlEnabled: process.env.ACCESS_CONTROL_ENABLED === "true",
   inviteExpiryDays: parseInt(process.env.INVITE_EXPIRY_DAYS || "7", 10),
   frontendUrl: process.env.FRONTEND_URL || "https://hydrilla.co",
   databaseUrl: process.env.DATABASE_URL || "",
