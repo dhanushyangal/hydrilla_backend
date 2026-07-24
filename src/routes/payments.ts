@@ -4,6 +4,7 @@ import { config } from "../config.js";
 import { supabase } from "../db.js";
 import { requireAuth, optionalAuth } from "../middleware/auth.js";
 import { getDodoPaymentsClient } from "../lib/dodopayments.js";
+import { captureServerEvent, flushPostHog } from "../lib/posthog.js";
 
 // ============================================================================
 // DODO PAYMENTS - Subscription Integration
@@ -99,12 +100,22 @@ paymentsRouter.post("/create-checkout", optionalAuth, async (req: Request, res: 
 
     logger.info({ plan, email, sessionId: session.session_id }, "Checkout session created");
 
+    captureServerEvent(userId, "checkout_session_created", {
+      plan,
+      session_id: session.session_id,
+    });
+    void flushPostHog();
+
     res.json({
       checkoutUrl: session.checkout_url,
       sessionId: session.session_id,
     });
   } catch (error: any) {
     logger.error({ error: error?.message }, "Error creating checkout session");
+    captureServerEvent((req as any).userId || null, "checkout_session_failed", {
+      plan: req.body?.plan || null,
+    });
+    void flushPostHog();
     res.status(500).json({ error: "Failed to create checkout session" });
   }
 });
@@ -562,6 +573,13 @@ async function handleSubscriptionActive(data: any, webhookId: string) {
     }
 
     logger.info({ subscriptionId, email, plan, credits }, "✅ Subscription active + credits granted");
+
+    captureServerEvent(userId, "subscription_activated", {
+      plan: plan || "unknown",
+      credits,
+      source: "dodo_webhook",
+    });
+    void flushPostHog();
   } catch (error: any) {
     logger.error({ error: error?.message }, "Error in handleSubscriptionActive");
   }
@@ -618,6 +636,19 @@ async function handleSubscriptionRenewed(data: any, webhookId: string) {
     }
 
     logger.info({ subscriptionId, plan, credits }, "✅ Subscription renewed + credits reset");
+
+    const renewUserId =
+      (await supabase
+        .from("user_subscriptions")
+        .select("user_id")
+        .eq("dodo_subscription_id", subscriptionId)
+        .maybeSingle()).data?.user_id ??
+      (email ? await findUserIdByEmail(email) : null);
+    captureServerEvent(renewUserId, "subscription_renewed", {
+      plan: plan || "unknown",
+      credits,
+    });
+    void flushPostHog();
   } catch (error: any) {
     logger.error({ error: error?.message }, "Error in handleSubscriptionRenewed");
   }
@@ -643,6 +674,17 @@ async function handleSubscriptionCancelled(data: any, eventType: string) {
     // Optionally zero out credits on cancellation
     // (We leave existing credits until the end of the period)
     logger.info({ subscriptionId }, `✅ Subscription marked as ${status}`);
+
+    const { data: subRow } = await supabase
+      .from("user_subscriptions")
+      .select("user_id, plan")
+      .eq("dodo_subscription_id", subscriptionId)
+      .maybeSingle();
+    captureServerEvent(subRow?.user_id, "subscription_cancelled", {
+      status,
+      plan: subRow?.plan || null,
+    });
+    void flushPostHog();
   } catch (error: any) {
     logger.error({ error: error?.message }, "Error in handleSubscriptionCancelled");
   }
