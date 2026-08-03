@@ -69,8 +69,9 @@ codeSculptRouter.post("/generate", requireAuth, requireApprovedAccess, async (re
 
     const entry = catalogEntry(modelId);
     if (!entry || entry.kind !== "code") {
-      // Allow OpenRouter free / live slugs that may not be in the static catalog yet
-      if (!isOpenRouterModelId(modelId) && providerForModel(modelId) !== "openrouter") {
+      // Allow OpenRouter free / live slugs / Cursor ids that may not be in the static catalog yet
+      const resolved = providerForModel(modelId);
+      if (!isOpenRouterModelId(modelId) && resolved !== "openrouter" && resolved !== "cursor") {
         return res.status(400).json({ error: "Select a bring-your-own model for Water" });
       }
     }

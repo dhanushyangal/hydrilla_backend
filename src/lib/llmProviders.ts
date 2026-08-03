@@ -3,10 +3,19 @@ import type { ApiKeyProvider } from "./userApiKeysCrypto.js";
 export type CatalogModel = {
   id: string;
   label: string;
-  group: "Hydrilla" | "Anthropic" | "OpenAI" | "Google" | "OpenRouter" | "OpenRouter Free";
+  group:
+    | "Hydrilla"
+    | "Cursor"
+    | "Anthropic"
+    | "OpenAI"
+    | "Google"
+    | "OpenRouter"
+    | "OpenRouter Free";
   kind: "mesh" | "code";
   provider: ApiKeyProvider | "hydrilla";
   openRouterSlug?: string;
+  /** Native Cursor Cloud Agents model.id (omit for account default). */
+  cursorModelId?: string | null;
   vision?: boolean;
   free?: boolean;
   comingSoon?: boolean;
@@ -61,6 +70,25 @@ export const MODEL_CATALOG: CatalogModel[] = [
     group: "Google",
     kind: "code",
     provider: "gemini",
+    vision: true,
+  },
+  // --- Cursor Cloud Agents (BYOK) — not chat-completions; uses /v1/agents ---
+  {
+    id: "cursor-auto",
+    label: "Cursor Auto",
+    group: "Cursor",
+    kind: "code",
+    provider: "cursor",
+    cursorModelId: null,
+    vision: true,
+  },
+  {
+    id: "cursor-composer-2",
+    label: "Composer 2",
+    group: "Cursor",
+    kind: "code",
+    provider: "cursor",
+    cursorModelId: "composer-2",
     vision: true,
   },
   // --- OpenRouter Free (BYOK, $0) ---
@@ -186,6 +214,7 @@ export function isOpenRouterModelId(modelId: string): boolean {
 export function providerForModel(modelId: string): ApiKeyProvider | "hydrilla" | null {
   const entry = catalogEntry(modelId);
   if (entry) return entry.provider;
+  if (modelId.startsWith("cursor-") || modelId.startsWith("cursor/")) return "cursor";
   if (isOpenRouterModelId(modelId)) return "openrouter";
   return null;
 }
@@ -342,6 +371,16 @@ export async function verifyProviderKey(
       return { ok: false, error: `Gemini ${res.status}: ${body.slice(0, 180)}` };
     }
 
+    if (provider === "cursor") {
+      // Cloud Agents API key probe — https://cursor.com/docs/api
+      const res = await fetch("https://api.cursor.com/v1/me", {
+        headers: { Authorization: `Bearer ${apiKey}` },
+      });
+      if (res.ok) return { ok: true };
+      const body = await res.text().catch(() => "");
+      return { ok: false, error: `Cursor ${res.status}: ${body.slice(0, 180)}` };
+    }
+
     return { ok: false, error: "Unknown provider" };
   } catch (err: any) {
     return { ok: false, error: err?.message || "Verification request failed" };
@@ -358,7 +397,121 @@ function resolveNativeModel(provider: ApiKeyProvider, modelId: string): string {
   if (provider === "gemini") {
     return modelId === "gemini-2.5-pro" ? "gemini-2.5-pro" : "gemini-2.5-flash";
   }
+  if (provider === "cursor") {
+    const entry = catalogEntry(modelId);
+    if (entry?.cursorModelId) return entry.cursorModelId;
+    if (modelId.startsWith("cursor/")) return modelId.slice("cursor/".length);
+    if (modelId === "cursor-composer-2") return "composer-2";
+    return ""; // empty → omit model (Cursor account default / Auto)
+  }
   return resolveOpenRouterSlug(modelId);
+}
+
+/**
+ * Cursor Cloud Agents are not chat-completions. Water uses a no-repo agent run
+ * and reads `run.result` (final assistant text). Docs:
+ * https://cursor.com/docs/cloud-agent/api/endpoints
+ */
+async function callCursorCloudAgent(params: {
+  apiKey: string;
+  modelId: string;
+  system: string;
+  userText: string;
+  imageUrl?: string | null;
+}): Promise<string> {
+  const native = resolveNativeModel("cursor", params.modelId);
+  const promptText = [
+    params.system.trim(),
+    "",
+    "---",
+    "",
+    params.userText.trim(),
+    "",
+    "IMPORTANT: You are answering a one-shot generation request for Hydrilla Water.",
+    "Do not edit files or use tools. Reply with ONLY the requested output in your final message.",
+  ].join("\n");
+
+  const body: Record<string, unknown> = {
+    prompt: {
+      text: promptText,
+      ...(params.imageUrl
+        ? { images: [{ url: params.imageUrl }] }
+        : {}),
+    },
+    name: "Hydrilla Water",
+    // Omit repos + env → no-repo agent (text-only generation).
+  };
+  if (native) {
+    body.model = {
+      id: native,
+      ...(native === "composer-2"
+        ? { params: [{ id: "fast", value: "true" }] }
+        : {}),
+    };
+  }
+
+  const createRes = await fetch("https://api.cursor.com/v1/agents", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${params.apiKey}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(body),
+  });
+  if (!createRes.ok) {
+    const errBody = await createRes.text().catch(() => "");
+    throw new Error(friendlyProviderError("cursor", createRes.status, errBody));
+  }
+
+  const created = (await createRes.json()) as {
+    agent?: { id?: string };
+    run?: { id?: string; status?: string; result?: string };
+  };
+  const agentId = created.agent?.id;
+  const runId = created.run?.id;
+  if (!agentId || !runId) {
+    throw new Error("Cursor agent create returned no agent/run id");
+  }
+
+  const terminal = new Set(["FINISHED", "ERROR", "CANCELLED", "EXPIRED"]);
+  const deadline = Date.now() + 240_000; // 4 minutes per LLM stage
+  let lastStatus = created.run?.status || "CREATING";
+
+  while (Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 2000));
+    const runRes = await fetch(`https://api.cursor.com/v1/agents/${agentId}/runs/${runId}`, {
+      headers: { Authorization: `Bearer ${params.apiKey}` },
+    });
+    if (!runRes.ok) {
+      const errBody = await runRes.text().catch(() => "");
+      throw new Error(friendlyProviderError("cursor", runRes.status, errBody));
+    }
+    const run = (await runRes.json()) as {
+      status?: string;
+      result?: string;
+    };
+    lastStatus = run.status || lastStatus;
+    if (run.status && terminal.has(run.status)) {
+      // Best-effort cleanup
+      void fetch(`https://api.cursor.com/v1/agents/${agentId}/archive`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${params.apiKey}` },
+      }).catch(() => {});
+
+      if (run.status !== "FINISHED") {
+        throw new Error(`Cursor run ended with status ${run.status}`);
+      }
+      const text = (run.result || "").trim();
+      if (!text) throw new Error("Cursor run finished with empty result");
+      return text;
+    }
+  }
+
+  void fetch(`https://api.cursor.com/v1/agents/${agentId}/archive`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${params.apiKey}` },
+  }).catch(() => {});
+  throw new Error(`Cursor run timed out (last status: ${lastStatus})`);
 }
 
 function friendlyProviderError(provider: ApiKeyProvider, status: number, body: string): string {
@@ -390,6 +543,16 @@ export async function callLLM(params: {
   const imageUrl = params.imageUrl || null;
   const maxTokens = params.maxTokens ?? 8192;
   const model = resolveNativeModel(provider, params.modelId);
+
+  if (provider === "cursor") {
+    return callCursorCloudAgent({
+      apiKey,
+      modelId: params.modelId,
+      system,
+      userText,
+      imageUrl,
+    });
+  }
 
   if (provider === "anthropic") {
     const content: Array<Record<string, unknown>> = [];

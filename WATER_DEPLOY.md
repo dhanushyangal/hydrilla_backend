@@ -4,11 +4,12 @@ Frontend product docs: in the `hyd-f` repo → [`docs/ENGINES.md`](https://githu
 
 ## 1) Supabase SQL (do this first)
 
-In Supabase → SQL Editor, run:
+In Supabase → SQL Editor, run **in order**:
 
-[`sql/add_user_api_keys_and_code_sculpt.sql`](./sql/add_user_api_keys_and_code_sculpt.sql)
+1. [`sql/add_user_api_keys_and_code_sculpt.sql`](./sql/add_user_api_keys_and_code_sculpt.sql)  
+2. [`sql/add_cursor_provider.sql`](./sql/add_cursor_provider.sql) — allows `cursor` BYOK keys  
 
-Additive only — safe for existing mesh jobs. Creates `user_api_keys` / prefs and Water columns on `jobs`.
+Additive only — safe for existing mesh jobs.
 
 ## 2) New Vercel env (backend project)
 

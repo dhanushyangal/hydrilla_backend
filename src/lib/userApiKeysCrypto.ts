@@ -1,7 +1,7 @@
 import crypto from "crypto";
 import { config } from "../config.js";
 
-export type ApiKeyProvider = "anthropic" | "openai" | "gemini" | "openrouter";
+export type ApiKeyProvider = "anthropic" | "openai" | "gemini" | "openrouter" | "cursor";
 export type ApiKeyStatus = "unchecked" | "valid" | "invalid";
 
 export const API_KEY_PROVIDERS: ApiKeyProvider[] = [
@@ -9,6 +9,7 @@ export const API_KEY_PROVIDERS: ApiKeyProvider[] = [
   "openai",
   "gemini",
   "openrouter",
+  "cursor",
 ];
 
 export function isApiKeyProvider(value: string): value is ApiKeyProvider {
@@ -73,6 +74,8 @@ export function providerLabel(provider: ApiKeyProvider): string {
       return "Google (Gemini)";
     case "openrouter":
       return "OpenRouter";
+    case "cursor":
+      return "Cursor";
   }
 }
 
@@ -83,5 +86,7 @@ export function lookLikeKey(provider: ApiKeyProvider, value: string): boolean {
   if (provider === "openai") return v.startsWith("sk-") || v.length > 40;
   if (provider === "openrouter") return v.startsWith("sk-or-") || v.length > 40;
   if (provider === "gemini") return v.length > 20;
+  // Cursor Cloud Agents / SDK keys (often crsr_…)
+  if (provider === "cursor") return v.startsWith("crsr_") || v.length >= 24;
   return false;
 }
