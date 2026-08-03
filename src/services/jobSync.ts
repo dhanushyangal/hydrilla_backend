@@ -1,11 +1,8 @@
 import { config } from "../config.js";
 import { logger } from "../logger.js";
-import { getJob, listJobs, updateJobStatus, updateJobResult } from "../repository/jobs.js";
+import { getJob, getJobsToSync, updateJobStatus, updateJobResult } from "../repository/jobs.js";
 import { JobStatus } from "../types.js";
 import { normalizeGlbUrl, normalizePreviewUrl } from "../utils/s3Urls.js";
-
-const GATEWAY_PRIMARY = config.hunyuanApi.url;
-const GATEWAY_ALTERNATIVE = config.hunyuanApi.urlAlternative || config.hunyuanApi.url;
 
 // Circuit breaker state to prevent continuous API calls when API is offline
 let circuitBreakerState = {
@@ -100,6 +97,16 @@ export async function syncJobFromApi(jobId: string): Promise<boolean> {
       logger.debug({ jobId }, "Job not found in database, skipping sync");
       return false;
     }
+
+    if (
+      dbJob.engine === "code_sculpt" ||
+      dbJob.engine === "water" ||
+      dbJob.generateType === "CodeSculpt" ||
+      dbJob.generateType === "Water" ||
+      dbJob.resultKind === "three_factory"
+    ) {
+      return true;
+    }
     
     // Skip syncing preview-only jobs (jobs with preview but no 3D result)
     // These jobs don't exist in Python API, they're only in our database
@@ -114,7 +121,15 @@ export async function syncJobFromApi(jobId: string): Promise<boolean> {
     const timeoutId = setTimeout(() => controller.abort(), 25000); // 25 second timeout
 
     const path = `/status/${jobId}`;
-    const urls = GATEWAY_ALTERNATIVE !== GATEWAY_PRIMARY ? [GATEWAY_PRIMARY, GATEWAY_ALTERNATIVE] : [GATEWAY_PRIMARY];
+    const isFluxJob =
+      dbJob.generateType === "TextToImage" ||
+      dbJob.generateType === "EditImage" ||
+      dbJob.generateType === "Combined";
+    const gateway = isFluxJob ? config.fluxGateway : config.trellisGateway;
+    const urls =
+      gateway.urlAlternative !== gateway.url
+        ? [gateway.url, gateway.urlAlternative]
+        : [gateway.url];
     let response: Response | null = null;
     let lastErr: unknown = null;
 
@@ -128,7 +143,7 @@ export async function syncJobFromApi(jobId: string): Promise<boolean> {
             break;
           }
           lastErr = new Error(`API returned ${res.status}`);
-          if (res.status >= 500 && baseUrl === GATEWAY_PRIMARY) {
+          if (res.status >= 500 && baseUrl === gateway.url) {
             logger.debug({ jobId, status: res.status }, "Primary gateway error, trying alternative");
             continue;
           }
@@ -136,7 +151,7 @@ export async function syncJobFromApi(jobId: string): Promise<boolean> {
           break;
         } catch (err) {
           lastErr = err;
-          if (baseUrl === GATEWAY_PRIMARY) {
+          if (baseUrl === gateway.url) {
             logger.debug({ jobId, err: (err as Error)?.message }, "Primary gateway failed, trying alternative");
             continue;
           }
@@ -298,8 +313,8 @@ export async function syncAllJobs(): Promise<{ synced: number; failed: number }>
       return { synced: 0, failed: 0 };
     }
 
-    // Get all jobs that are still processing
-    const jobs = await listJobs(1000); // Get up to 1000 jobs
+    // Repository filtering excludes Code Sculpt and other non-GPU jobs.
+    const jobs = await getJobsToSync();
     // Filter out preview-only jobs (they don't exist in Python API)
     const activeJobs = jobs.filter((job) => 
       (job.status === "WAIT" || job.status === "RUN") && 

@@ -68,6 +68,11 @@ export function normalizePreviewUrl(jobId: string, apiUrl: string | null | undef
     return getDirectS3PreviewImageUrl(jobId);
   }
 
+  // Client-captured Code Sculpt thumbnails (data URLs) must not be rewritten to S3.
+  if (apiUrl.startsWith("data:") || apiUrl.startsWith("blob:")) {
+    return apiUrl;
+  }
+
   const urlWithoutParams = apiUrl.split("?")[0];
 
   // If the URL points to our S3 bucket with known paths, return as-is (no query params)

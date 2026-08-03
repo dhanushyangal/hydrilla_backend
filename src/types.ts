@@ -9,7 +9,12 @@ export type GenerateType =
   | "TextTo3D"
   | "ImageTo3D"
   | "EditImage"
-  | "Combined";
+  | "Combined"
+  | "CodeSculpt"
+  | "Water";
+
+export type JobEngine = "trilles" | "hunyuan" | "code_sculpt" | "water";
+export type JobResultKind = "glb" | "three_factory";
 
 export interface CreateJobInput {
   prompt?: string;
@@ -38,6 +43,13 @@ export interface JobRecord {
   errorCode: string | null;
   errorMessage: string | null;
   creditsUsed: number;  // Credits consumed for this job (e.g. 10 for 3D, 0 for preview)
+  engine?: JobEngine | string | null;
+  resultKind?: JobResultKind | string | null;
+  llmModel?: string | null;
+  llmProvider?: string | null;
+  factoryCode?: string | null;
+  sculptPass?: string | null;
+  sculptSpec?: Record<string, unknown> | null;
   createdAt: Date;
   updatedAt: Date;
 }

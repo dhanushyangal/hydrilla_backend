@@ -239,7 +239,17 @@ export async function getJobsToSync(): Promise<JobRecord[]> {
 
     if (error) throw error;
     if (!data) return [];
-    return data.map(mapRow);
+    // Water jobs are LLM-backed — never poll the GPU gateway for them.
+    return data
+      .map(mapRow)
+      .filter(
+        (j) =>
+          j.engine !== "code_sculpt" &&
+          j.engine !== "water" &&
+          j.generateType !== "CodeSculpt" &&
+          j.generateType !== "Water" &&
+          j.resultKind !== "three_factory"
+      );
   } catch (err: any) {
     logger.error(err, "Failed to get jobs to sync from database");
     throw new Error(`Database error: ${err.message}`);
@@ -276,7 +286,11 @@ function mapRow(row: any): JobRecord {
     imageUrl = imageUrl.split('?')[0]; // Strip query params
   }
   if (previewImageUrl) {
-    previewImageUrl = normalizePreviewUrl(row.id, previewImageUrl);
+    if (String(previewImageUrl).startsWith("data:") || String(previewImageUrl).startsWith("blob:")) {
+      // keep Code Sculpt thumbnails
+    } else {
+      previewImageUrl = normalizePreviewUrl(row.id, previewImageUrl);
+    }
   }
   if (resultGlbUrl) {
     resultGlbUrl = normalizeGlbUrl(row.id, resultGlbUrl);
@@ -308,6 +322,13 @@ function mapRow(row: any): JobRecord {
     errorCode: row.error_code,
     errorMessage: row.error_message,
     creditsUsed: row.credits_used != null ? row.credits_used : 0,
+    engine: row.engine ?? "trilles",
+    resultKind: row.result_kind ?? "glb",
+    llmModel: row.llm_model ?? null,
+    llmProvider: row.llm_provider ?? null,
+    factoryCode: row.factory_code ?? null,
+    sculptPass: row.sculpt_pass ?? null,
+    sculptSpec: row.sculpt_spec ?? null,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };

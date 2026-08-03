@@ -2641,11 +2641,16 @@ threeDRouter.get("/workspaces/:workspaceId/jobs", requireAuth, requireApprovedAc
         resultGlbUrl = normalizeGlbUrl(row.id, resultGlbUrl);
       }
 
+      // Do not inline full factory_code here — it can be huge. Clients fetch
+      // it from GET /api/water/jobs/:id (legacy: /api/code-sculpt/jobs/:id).
+      const hasFactoryCode = Boolean(row.factory_code && String(row.factory_code).length > 0);
+
       return {
         id: row.id,
         userId: row.user_id || null,
         chatId: row.chat_id || null,
         workspaceId: row.workspace_id || null,
+        parentJobId: row.parent_job_id || null,
         status: row.status,
         prompt: row.prompt,
         imageUrl: imageUrl,
@@ -2655,6 +2660,14 @@ threeDRouter.get("/workspaces/:workspaceId/jobs", requireAuth, requireApprovedAc
         previewImageUrl: previewImageUrl,
         errorCode: row.error_code,
         errorMessage: row.error_message,
+        engine: row.engine ?? "trilles",
+        resultKind: row.result_kind ?? "glb",
+        llmModel: row.llm_model ?? null,
+        llmProvider: row.llm_provider ?? null,
+        sculptPass: row.sculpt_pass ?? null,
+        // Signal completion without shipping the full TypeScript payload
+        factoryCode: hasFactoryCode ? "__present__" : null,
+        hasFactoryCode,
         createdAt: row.created_at,
         updatedAt: row.updated_at,
       };

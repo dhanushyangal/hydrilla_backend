@@ -4,9 +4,17 @@ import { threeDRouter } from "../src/routes/threeD.js";
 import { paymentsRouter } from "../src/routes/payments.js";
 import { invitesRouter } from "../src/routes/invites.js";
 import { adminRouter } from "../src/routes/admin.js";
+import { userRouter } from "../src/routes/user.js";
+import { codeSculptRouter } from "../src/routes/codeSculpt.js";
 import { logger } from "../src/logger.js";
 import { initDb } from "../src/db.js";
 import pinoHttp from "pino-http";
+
+// Water can make up to four sequential LLM calls. Keep the HTTP response
+// fast; waitUntil owns this function for the full generation (up to 300s).
+export const config = {
+  maxDuration: 300,
+};
 
 // Initialize database connection
 let dbInitialized = false;
@@ -72,6 +80,11 @@ app.use("/api/admin", initDbMiddleware, adminRouter);
 
 // Payments routes
 app.use("/api/payments", initDbMiddleware, paymentsRouter);
+
+// BYOK keys + Water engine (legacy alias: /api/code-sculpt)
+app.use("/api/user", initDbMiddleware, userRouter);
+app.use("/api/water", initDbMiddleware, codeSculptRouter);
+app.use("/api/code-sculpt", initDbMiddleware, codeSculptRouter);
 
 // Error handler
 app.use((err: any, _req: any, res: any, _next: any) => {

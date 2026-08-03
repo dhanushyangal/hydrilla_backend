@@ -99,6 +99,9 @@ export const config = {
   inviteExpiryDays: parseInt(process.env.INVITE_EXPIRY_DAYS || "7", 10),
   frontendUrl: process.env.FRONTEND_URL || "https://hydrilla.co",
   databaseUrl: process.env.DATABASE_URL || "",
+  /** AES key material for BYOK API keys (scrypt). Set in Vercel env. */
+  userApiKeysEncryptionSecret:
+    process.env.USER_API_KEYS_ENCRYPTION_SECRET || "",
   dodoPayment: {
     apiKey: process.env.DODO_PAYMENT_API_KEY || "",
     mode: process.env.DODO_PAYMENT_MODE || "test",  // "test" or "live"
@@ -155,6 +158,12 @@ if (!config.dodoPayment.studioProductId) {
 
 if (!config.dodoPayment.returnUrl) {
   console.warn("[config] DODO_PAYMENTS_RETURN_URL is missing. Payment redirects will not work correctly.");
+}
+
+if (!config.userApiKeysEncryptionSecret) {
+  console.warn(
+    "[config] USER_API_KEYS_ENCRYPTION_SECRET is missing. BYOK / Water API key storage will fail until set."
+  );
 }
 
 const onVercel = process.env.VERCEL === "1" || !!process.env.VERCEL_ENV;
