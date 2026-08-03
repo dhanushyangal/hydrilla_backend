@@ -19,7 +19,7 @@ export type UserApiKeyMeta = {
 };
 
 export async function listUserApiKeyMeta(userId: string): Promise<UserApiKeyMeta[]> {
-  const providers: ApiKeyProvider[] = ["anthropic", "openai", "gemini", "openrouter"];
+  const providers: ApiKeyProvider[] = ["anthropic", "openai", "gemini", "openrouter", "cursor"];
   const { data, error } = await supabase
     .from("user_api_keys")
     .select("provider, last4, status, last_error, verified_at, updated_at")
@@ -156,11 +156,22 @@ export async function upsertUserModelPrefs(
   userId: string,
   prefs: { defaultMeshModel?: string; defaultCodeModel?: string | null }
 ): Promise<void> {
+  // Merge with existing row so omitting a field does not wipe it.
+  const current = await getUserModelPrefs(userId);
+  const mesh =
+    prefs.defaultMeshModel !== undefined
+      ? prefs.defaultMeshModel || "trilles"
+      : current.defaultMeshModel;
+  const code =
+    prefs.defaultCodeModel !== undefined
+      ? prefs.defaultCodeModel
+      : current.defaultCodeModel;
+
   const { error } = await supabase.from("user_model_prefs").upsert(
     {
       user_id: userId,
-      default_mesh_model: prefs.defaultMeshModel ?? "trilles",
-      default_code_model: prefs.defaultCodeModel ?? null,
+      default_mesh_model: mesh,
+      default_code_model: code,
       updated_at: new Date().toISOString(),
     },
     { onConflict: "user_id" }

@@ -72,7 +72,7 @@ export const MODEL_CATALOG: CatalogModel[] = [
     provider: "gemini",
     vision: true,
   },
-  // --- Cursor Cloud Agents (BYOK) — not chat-completions; uses /v1/agents ---
+  // --- Cursor Cloud Agents (BYOK) — live list from GET /v1/models; Auto omits model.id ---
   {
     id: "cursor-auto",
     label: "Cursor Auto",
@@ -80,15 +80,6 @@ export const MODEL_CATALOG: CatalogModel[] = [
     kind: "code",
     provider: "cursor",
     cursorModelId: null,
-    vision: true,
-  },
-  {
-    id: "cursor-composer-2",
-    label: "Composer 2",
-    group: "Cursor",
-    kind: "code",
-    provider: "cursor",
-    cursorModelId: "composer-2",
     vision: true,
   },
   // --- OpenRouter Free (BYOK, $0) ---
@@ -261,6 +252,166 @@ function hasVision(m: OpenRouterModelRow): boolean {
   return inputs.includes("image");
 }
 
+export type CursorModelParam = { id: string; value: string };
+
+export type CursorModelRow = {
+  /** Native Cursor model.id for Cloud Agents create */
+  id: string;
+  displayName: string;
+  /** True when this is the account/default auto router */
+  isAuto?: boolean;
+  /** Alternate ids that resolve to the same model */
+  aliases?: string[];
+  /** Default variant params from GET /v1/models (pass on create) */
+  defaultParams?: CursorModelParam[];
+};
+
+type CursorModelsCacheEntry = { at: number; rows: CursorModelRow[] };
+const cursorModelsCache = new Map<string, CursorModelsCacheEntry>();
+const CURSOR_MODELS_TTL_MS = 5 * 60 * 1000;
+
+function isCursorAutoNative(id: string): boolean {
+  const lower = id.toLowerCase();
+  return (
+    !id ||
+    lower === "default" ||
+    lower === "auto" ||
+    lower === "auto-smart" ||
+    lower.startsWith("auto-")
+  );
+}
+
+/**
+ * Live models from Cursor Cloud Agents API (requires user API key).
+ * Docs: https://cursor.com/docs/cloud-agent/api/endpoints#list-models
+ * Only ids from this list may be passed as model.id on Create Agent.
+ */
+export async function fetchCursorModels(apiKey: string): Promise<CursorModelRow[]> {
+  const cacheKey = apiKey.slice(-16);
+  const cached = cursorModelsCache.get(cacheKey);
+  if (cached && Date.now() - cached.at < CURSOR_MODELS_TTL_MS) {
+    return cached.rows;
+  }
+
+  const res = await fetch("https://api.cursor.com/v1/models", {
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      Accept: "application/json",
+    },
+  });
+  if (!res.ok) {
+    const body = await res.text().catch(() => "");
+    throw new Error(`Cursor models list failed (${res.status}): ${body.slice(0, 180)}`);
+  }
+  const json = (await res.json()) as {
+    items?: Array<{
+      id?: string;
+      displayName?: string;
+      name?: string;
+      aliases?: string[];
+      variants?: Array<{
+        displayName?: string;
+        isDefault?: boolean;
+        params?: Array<{ id?: string; value?: string }>;
+      }>;
+    }>;
+    models?: string[] | Array<{ id?: string; displayName?: string; name?: string }>;
+  };
+
+  const rows: CursorModelRow[] = [];
+  const seen = new Set<string>();
+
+  const push = (
+    id: string,
+    displayName?: string,
+    aliases?: string[],
+    defaultParams?: CursorModelParam[]
+  ) => {
+    const native = String(id || "").trim();
+    if (!native || seen.has(native)) return;
+    seen.add(native);
+    rows.push({
+      id: native,
+      displayName: (displayName || native).trim() || native,
+      isAuto: isCursorAutoNative(native),
+      aliases: aliases?.filter(Boolean),
+      defaultParams: defaultParams?.length ? defaultParams : undefined,
+    });
+  };
+
+  for (const item of json.items || []) {
+    if (!item?.id) continue;
+    const defVariant =
+      item.variants?.find((v) => v.isDefault) || item.variants?.[0];
+    const defaultParams = (defVariant?.params || [])
+      .filter((p): p is { id: string; value: string } => Boolean(p?.id && p.value != null))
+      .map((p) => ({ id: String(p.id), value: String(p.value) }));
+    push(item.id, item.displayName || item.name, item.aliases, defaultParams);
+  }
+  // v0-shaped fallback: { models: ["composer-2", ...] }
+  for (const m of json.models || []) {
+    if (typeof m === "string") push(m);
+    else if (m?.id) push(m.id, m.displayName || m.name);
+  }
+
+  rows.sort((a, b) => {
+    if (a.isAuto !== b.isAuto) return a.isAuto ? -1 : 1;
+    return a.displayName.localeCompare(b.displayName);
+  });
+  cursorModelsCache.set(cacheKey, { at: Date.now(), rows });
+  return rows;
+}
+
+/**
+ * Map a picker modelId → Cloud Agents `model` field.
+ * Only uses ids returned by GET /v1/models for this API key.
+ * Auto / unknown → omit model (account default).
+ */
+async function resolveCursorAgentModel(
+  apiKey: string,
+  modelId: string
+): Promise<{ id?: string; params?: CursorModelParam[] }> {
+  let requested = "";
+  if (modelId === "cursor-auto" || !modelId) {
+    requested = "";
+  } else if (modelId.startsWith("cursor/")) {
+    requested = modelId.slice("cursor/".length);
+  } else if (modelId === "cursor-composer-2") {
+    // Legacy curated id — resolve against live composer* if present
+    requested = "composer";
+  } else if (!modelId.startsWith("cursor-")) {
+    requested = modelId;
+  }
+
+  if (!requested || isCursorAutoNative(requested)) return {};
+
+  let models: CursorModelRow[] = [];
+  try {
+    models = await fetchCursorModels(apiKey);
+  } catch {
+    // If list fails, try the requested id bare (best effort)
+    return { id: requested === "composer" ? undefined : requested };
+  }
+
+  const matchExact = models.find(
+    (m) =>
+      !m.isAuto &&
+      (m.id === requested || (m.aliases || []).includes(requested))
+  );
+  if (matchExact) {
+    return { id: matchExact.id, params: matchExact.defaultParams };
+  }
+
+  // Soft-match legacy "composer" / composer-* against whatever the key exposes
+  if (requested === "composer" || requested.startsWith("composer-")) {
+    const composer = models.find((m) => !m.isAuto && /^composer/i.test(m.id));
+    if (composer) return { id: composer.id, params: composer.defaultParams };
+  }
+
+  // Not available for this key → account Auto
+  return {};
+}
+
 /** Public OpenRouter models list filtered to free chat models. */
 export async function fetchOpenRouterFreeModels(): Promise<FreeOpenRouterModel[]> {
   const res = await fetch("https://openrouter.ai/api/v1/models", {
@@ -387,30 +538,40 @@ export async function verifyProviderKey(
   }
 }
 
+/** Known native ids for first-party chat providers (pass through as selected). */
+const ANTHROPIC_IDS = new Set(["claude-sonnet-4-5", "claude-opus-4-5"]);
+const OPENAI_IDS = new Set(["gpt-4.1", "gpt-4.1-mini"]);
+const GEMINI_IDS = new Set(["gemini-2.5-flash", "gemini-2.5-pro"]);
+
 function resolveNativeModel(provider: ApiKeyProvider, modelId: string): string {
   if (provider === "anthropic") {
-    return modelId === "claude-opus-4-5" ? "claude-opus-4-5" : "claude-sonnet-4-5";
+    return ANTHROPIC_IDS.has(modelId) ? modelId : "claude-sonnet-4-5";
   }
   if (provider === "openai") {
-    return modelId === "gpt-4.1-mini" ? "gpt-4.1-mini" : "gpt-4.1";
+    return OPENAI_IDS.has(modelId) ? modelId : "gpt-4.1";
   }
   if (provider === "gemini") {
-    return modelId === "gemini-2.5-pro" ? "gemini-2.5-pro" : "gemini-2.5-flash";
+    return GEMINI_IDS.has(modelId) ? modelId : "gemini-2.5-flash";
   }
   if (provider === "cursor") {
-    const entry = catalogEntry(modelId);
-    if (entry?.cursorModelId) return entry.cursorModelId;
-    if (modelId.startsWith("cursor/")) return modelId.slice("cursor/".length);
-    if (modelId === "cursor-composer-2") return "composer-2";
-    return ""; // empty → omit model (Cursor account default / Auto)
+    // Native ids resolved at call time via GET /v1/models (resolveCursorAgentModel).
+    if (modelId === "cursor-auto" || modelId === "cursor-composer-2") return "";
+    if (modelId.startsWith("cursor/")) {
+      const native = modelId.slice("cursor/".length);
+      return isCursorAutoNative(native) ? "" : native;
+    }
+    return "";
   }
   return resolveOpenRouterSlug(modelId);
 }
 
 /**
  * Cursor Cloud Agents are not chat-completions. Water uses a no-repo agent run
- * and reads `run.result` (final assistant text). Docs:
- * https://cursor.com/docs/cloud-agent/api/endpoints
+ * and reads `run.result` (final assistant text).
+ * Docs: https://cursor.com/docs/cloud-agent/api/endpoints
+ *
+ * Model selection: GET /v1/models for this key → pass model.id (+ default variant params).
+ * Omit `model` for account Auto.
  */
 async function callCursorCloudAgent(params: {
   apiKey: string;
@@ -419,7 +580,7 @@ async function callCursorCloudAgent(params: {
   userText: string;
   imageUrl?: string | null;
 }): Promise<string> {
-  const native = resolveNativeModel("cursor", params.modelId);
+  let selection = await resolveCursorAgentModel(params.apiKey, params.modelId);
   const promptText = [
     params.system.trim(),
     "",
@@ -431,36 +592,52 @@ async function callCursorCloudAgent(params: {
     "Do not edit files or use tools. Reply with ONLY the requested output in your final message.",
   ].join("\n");
 
-  const body: Record<string, unknown> = {
-    prompt: {
-      text: promptText,
-      ...(params.imageUrl
-        ? { images: [{ url: params.imageUrl }] }
-        : {}),
-    },
-    name: "Hydrilla Water",
-    // Omit repos + env → no-repo agent (text-only generation).
-  };
-  if (native) {
-    body.model = {
-      id: native,
-      ...(native === "composer-2"
-        ? { params: [{ id: "fast", value: "true" }] }
-        : {}),
+  const buildBody = (sel: { id?: string; params?: CursorModelParam[] }): Record<string, unknown> => {
+    const body: Record<string, unknown> = {
+      prompt: {
+        text: promptText,
+        ...(params.imageUrl ? { images: [{ url: params.imageUrl }] } : {}),
+      },
+      name: "Hydrilla Water",
+      // Omit repos + env → no-repo agent (text-only generation).
     };
-  }
+    if (sel.id) {
+      body.model = {
+        id: sel.id,
+        ...(sel.params?.length ? { params: sel.params } : {}),
+      };
+    }
+    return body;
+  };
 
-  const createRes = await fetch("https://api.cursor.com/v1/agents", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${params.apiKey}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify(body),
-  });
+  const createAgent = async (sel: { id?: string; params?: CursorModelParam[] }) =>
+    fetch("https://api.cursor.com/v1/agents", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${params.apiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(buildBody(sel)),
+    });
+
+  let createRes = await createAgent(selection);
   if (!createRes.ok) {
     const errBody = await createRes.text().catch(() => "");
-    throw new Error(friendlyProviderError("cursor", createRes.status, errBody));
+    // Invalid / unavailable model → retry once with account Auto (omit model)
+    if (
+      createRes.status === 400 &&
+      selection.id &&
+      /invalid_model|not available|invalid/i.test(errBody)
+    ) {
+      selection = {};
+      createRes = await createAgent(selection);
+      if (!createRes.ok) {
+        const retryBody = await createRes.text().catch(() => "");
+        throw new Error(friendlyProviderError("cursor", createRes.status, retryBody || errBody));
+      }
+    } else {
+      throw new Error(friendlyProviderError("cursor", createRes.status, errBody));
+    }
   }
 
   const created = (await createRes.json()) as {

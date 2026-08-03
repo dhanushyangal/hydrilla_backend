@@ -13,6 +13,7 @@ import { createWorkspace, getWorkspace, getWorkspaceForUser, listWorkspacesForUs
 import { optionalAuth, requireAuth, requireApprovedAccess, syncUserToDatabase } from "../middleware/auth.js";
 import { getUserIsApproved, isAdminEmail } from "../services/accessControl.js";
 import { normalizeGlbUrl, normalizePreviewUrl } from "../utils/s3Urls.js";
+import { isWaterEngine, isWaterJobId, isWaterJobRow } from "../lib/engines.js";
 import { JobStatus, JobRecord, ChatRecord, WorkspaceRecord, GenerateType } from "../types.js";
 
 export const threeDRouter = Router();
@@ -963,6 +964,17 @@ threeDRouter.get("/status/:jobId", optionalAuth, async (req, res) => {
     // First, try to get job from database
     let job = await getJob(jobId);
 
+    // Water jobs are not GPU/mesh jobs — never treat them as GLB pipeline status.
+    if (job && (isWaterJobId(jobId) || isWaterJobRow(job as any))) {
+      if (userId && job.userId && job.userId !== userId) {
+        return res.status(403).json({ error: "You don't have permission to view this job" });
+      }
+      return res.status(400).json({
+        error: "water_job",
+        message: "This is a Water job. Use GET /api/water/jobs/:id instead of /api/3d/status.",
+      });
+    }
+
     // If job exists and is completed, return it immediately (no need to check external API)
     // Also return immediately for preview-only jobs (they don't exist in Python API)
     if (job && (job.status === "DONE" || job.status === "FAIL" || (job.previewImageUrl && !job.resultGlbUrl))) {
@@ -1403,6 +1415,12 @@ threeDRouter.get("/glb/:jobId", optionalAuth, async (req, res) => {
     // Check ownership
     if (userId && job.userId && job.userId !== userId) {
       return res.status(403).json({ error: "You don't have permission to view this job" });
+    }
+
+    if (isWaterJobId(jobId) || isWaterJobRow(job as any)) {
+      return res.status(404).json({
+        error: "Water jobs have no GLB mesh. Open via /api/water/jobs/:id (procedural Three.js).",
+      });
     }
 
     // Get GLB URL
@@ -2637,13 +2655,24 @@ threeDRouter.get("/workspaces/:workspaceId/jobs", requireAuth, requireApprovedAc
       if (previewImageUrl) {
         previewImageUrl = normalizePreviewUrl(row.id, previewImageUrl);
       }
-      if (resultGlbUrl) {
-        resultGlbUrl = normalizeGlbUrl(row.id, resultGlbUrl);
-      }
 
       // Do not inline full factory_code here — it can be huge. Clients fetch
       // it from GET /api/water/jobs/:id (legacy: /api/code-sculpt/jobs/:id).
       const hasFactoryCode = Boolean(row.factory_code && String(row.factory_code).length > 0);
+      const waterLike =
+        String(row.id || "").startsWith("wt_") ||
+        String(row.id || "").startsWith("cs_") ||
+        isWaterEngine(row.engine) ||
+        isWaterEngine(row.generate_type) ||
+        row.result_kind === "three_factory" ||
+        hasFactoryCode;
+
+      // Water jobs never have a mesh GLB — never expose a proxy URL that 404s.
+      if (waterLike) {
+        resultGlbUrl = null;
+      } else if (resultGlbUrl) {
+        resultGlbUrl = normalizeGlbUrl(row.id, resultGlbUrl);
+      }
 
       return {
         id: row.id,
@@ -2654,14 +2683,14 @@ threeDRouter.get("/workspaces/:workspaceId/jobs", requireAuth, requireApprovedAc
         status: row.status,
         prompt: row.prompt,
         imageUrl: imageUrl,
-        generateType: row.generate_type,
+        generateType: row.generate_type ?? (waterLike ? "Water" : null),
         enablePBR: row.enable_pbr,
         resultGlbUrl: resultGlbUrl,
         previewImageUrl: previewImageUrl,
         errorCode: row.error_code,
         errorMessage: row.error_message,
-        engine: row.engine ?? "trilles",
-        resultKind: row.result_kind ?? "glb",
+        engine: row.engine ?? (waterLike ? "water" : "trilles"),
+        resultKind: row.result_kind ?? (waterLike ? "three_factory" : "glb"),
         llmModel: row.llm_model ?? null,
         llmProvider: row.llm_provider ?? null,
         sculptPass: row.sculpt_pass ?? null,

@@ -280,6 +280,17 @@ function mapRow(row: any): JobRecord {
   let imageUrl = row.image_url;
   let previewImageUrl = row.preview_image_url;
   let resultGlbUrl = row.result_glb_url;
+
+  const id = String(row.id || "");
+  const waterLike =
+    id.startsWith("wt_") ||
+    id.startsWith("cs_") ||
+    row.engine === "water" ||
+    row.engine === "code_sculpt" ||
+    row.generate_type === "Water" ||
+    row.generate_type === "CodeSculpt" ||
+    row.result_kind === "three_factory" ||
+    Boolean(row.factory_code && String(row.factory_code).length > 0);
   
   // Normalize image URLs
   if (imageUrl && imageUrl.includes('amazonaws.com')) {
@@ -292,7 +303,10 @@ function mapRow(row: any): JobRecord {
       previewImageUrl = normalizePreviewUrl(row.id, previewImageUrl);
     }
   }
-  if (resultGlbUrl) {
+  // Water jobs never expose a mesh GLB proxy URL
+  if (waterLike) {
+    resultGlbUrl = null;
+  } else if (resultGlbUrl) {
     resultGlbUrl = normalizeGlbUrl(row.id, resultGlbUrl);
   }
 
@@ -315,15 +329,15 @@ function mapRow(row: any): JobRecord {
     prompt: row.prompt,
     imageUrl: imageUrl,
     sourceImages,
-    generateType: row.generate_type,
+    generateType: row.generate_type ?? (waterLike ? ("Water" as GenerateType) : row.generate_type),
     enablePBR: row.enable_pbr,
     resultGlbUrl: resultGlbUrl,
     previewImageUrl: previewImageUrl,
     errorCode: row.error_code,
     errorMessage: row.error_message,
     creditsUsed: row.credits_used != null ? row.credits_used : 0,
-    engine: row.engine ?? "trilles",
-    resultKind: row.result_kind ?? "glb",
+    engine: row.engine ?? (waterLike ? "water" : "trilles"),
+    resultKind: row.result_kind ?? (waterLike ? "three_factory" : "glb"),
     llmModel: row.llm_model ?? null,
     llmProvider: row.llm_provider ?? null,
     factoryCode: row.factory_code ?? null,

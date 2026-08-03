@@ -15,6 +15,7 @@ import {
   providerLabel,
 } from "../lib/userApiKeysCrypto.js";
 import {
+  fetchCursorModels,
   fetchOpenRouterFreeModels,
   fetchOpenRouterKeyInfo,
   verifyProviderKey,
@@ -22,6 +23,31 @@ import {
 import { logger } from "../logger.js";
 
 export const userRouter = Router();
+
+/**
+ * Live Cursor Cloud Agents models for the picker (requires a saved Cursor key).
+ * GET https://api.cursor.com/v1/models
+ */
+userRouter.get("/cursor/models", requireAuth, async (req, res) => {
+  try {
+    const userId = req.userId!;
+    const plaintext = await getDecryptedUserApiKey(userId, "cursor");
+    if (!plaintext) {
+      return res.status(404).json({ error: "No Cursor API key saved. Add one in Settings." });
+    }
+    const models = await fetchCursorModels(plaintext);
+    res.setHeader("Cache-Control", "private, max-age=300");
+    res.json({
+      models,
+      syncedAt: new Date().toISOString(),
+      note:
+        "From Cursor GET /v1/models for your key. Pass these ids as model.id on create; Auto omits model.",
+    });
+  } catch (err: any) {
+    logger.error({ err }, "GET /api/user/cursor/models failed");
+    res.status(502).json({ error: err?.message || "Failed to sync Cursor models" });
+  }
+});
 
 /** Live free-model catalog from OpenRouter (public list, auth optional for consistency). */
 userRouter.get("/openrouter/free-models", requireAuth, async (_req, res) => {
@@ -117,11 +143,17 @@ userRouter.put("/api-keys/:provider", requireAuth, async (req, res) => {
     });
   } catch (err: any) {
     logger.error({ err }, "PUT /api/user/api-keys failed");
-    res.status(500).json({
-      error: err?.message?.includes("USER_API_KEYS_ENCRYPTION_SECRET")
-        ? "Server missing USER_API_KEYS_ENCRYPTION_SECRET"
-        : "Failed to save API key",
-    });
+    const msg = String(err?.message || "");
+    let error = "Failed to save API key";
+    if (msg.includes("USER_API_KEYS_ENCRYPTION_SECRET")) {
+      error = "Server missing USER_API_KEYS_ENCRYPTION_SECRET";
+    } else if (msg.includes("user_api_keys_provider_check")) {
+      error =
+        "Database is missing the Cursor provider. Run sql/add_cursor_provider.sql in Supabase.";
+    } else if (msg) {
+      error = msg.slice(0, 240);
+    }
+    res.status(500).json({ error });
   }
 });
 

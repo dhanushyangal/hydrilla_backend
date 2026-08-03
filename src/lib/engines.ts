@@ -40,15 +40,32 @@ export function isHydrillaCloudEngine(value?: string | null): boolean {
   return v === "trilles" || v === "trellis" || v === "hunyuan" || v.includes("hunyuan");
 }
 
-/** True when GPU status polling should be skipped. */
+/** Water job ids: `wt_` (current) or legacy `cs_`. */
+export function isWaterJobId(id?: string | null): boolean {
+  if (!id) return false;
+  return id.startsWith("wt_") || id.startsWith("cs_");
+}
+
+/** True when GPU status polling / GLB proxy should be skipped. */
 export function isWaterJobRow(row: {
+  id?: string | null;
   engine?: string | null;
   generate_type?: string | null;
   generateType?: string | null;
+  result_kind?: string | null;
+  resultKind?: string | null;
+  factory_code?: string | null;
 }): boolean {
-  return (
+  if (isWaterJobId(row.id)) return true;
+  if (
     isWaterEngine(row.engine) ||
     isWaterEngine(row.generate_type) ||
     isWaterEngine(row.generateType)
-  );
+  ) {
+    return true;
+  }
+  const kind = row.result_kind || row.resultKind;
+  if (kind === "three_factory") return true;
+  if (row.factory_code && String(row.factory_code).length > 0) return true;
+  return false;
 }

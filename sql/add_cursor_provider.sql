@@ -1,5 +1,4 @@
--- Add Cursor as a BYOK provider on user_api_keys.
--- Run in Supabase SQL Editor after the base Water/BYOK migration.
+-- Allow Cursor as a BYOK provider (run once in Supabase SQL Editor).
 
 ALTER TABLE user_api_keys
   DROP CONSTRAINT IF EXISTS user_api_keys_provider_check;

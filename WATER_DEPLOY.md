@@ -37,7 +37,9 @@ S3_REGION
 
 `api/index.ts` mounts:
 
-- `/api/user` — API keys, model prefs, OpenRouter free sync  
+- `/api/user` — API keys, model prefs  
+  - `GET /api/user/openrouter/free-models` — live free catalog  
+  - `GET /api/user/cursor/models` — live Cloud Agents models (needs Cursor key)  
 - `/api/water` — Water generate / poll / thumbnail  
 - `/api/code-sculpt` — legacy alias (same router)  
 - existing `/api/3d`, payments, invites, admin  
@@ -49,8 +51,9 @@ S3_REGION
 | | Hydrilla cloud (Trilles) | Water |
 |---|---|---|
 | Input | Image (or text→image→3D) | Text; image optional |
-| Compute | Hydrilla GPU | User LLM key |
+| Compute | Hydrilla GPU | User LLM key (Claude / OpenAI / Gemini / OpenRouter / Cursor) |
 | Cost | Credits | 0 credits |
 | Output | GLB | Three.js factory |
 
+Water model architecture: frontend `docs/ENGINES.md`.  
 Do **not** call the cloud engine Aggregator.
