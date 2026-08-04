@@ -637,7 +637,10 @@ async function callCursorCloudAgent(params: {
   system: string;
   userText: string;
   imageUrl?: string | null;
+  timeoutMs?: number;
 }): Promise<LlmCallResult> {
+  const timeoutMs = params.timeoutMs ?? 210_000;
+  const signal = AbortSignal.timeout(timeoutMs);
   let selection = await resolveCursorAgentModel(params.apiKey, params.modelId);
   const promptText = [
     params.system.trim(),
@@ -671,6 +674,7 @@ async function callCursorCloudAgent(params: {
   const createAgent = async (sel: { id?: string; params?: CursorModelParam[] }) =>
     fetch("https://api.cursor.com/v1/agents", {
       method: "POST",
+      signal,
       headers: {
         Authorization: `Bearer ${params.apiKey}`,
         "Content-Type": "application/json",
@@ -709,7 +713,7 @@ async function callCursorCloudAgent(params: {
   }
 
   const terminal = new Set(["FINISHED", "ERROR", "CANCELLED", "EXPIRED"]);
-  const deadline = Date.now() + 240_000; // 4 minutes per LLM stage
+  const deadline = Date.now() + timeoutMs;
   let lastStatus = created.run?.status || "CREATING";
 
   const archiveAgent = () => {
@@ -722,6 +726,7 @@ async function callCursorCloudAgent(params: {
   while (Date.now() < deadline) {
     await new Promise((r) => setTimeout(r, 2000));
     const runRes = await fetch(`https://api.cursor.com/v1/agents/${agentId}/runs/${runId}`, {
+      signal,
       headers: { Authorization: `Bearer ${params.apiKey}` },
     });
     if (!runRes.ok) {
@@ -823,10 +828,16 @@ export async function callLLM(params: {
   userText: string;
   imageUrl?: string | null;
   maxTokens?: number;
+  /** Hard cap per provider call so one pass cannot strand a Water job forever. */
+  timeoutMs?: number;
 }): Promise<LlmCallResult> {
   const { provider, apiKey, system, userText } = params;
   const imageUrl = params.imageUrl || null;
   const maxTokens = params.maxTokens ?? 8192;
+  // Cursor Cloud Agents commonly need 2–4 min; 75s default aborted Studio runs into fallback.
+  const timeoutMs =
+    params.timeoutMs ?? (provider === "cursor" ? 210_000 : 75_000);
+  const signal = AbortSignal.timeout(timeoutMs);
   const model = resolveNativeModel(provider, params.modelId);
 
   if (provider === "cursor") {
@@ -836,6 +847,7 @@ export async function callLLM(params: {
       system,
       userText,
       imageUrl,
+      timeoutMs,
     });
   }
 
@@ -846,6 +858,7 @@ export async function callLLM(params: {
 
     const res = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
+      signal,
       headers: {
         "content-type": "application/json",
         "x-api-key": apiKey,
@@ -886,6 +899,7 @@ export async function callLLM(params: {
 
     const res = await fetch(`${base}/chat/completions`, {
       method: "POST",
+      signal,
       headers: {
         "content-type": "application/json",
         Authorization: `Bearer ${apiKey}`,
@@ -946,6 +960,7 @@ export async function callLLM(params: {
   };
   const res = await fetch(url, {
     method: "POST",
+    signal,
     headers: { "content-type": "application/json" },
     body: JSON.stringify(body),
   });
@@ -953,6 +968,7 @@ export async function callLLM(params: {
     // Gemini fileUri needs Files-API URIs; retry text-only with a described reference.
     const res2 = await fetch(url, {
       method: "POST",
+      signal,
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
         systemInstruction: { parts: [{ text: system }] },

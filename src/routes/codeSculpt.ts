@@ -10,7 +10,12 @@ import {
   providerForModel,
   hasReportedTokenUsage,
 } from "../lib/llmProviders.js";
-import { intakeGate, runCodeSculptPipeline } from "../lib/codeSculptPipeline.js";
+import { intakeGate } from "../lib/codeSculptPipeline.js";
+import { runStudioPipeline } from "../lib/water/harness/run.js";
+import {
+  parseQualityTier,
+  parseWaterSkillId,
+} from "../lib/waterSkills.js";
 import { ENGINE } from "../lib/engines.js";
 import { supabase } from "../db.js";
 import { logger } from "../logger.js";
@@ -65,6 +70,8 @@ codeSculptRouter.post("/generate", requireAuth, async (req, res) => {
     const prompt = req.body?.prompt ? String(req.body.prompt).trim() : "";
     const workspaceId = req.body?.workspaceId || null;
     const parentJobId = req.body?.parentJobId || null;
+    const skillId = parseWaterSkillId(req.body?.skillId);
+    const qualityTier = parseQualityTier(req.body?.qualityTier);
 
     const intake = intakeGate({ prompt, imageUrl });
     if (!intake.ok) {
@@ -159,12 +166,14 @@ codeSculptRouter.post("/generate", requireAuth, async (req, res) => {
     // after the response; locally the normal Node process owns the task.
     const generationTask = (async () => {
       try {
-        const result = await runCodeSculptPipeline({
+        const result = await runStudioPipeline({
           provider: provider as ApiKeyProvider,
           modelId,
           apiKey,
           prompt,
           imageUrl,
+          skillId,
+          qualityTier,
           onPass: async (pass) => {
             await supabase.from("jobs").update({ sculpt_pass: pass }).eq("id", jobId);
           },
@@ -176,19 +185,33 @@ codeSculptRouter.post("/generate", requireAuth, async (req, res) => {
             status: "FAIL",
             errorCode: "empty_factory",
             errorMessage:
-              "Model returned no usable code. Try a stronger model (Auto Free routes to a capable one).",
+              "The model did not return usable Three.js code. Try another Water model, or rephrase the prompt.",
           });
           return;
         }
 
+        const lastPass =
+          result.completedPasses[result.completedPasses.length - 1] || "blockout";
+
         await updateCodeSculptResult(jobId, {
           status: "DONE",
           factoryCode,
-          sculptPass: "blockout",
+          sculptPass: result.partial ? "partial" : lastPass,
           sculptSpec: {
             modelId,
             provider,
-            pass: "blockout",
+            skillId: result.skillId,
+            qualityTier: result.qualityTier,
+            pass: lastPass,
+            completedPasses: result.completedPasses,
+            passReviews: result.passReviews,
+            partial: result.partial,
+            usedFallback: Boolean(
+              result.partial &&
+                (result.spec as { qualityContract?: { notes?: string } })?.qualityContract?.notes?.includes(
+                  "[fallback-factory]"
+                )
+            ),
             mode: imageUrl ? "image_to_code" : "text_to_code",
             refined: result.refined,
             specGate: result.specGate,
@@ -210,7 +233,7 @@ codeSculptRouter.post("/generate", requireAuth, async (req, res) => {
             : null,
         });
       } catch (err: any) {
-        logger.error({ err, jobId }, "Code Sculpt generation failed");
+        logger.error({ err, jobId }, "Water Studio generation failed");
         try {
           await updateJobStatus(jobId, {
             status: "FAIL",
@@ -231,6 +254,8 @@ codeSculptRouter.post("/generate", requireAuth, async (req, res) => {
       jobId,
       status: "RUN",
       engine: "water",
+      skillId,
+      qualityTier,
       mode: imageUrl ? "image_to_code" : "text_to_code",
     });
   } catch (err: any) {
@@ -259,16 +284,35 @@ codeSculptRouter.get("/jobs/:jobId", requireAuth, async (req, res) => {
         ? (data.sculpt_spec as { tokenUsage?: { inputTokens?: number; outputTokens?: number; totalTokens?: number } })
             .tokenUsage
         : null;
+    const dbStatus = (data?.status || job.status) as string;
+    const updatedAtMs = Date.parse(data?.updated_at || job.updatedAt || "");
+    const isStaleRun =
+      (dbStatus === "RUN" || dbStatus === "WAIT") &&
+      Number.isFinite(updatedAtMs) &&
+      Date.now() - updatedAtMs > 8 * 60 * 1000;
+    if (isStaleRun) {
+      await updateCodeSculptResult(jobId, {
+        status: "FAIL",
+        sculptPass: data?.sculpt_pass || "blockout",
+        errorCode: "water_timeout",
+        errorMessage:
+          "The Water provider stopped responding and the job expired. Retry with Fast/Standard or another model.",
+      }).catch((error) => {
+        logger.warn({ error, jobId }, "Failed to expire stale Water job");
+      });
+    }
 
     res.json({
       job: {
         id: job.id,
-        status: job.status,
+        status: isStaleRun ? "FAIL" : job.status,
         prompt: job.prompt,
         imageUrl: job.imageUrl,
         previewImageUrl: job.previewImageUrl ?? data?.preview_image_url ?? null,
-        errorCode: job.errorCode,
-        errorMessage: job.errorMessage,
+        errorCode: isStaleRun ? "water_timeout" : job.errorCode,
+        errorMessage: isStaleRun
+          ? "The Water provider stopped responding and the job expired. Retry with Fast/Standard or another model."
+          : job.errorMessage,
         engine: data?.engine || "water",
         resultKind: data?.result_kind || "three_factory",
         llmModel: data?.llm_model || null,

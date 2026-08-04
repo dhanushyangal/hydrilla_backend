@@ -471,6 +471,10 @@ Generate the blockout pass factory now. TypeScript only.${fixBlock}`;
 // Orchestrator
 // ---------------------------------------------------------------------------
 
+/**
+ * @deprecated Prefer runStudioPipeline from water/harness/run.ts (multi-pass Studio).
+ * Kept for Fast-tier parity tests and legacy imports.
+ */
 export async function runCodeSculptPipeline(params: {
   provider: ApiKeyProvider;
   modelId: string;
