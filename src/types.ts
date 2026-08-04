@@ -21,7 +21,6 @@ export interface CreateJobInput {
   imageUrl?: string;
   imageBase64?: string;
   multiViewImages?: Array<{ viewType: "left" | "right" | "back"; viewImageUrl: string }>;
-  enablePBR?: boolean;
   generateType?: GenerateType;
 }
 
@@ -37,7 +36,7 @@ export interface JobRecord {
   imageUrl: string | null;
   sourceImages: string[] | null; // Actual source image URLs used as input (e.g. 2 URLs for combined edit)
   generateType: GenerateType;
-  enablePBR: boolean;
+  enablePBR: boolean; // legacy field; always true (column dropped)
   resultGlbUrl: string | null;
   previewImageUrl: string | null;
   errorCode: string | null;
@@ -78,17 +77,4 @@ export interface UserRecord {
   imageUrl: string | null;
   createdAt: Date;
   updatedAt: Date;
-}
-
-export interface AssetRecord {
-  id: string;
-  userId: string;
-  jobId: string | null;
-  type: "model" | "image" | "preview";
-  name: string | null;
-  fileUrl: string;
-  fileSize: number | null;
-  mimeType: string | null;
-  metadata: Record<string, unknown> | null;
-  createdAt: Date;
 }

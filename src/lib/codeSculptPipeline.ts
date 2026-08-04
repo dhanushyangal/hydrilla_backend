@@ -9,7 +9,7 @@
  * Model calls: 2 on the happy path, 3 when the code gate rejects once.
  */
 
-import { callLLM } from "./llmProviders.js";
+import { addTokenUsage, callLLM, emptyTokenUsage, type LlmTokenUsage } from "./llmProviders.js";
 import type { ApiKeyProvider } from "./userApiKeysCrypto.js";
 
 export type SculptPass =
@@ -42,6 +42,13 @@ export type SculptSpec = {
   scale?: { unit?: string; approxHeight?: number };
 };
 
+export type TokenPassBreakdown = {
+  pass: string;
+  inputTokens: number;
+  outputTokens: number;
+  totalTokens: number;
+};
+
 export type PipelineResult = {
   factoryCode: string;
   spec: SculptSpec;
@@ -49,6 +56,8 @@ export type PipelineResult = {
   specGate: GateResult;
   codeGate: GateResult;
   refined: boolean;
+  tokenUsage: LlmTokenUsage;
+  tokenPasses: TokenPassBreakdown[];
 };
 
 export type GateResult = { ok: boolean; violations: string[] };
@@ -194,7 +203,13 @@ export async function buildSculptSpec(params: {
   apiKey: string;
   prompt: string;
   imageUrl?: string | null;
-}): Promise<{ spec: SculptSpec; gate: GateResult; usedFallback: boolean }> {
+}): Promise<{
+  spec: SculptSpec;
+  gate: GateResult;
+  usedFallback: boolean;
+  tokenUsage: LlmTokenUsage;
+  tokenPasses: TokenPassBreakdown[];
+}> {
   const subject = params.imageUrl
     ? `Reference image attached. User note: ${params.prompt || "(none)"}`
     : `Subject described by the user: "${params.prompt}"`;
@@ -203,9 +218,12 @@ export async function buildSculptSpec(params: {
 
 Plan the procedural reconstruction. Return the JSON spec only.`;
 
+  let usage = emptyTokenUsage();
+  const tokenPasses: TokenPassBreakdown[] = [];
+
   let spec: SculptSpec | null = null;
   try {
-    const text = await callLLM({
+    const result = await callLLM({
       provider: params.provider,
       modelId: params.modelId,
       apiKey: params.apiKey,
@@ -214,23 +232,32 @@ Plan the procedural reconstruction. Return the JSON spec only.`;
       imageUrl: params.imageUrl,
       maxTokens: 4096,
     });
-    spec = extractJson(text) as SculptSpec;
+    usage = addTokenUsage(usage, result.usage);
+    if (result.usage) {
+      tokenPasses.push({
+        pass: "assessment",
+        inputTokens: result.usage.inputTokens,
+        outputTokens: result.usage.outputTokens,
+        totalTokens: result.usage.totalTokens,
+      });
+    }
+    spec = extractJson(result.text) as SculptSpec;
   } catch {
     spec = null;
   }
 
   if (!spec) {
     const fb = fallbackSpec(params.prompt);
-    return { spec: fb, gate: validateSculptSpec(fb), usedFallback: true };
+    return { spec: fb, gate: validateSculptSpec(fb), usedFallback: true, tokenUsage: usage, tokenPasses };
   }
 
   let gate = validateSculptSpec(spec);
-  if (gate.ok) return { spec, gate, usedFallback: false };
+  if (gate.ok) return { spec, gate, usedFallback: false, tokenUsage: usage, tokenPasses };
 
   // One bounded repair pass. The model gets deterministic violations instead
   // of being asked to vaguely "improve" the spec.
   try {
-    const repairedText = await callLLM({
+    const repairedResult = await callLLM({
       provider: params.provider,
       modelId: params.modelId,
       apiKey: params.apiKey,
@@ -243,10 +270,19 @@ Fix every violation and return the complete JSON spec only:
       imageUrl: params.imageUrl,
       maxTokens: 4096,
     });
-    const repaired = extractJson(repairedText) as SculptSpec;
+    usage = addTokenUsage(usage, repairedResult.usage);
+    if (repairedResult.usage) {
+      tokenPasses.push({
+        pass: "spec_repair",
+        inputTokens: repairedResult.usage.inputTokens,
+        outputTokens: repairedResult.usage.outputTokens,
+        totalTokens: repairedResult.usage.totalTokens,
+      });
+    }
+    const repaired = extractJson(repairedResult.text) as SculptSpec;
     const repairedGate = validateSculptSpec(repaired);
     if (repairedGate.ok) {
-      return { spec: repaired, gate: repairedGate, usedFallback: false };
+      return { spec: repaired, gate: repairedGate, usedFallback: false, tokenUsage: usage, tokenPasses };
     }
   } catch {
     // Fall through to a deterministic valid scaffold.
@@ -254,7 +290,7 @@ Fix every violation and return the complete JSON spec only:
 
   const fb = fallbackSpec(params.prompt);
   gate = validateSculptSpec(fb);
-  return { spec: fb, gate, usedFallback: true };
+  return { spec: fb, gate, usedFallback: true, tokenUsage: usage, tokenPasses };
 }
 
 // ---------------------------------------------------------------------------
@@ -405,7 +441,7 @@ async function generateBlockout(params: {
   prompt: string;
   imageUrl?: string | null;
   violations?: string[];
-}): Promise<string> {
+}): Promise<{ code: string; usage: LlmTokenUsage | null }> {
   const fixBlock = params.violations?.length
     ? `\n\nThe previous attempt was rejected by the build gate. Fix ALL of these and return the full corrected module:\n- ${params.violations.join(
         "\n- "
@@ -419,7 +455,7 @@ ${JSON.stringify(params.spec, null, 2)}
 
 Generate the blockout pass factory now. TypeScript only.${fixBlock}`;
 
-  const text = await callLLM({
+  const result = await callLLM({
     provider: params.provider,
     modelId: params.modelId,
     apiKey: params.apiKey,
@@ -428,7 +464,7 @@ Generate the blockout pass factory now. TypeScript only.${fixBlock}`;
     imageUrl: params.imageUrl,
     maxTokens: 8192,
   });
-  return extractCode(text);
+  return { code: extractCode(result.text), usage: result.usage };
 }
 
 // ---------------------------------------------------------------------------
@@ -452,7 +488,12 @@ export async function runCodeSculptPipeline(params: {
   };
 
   await note("assessment");
-  const { spec, gate: specGate } = await buildSculptSpec({
+  const {
+    spec,
+    gate: specGate,
+    tokenUsage: specUsage,
+    tokenPasses: specPasses,
+  } = await buildSculptSpec({
     provider: params.provider,
     modelId: params.modelId,
     apiKey: params.apiKey,
@@ -460,9 +501,12 @@ export async function runCodeSculptPipeline(params: {
     imageUrl: params.imageUrl,
   });
 
+  let tokenUsage = specUsage;
+  const tokenPasses = [...specPasses];
+
   await note("spec");
   await note("blockout");
-  let factoryCode = await generateBlockout({
+  const blockout = await generateBlockout({
     provider: params.provider,
     modelId: params.modelId,
     apiKey: params.apiKey,
@@ -470,6 +514,16 @@ export async function runCodeSculptPipeline(params: {
     prompt: params.prompt,
     imageUrl: params.imageUrl,
   });
+  let factoryCode = blockout.code;
+  tokenUsage = addTokenUsage(tokenUsage, blockout.usage);
+  if (blockout.usage) {
+    tokenPasses.push({
+      pass: "blockout",
+      inputTokens: blockout.usage.inputTokens,
+      outputTokens: blockout.usage.outputTokens,
+      totalTokens: blockout.usage.totalTokens,
+    });
+  }
 
   await note("review");
   let codeGate = validateFactoryCode(factoryCode, spec);
@@ -486,10 +540,19 @@ export async function runCodeSculptPipeline(params: {
       imageUrl: params.imageUrl,
       violations: codeGate.violations,
     });
-    const retryGate = validateFactoryCode(retry, spec);
+    tokenUsage = addTokenUsage(tokenUsage, retry.usage);
+    if (retry.usage) {
+      tokenPasses.push({
+        pass: "blockout_refine",
+        inputTokens: retry.usage.inputTokens,
+        outputTokens: retry.usage.outputTokens,
+        totalTokens: retry.usage.totalTokens,
+      });
+    }
+    const retryGate = validateFactoryCode(retry.code, spec);
     // Keep the better of the two attempts.
     if (retryGate.violations.length <= codeGate.violations.length) {
-      factoryCode = retry;
+      factoryCode = retry.code;
       codeGate = retryGate;
     }
   }
@@ -506,5 +569,14 @@ export async function runCodeSculptPipeline(params: {
   }
 
   await note("done");
-  return { factoryCode, spec, pass: "blockout", specGate, codeGate, refined };
+  return {
+    factoryCode,
+    spec,
+    pass: "blockout",
+    specGate,
+    codeGate,
+    refined,
+    tokenUsage,
+    tokenPasses,
+  };
 }

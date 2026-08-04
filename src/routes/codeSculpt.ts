@@ -1,13 +1,14 @@
 import { Router } from "express";
 import { randomUUID } from "crypto";
 import { waitUntil } from "@vercel/functions";
-import { requireAuth, requireApprovedAccess, syncUserToDatabase } from "../middleware/auth.js";
+import { requireAuth, syncUserToDatabase } from "../middleware/auth.js";
 import { createJob, getJobForUser, updateJobStatus } from "../repository/jobs.js";
 import { getDecryptedUserApiKey, listUserApiKeyMeta } from "../repository/userApiKeys.js";
 import {
   catalogEntry,
   isOpenRouterModelId,
   providerForModel,
+  hasReportedTokenUsage,
 } from "../lib/llmProviders.js";
 import { intakeGate, runCodeSculptPipeline } from "../lib/codeSculptPipeline.js";
 import { ENGINE } from "../lib/engines.js";
@@ -30,6 +31,9 @@ async function updateCodeSculptResult(
     errorCode?: string | null;
     errorMessage?: string | null;
     previewImageUrl?: string | null;
+    llmInputTokens?: number | null;
+    llmOutputTokens?: number | null;
+    llmTotalTokens?: number | null;
   }
 ) {
   const patch: Record<string, unknown> = {
@@ -42,12 +46,15 @@ async function updateCodeSculptResult(
   if (data.errorCode !== undefined) patch.error_code = data.errorCode;
   if (data.errorMessage !== undefined) patch.error_message = data.errorMessage;
   if (data.previewImageUrl !== undefined) patch.preview_image_url = data.previewImageUrl;
+  if (data.llmInputTokens !== undefined) patch.llm_input_tokens = data.llmInputTokens;
+  if (data.llmOutputTokens !== undefined) patch.llm_output_tokens = data.llmOutputTokens;
+  if (data.llmTotalTokens !== undefined) patch.llm_total_tokens = data.llmTotalTokens;
 
   const { error } = await supabase.from("jobs").update(patch).eq("id", jobId);
   if (error) throw error;
 }
 
-codeSculptRouter.post("/generate", requireAuth, requireApprovedAccess, async (req, res) => {
+codeSculptRouter.post("/generate", requireAuth, async (req, res) => {
   try {
     const userId = req.userId!;
     await syncUserToDatabase(userId);
@@ -120,7 +127,6 @@ codeSculptRouter.post("/generate", requireAuth, requireApprovedAccess, async (re
         imageUrl,
         sourceImages: imageUrl ? [imageUrl] : null,
         generateType: ENGINE.water.writeGenerateType as any,
-        enablePBR: true,
         status: "RUN",
         creditsUsed: 0,
       });
@@ -188,9 +194,20 @@ codeSculptRouter.post("/generate", requireAuth, requireApprovedAccess, async (re
             specGate: result.specGate,
             codeGate: result.codeGate,
             spec: result.spec,
+            tokenUsage: hasReportedTokenUsage(result.tokenUsage) ? result.tokenUsage : null,
+            tokenPasses: result.tokenPasses,
             createdAt: new Date().toISOString(),
           },
           previewImageUrl: imageUrl,
+          llmInputTokens: hasReportedTokenUsage(result.tokenUsage)
+            ? result.tokenUsage.inputTokens
+            : null,
+          llmOutputTokens: hasReportedTokenUsage(result.tokenUsage)
+            ? result.tokenUsage.outputTokens
+            : null,
+          llmTotalTokens: hasReportedTokenUsage(result.tokenUsage)
+            ? result.tokenUsage.totalTokens
+            : null,
         });
       } catch (err: any) {
         logger.error({ err, jobId }, "Code Sculpt generation failed");
@@ -232,10 +249,16 @@ codeSculptRouter.get("/jobs/:jobId", requireAuth, async (req, res) => {
     const { data } = await supabase
       .from("jobs")
       .select(
-        "id, status, engine, result_kind, llm_model, llm_provider, factory_code, sculpt_pass, sculpt_spec, preview_image_url, image_url, error_code, error_message, prompt, created_at, updated_at"
+        "id, status, engine, result_kind, llm_model, llm_provider, factory_code, sculpt_pass, sculpt_spec, preview_image_url, image_url, error_code, error_message, prompt, created_at, updated_at, llm_input_tokens, llm_output_tokens, llm_total_tokens"
       )
       .eq("id", jobId)
       .maybeSingle();
+
+    const tokenFromSpec =
+      data?.sculpt_spec && typeof data.sculpt_spec === "object"
+        ? (data.sculpt_spec as { tokenUsage?: { inputTokens?: number; outputTokens?: number; totalTokens?: number } })
+            .tokenUsage
+        : null;
 
     res.json({
       job: {
@@ -253,6 +276,9 @@ codeSculptRouter.get("/jobs/:jobId", requireAuth, async (req, res) => {
         factoryCode: data?.factory_code || null,
         sculptPass: data?.sculpt_pass || null,
         sculptSpec: data?.sculpt_spec || null,
+        llmInputTokens: data?.llm_input_tokens ?? tokenFromSpec?.inputTokens ?? null,
+        llmOutputTokens: data?.llm_output_tokens ?? tokenFromSpec?.outputTokens ?? null,
+        llmTotalTokens: data?.llm_total_tokens ?? tokenFromSpec?.totalTokens ?? null,
         createdAt: job.createdAt,
         updatedAt: job.updatedAt,
       },
@@ -260,6 +286,50 @@ codeSculptRouter.get("/jobs/:jobId", requireAuth, async (req, res) => {
   } catch (err: any) {
     logger.error({ err }, "GET code-sculpt job failed");
     res.status(500).json({ error: "Failed to load job" });
+  }
+});
+
+/** List Water jobs with LLM token usage for the signed-in user. */
+codeSculptRouter.get("/usage", requireAuth, async (req, res) => {
+  try {
+    const userId = req.userId!;
+    const limit = Math.min(Math.max(parseInt(String(req.query.limit || "100"), 10) || 100, 1), 200);
+
+    const { data, error } = await supabase
+      .from("jobs")
+      .select(
+        "id, prompt, status, llm_model, llm_provider, llm_input_tokens, llm_output_tokens, llm_total_tokens, sculpt_spec, created_at, engine"
+      )
+      .eq("user_id", userId)
+      .or("engine.eq.water,engine.eq.code_sculpt,id.like.wt_%,id.like.cs_%")
+      .order("created_at", { ascending: false })
+      .limit(limit);
+
+    if (error) throw error;
+
+    const jobs = (data || []).map((row: any) => {
+      const fromSpec =
+        row.sculpt_spec && typeof row.sculpt_spec === "object"
+          ? (row.sculpt_spec as { tokenUsage?: { inputTokens?: number; outputTokens?: number; totalTokens?: number } })
+              .tokenUsage
+          : null;
+      return {
+        id: row.id,
+        prompt: row.prompt,
+        status: row.status,
+        model: row.llm_model || null,
+        provider: row.llm_provider || null,
+        inputTokens: row.llm_input_tokens ?? fromSpec?.inputTokens ?? null,
+        outputTokens: row.llm_output_tokens ?? fromSpec?.outputTokens ?? null,
+        totalTokens: row.llm_total_tokens ?? fromSpec?.totalTokens ?? null,
+        createdAt: row.created_at,
+      };
+    });
+
+    res.json({ jobs });
+  } catch (err: any) {
+    logger.error({ err }, "GET /api/water/usage failed");
+    res.status(500).json({ error: err?.message || "Failed to load Water usage" });
   }
 });
 

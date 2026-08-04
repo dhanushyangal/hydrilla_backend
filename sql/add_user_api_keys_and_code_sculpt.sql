@@ -92,8 +92,7 @@ ALTER TABLE jobs
   ADD COLUMN IF NOT EXISTS llm_provider TEXT,
   ADD COLUMN IF NOT EXISTS factory_code TEXT,
   ADD COLUMN IF NOT EXISTS sculpt_spec JSONB,
-  ADD COLUMN IF NOT EXISTS sculpt_pass TEXT,
-  ADD COLUMN IF NOT EXISTS comparison_sheet_url TEXT;
+  ADD COLUMN IF NOT EXISTS sculpt_pass TEXT;
 
 -- Backfill only nulls — never overwrite existing values.
 UPDATE jobs SET engine = 'trilles' WHERE engine IS NULL;

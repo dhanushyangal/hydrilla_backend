@@ -573,13 +573,71 @@ function resolveNativeModel(provider: ApiKeyProvider, modelId: string): string {
  * Model selection: GET /v1/models for this key → pass model.id (+ default variant params).
  * Omit `model` for account Auto.
  */
+/**
+ * Cursor Cloud Agents expose metering at GET /v1/agents/{id}/usage.
+ * Usage can lag a moment after FINISHED — retry a few times.
+ */
+async function fetchCursorRunUsage(
+  apiKey: string,
+  agentId: string,
+  runId: string
+): Promise<LlmTokenUsage | null> {
+  for (let attempt = 0; attempt < 4; attempt++) {
+    if (attempt > 0) await new Promise((r) => setTimeout(r, 1200));
+    try {
+      const url = `https://api.cursor.com/v1/agents/${encodeURIComponent(agentId)}/usage?runId=${encodeURIComponent(runId)}`;
+      const res = await fetch(url, {
+        headers: { Authorization: `Bearer ${apiKey}` },
+      });
+      if (!res.ok) continue;
+      const data = (await res.json()) as {
+        totalUsage?: {
+          inputTokens?: number;
+          outputTokens?: number;
+          totalTokens?: number;
+        };
+        runs?: Array<{
+          id?: string;
+          usage?: {
+            inputTokens?: number;
+            outputTokens?: number;
+            totalTokens?: number;
+          };
+        }>;
+      };
+      const raw =
+        data.runs?.find((r) => r.id === runId)?.usage ||
+        data.runs?.[0]?.usage ||
+        data.totalUsage;
+      if (!raw) continue;
+      const fromCounts = usageFromCounts(raw.inputTokens ?? 0, raw.outputTokens ?? 0);
+      if (fromCounts) {
+        if (raw.totalTokens && raw.totalTokens > fromCounts.totalTokens) {
+          fromCounts.totalTokens = Math.floor(raw.totalTokens);
+        }
+        return fromCounts;
+      }
+      if (raw.totalTokens && raw.totalTokens > 0) {
+        return {
+          inputTokens: Math.max(0, Math.floor(raw.inputTokens || 0)),
+          outputTokens: Math.max(0, Math.floor(raw.outputTokens || 0)),
+          totalTokens: Math.floor(raw.totalTokens),
+        };
+      }
+    } catch {
+      // keep trying
+    }
+  }
+  return null;
+}
+
 async function callCursorCloudAgent(params: {
   apiKey: string;
   modelId: string;
   system: string;
   userText: string;
   imageUrl?: string | null;
-}): Promise<string> {
+}): Promise<LlmCallResult> {
   let selection = await resolveCursorAgentModel(params.apiKey, params.modelId);
   const promptText = [
     params.system.trim(),
@@ -654,6 +712,13 @@ async function callCursorCloudAgent(params: {
   const deadline = Date.now() + 240_000; // 4 minutes per LLM stage
   let lastStatus = created.run?.status || "CREATING";
 
+  const archiveAgent = () => {
+    void fetch(`https://api.cursor.com/v1/agents/${agentId}/archive`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${params.apiKey}` },
+    }).catch(() => {});
+  };
+
   while (Date.now() < deadline) {
     await new Promise((r) => setTimeout(r, 2000));
     const runRes = await fetch(`https://api.cursor.com/v1/agents/${agentId}/runs/${runId}`, {
@@ -669,25 +734,23 @@ async function callCursorCloudAgent(params: {
     };
     lastStatus = run.status || lastStatus;
     if (run.status && terminal.has(run.status)) {
-      // Best-effort cleanup
-      void fetch(`https://api.cursor.com/v1/agents/${agentId}/archive`, {
-        method: "POST",
-        headers: { Authorization: `Bearer ${params.apiKey}` },
-      }).catch(() => {});
-
       if (run.status !== "FINISHED") {
+        archiveAgent();
         throw new Error(`Cursor run ended with status ${run.status}`);
       }
       const text = (run.result || "").trim();
-      if (!text) throw new Error("Cursor run finished with empty result");
-      return text;
+      if (!text) {
+        archiveAgent();
+        throw new Error("Cursor run finished with empty result");
+      }
+      // Fetch usage before archive — metering can lag slightly after FINISHED.
+      const usage = await fetchCursorRunUsage(params.apiKey, agentId, runId);
+      archiveAgent();
+      return { text, usage };
     }
   }
 
-  void fetch(`https://api.cursor.com/v1/agents/${agentId}/archive`, {
-    method: "POST",
-    headers: { Authorization: `Bearer ${params.apiKey}` },
-  }).catch(() => {});
+  archiveAgent();
   throw new Error(`Cursor run timed out (last status: ${lastStatus})`);
 }
 
@@ -703,9 +766,54 @@ function friendlyProviderError(provider: ApiKeyProvider, status: number, body: s
   return `${provider} request failed (${status}): ${body.slice(0, 240)}`;
 }
 
+export type LlmTokenUsage = {
+  inputTokens: number;
+  outputTokens: number;
+  totalTokens: number;
+};
+
+export type LlmCallResult = {
+  text: string;
+  usage: LlmTokenUsage | null;
+};
+
+export function emptyTokenUsage(): LlmTokenUsage {
+  return { inputTokens: 0, outputTokens: 0, totalTokens: 0 };
+}
+
+/** True when the provider reported a non-zero token count. */
+export function hasReportedTokenUsage(u: LlmTokenUsage | null | undefined): boolean {
+  if (!u) return false;
+  return u.inputTokens > 0 || u.outputTokens > 0 || u.totalTokens > 0;
+}
+
+export function addTokenUsage(
+  a: LlmTokenUsage,
+  b: LlmTokenUsage | null | undefined
+): LlmTokenUsage {
+  if (!b) return a;
+  return {
+    inputTokens: a.inputTokens + (b.inputTokens || 0),
+    outputTokens: a.outputTokens + (b.outputTokens || 0),
+    totalTokens: a.totalTokens + (b.totalTokens || 0),
+  };
+}
+
+function usageFromCounts(input: number, output: number): LlmTokenUsage | null {
+  const inputTokens = Math.max(0, Math.floor(input || 0));
+  const outputTokens = Math.max(0, Math.floor(output || 0));
+  if (inputTokens === 0 && outputTokens === 0) return null;
+  return {
+    inputTokens,
+    outputTokens,
+    totalTokens: inputTokens + outputTokens,
+  };
+}
+
 /**
  * One text (optionally vision) completion across all supported providers.
  * `imageUrl` is optional — text-only prompts are the primary Code Sculpt path.
+ * Returns completion text plus provider token usage when available.
  */
 export async function callLLM(params: {
   provider: ApiKeyProvider;
@@ -715,7 +823,7 @@ export async function callLLM(params: {
   userText: string;
   imageUrl?: string | null;
   maxTokens?: number;
-}): Promise<string> {
+}): Promise<LlmCallResult> {
   const { provider, apiKey, system, userText } = params;
   const imageUrl = params.imageUrl || null;
   const maxTokens = params.maxTokens ?? 8192;
@@ -754,10 +862,16 @@ export async function callLLM(params: {
       const body = await res.text().catch(() => "");
       throw new Error(friendlyProviderError(provider, res.status, body));
     }
-    const data = (await res.json()) as { content?: Array<{ type: string; text?: string }> };
-    return (
-      data.content?.filter((c) => c.type === "text").map((c) => c.text || "").join("\n") || ""
-    );
+    const data = (await res.json()) as {
+      content?: Array<{ type: string; text?: string }>;
+      usage?: { input_tokens?: number; output_tokens?: number };
+    };
+    const text =
+      data.content?.filter((c) => c.type === "text").map((c) => c.text || "").join("\n") || "";
+    return {
+      text,
+      usage: usageFromCounts(data.usage?.input_tokens ?? 0, data.usage?.output_tokens ?? 0),
+    };
   }
 
   if (provider === "openai" || provider === "openrouter") {
@@ -795,9 +909,29 @@ export async function callLLM(params: {
     const data = (await res.json()) as {
       choices?: Array<{ message?: { content?: string } }>;
       error?: { message?: string };
+      usage?: {
+        prompt_tokens?: number;
+        completion_tokens?: number;
+        total_tokens?: number;
+        // OpenRouter sometimes nests native accounting
+        prompt_tokens_details?: unknown;
+        native_tokens_prompt?: number;
+        native_tokens_completion?: number;
+      };
     };
     if (data.error?.message) throw new Error(data.error.message);
-    return data.choices?.[0]?.message?.content || "";
+    const promptTok =
+      data.usage?.prompt_tokens ?? data.usage?.native_tokens_prompt ?? 0;
+    const completionTok =
+      data.usage?.completion_tokens ?? data.usage?.native_tokens_completion ?? 0;
+    const usage = usageFromCounts(promptTok, completionTok);
+    if (usage && data.usage?.total_tokens) {
+      usage.totalTokens = Math.max(usage.totalTokens, Math.floor(data.usage.total_tokens));
+    }
+    return {
+      text: data.choices?.[0]?.message?.content || "",
+      usage,
+    };
   }
 
   // gemini
@@ -831,8 +965,27 @@ export async function callLLM(params: {
     }
     const data2 = (await res2.json()) as {
       candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>;
+      usageMetadata?: {
+        promptTokenCount?: number;
+        candidatesTokenCount?: number;
+        totalTokenCount?: number;
+      };
     };
-    return data2.candidates?.[0]?.content?.parts?.map((p) => p.text || "").join("\n") || "";
+    const usage = usageFromCounts(
+      data2.usageMetadata?.promptTokenCount ?? 0,
+      data2.usageMetadata?.candidatesTokenCount ?? 0
+    );
+    if (usage && data2.usageMetadata?.totalTokenCount) {
+      usage.totalTokens = Math.max(
+        usage.totalTokens,
+        Math.floor(data2.usageMetadata.totalTokenCount)
+      );
+    }
+    return {
+      text:
+        data2.candidates?.[0]?.content?.parts?.map((p) => p.text || "").join("\n") || "",
+      usage,
+    };
   }
   if (!res.ok) {
     const errText = await res.text().catch(() => "");
@@ -840,6 +993,24 @@ export async function callLLM(params: {
   }
   const data = (await res.json()) as {
     candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>;
+    usageMetadata?: {
+      promptTokenCount?: number;
+      candidatesTokenCount?: number;
+      totalTokenCount?: number;
+    };
   };
-  return data.candidates?.[0]?.content?.parts?.map((p) => p.text || "").join("\n") || "";
+  const usage = usageFromCounts(
+    data.usageMetadata?.promptTokenCount ?? 0,
+    data.usageMetadata?.candidatesTokenCount ?? 0
+  );
+  if (usage && data.usageMetadata?.totalTokenCount) {
+    usage.totalTokens = Math.max(
+      usage.totalTokens,
+      Math.floor(data.usageMetadata.totalTokenCount)
+    );
+  }
+  return {
+    text: data.candidates?.[0]?.content?.parts?.map((p) => p.text || "").join("\n") || "",
+    usage,
+  };
 }

@@ -1,0 +1,3 @@
+-- Archived one-shot / obsolete SQL.
+-- Active cleanup migration: ../004_drop_unused_invite_and_columns.sql
+-- Canonical schema reference: ../schema.sql

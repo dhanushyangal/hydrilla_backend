@@ -125,38 +125,19 @@ export async function syncJobFromApi(jobId: string): Promise<boolean> {
       dbJob.generateType === "TextToImage" ||
       dbJob.generateType === "EditImage" ||
       dbJob.generateType === "Combined";
-    const gateway = isFluxJob ? config.fluxGateway : config.trellisGateway;
-    const urls =
-      gateway.urlAlternative !== gateway.url
-        ? [gateway.url, gateway.urlAlternative]
-        : [gateway.url];
+    const baseUrl = isFluxJob ? config.fluxGateway.url : config.trellisGateway.url;
+    const url = `${baseUrl}${path}`;
+
     let response: Response | null = null;
     let lastErr: unknown = null;
 
     try {
-      for (const baseUrl of urls) {
-        const url = `${baseUrl}${path}`;
-        try {
-          const res = await fetch(url, { signal: controller.signal });
-          if (res.ok || res.status === 404 || res.status < 500) {
-            response = res;
-            break;
-          }
-          lastErr = new Error(`API returned ${res.status}`);
-          if (res.status >= 500 && baseUrl === gateway.url) {
-            logger.debug({ jobId, status: res.status }, "Primary gateway error, trying alternative");
-            continue;
-          }
-          response = res;
-          break;
-        } catch (err) {
-          lastErr = err;
-          if (baseUrl === gateway.url) {
-            logger.debug({ jobId, err: (err as Error)?.message }, "Primary gateway failed, trying alternative");
-            continue;
-          }
-          throw err;
-        }
+      try {
+        const res = await fetch(url, { signal: controller.signal });
+        response = res;
+      } catch (err) {
+        lastErr = err;
+        throw err;
       }
       clearTimeout(timeoutId);
       if (!response) {

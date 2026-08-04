@@ -2,11 +2,6 @@ import { Request, Response, NextFunction } from "express";
 import { createClerkClient } from "@clerk/clerk-sdk-node";
 import { config } from "../config.js";
 import { logger } from "../logger.js";
-import {
-  getUserIsApproved,
-  isAdminEmail,
-  resolveUserApproval,
-} from "../services/accessControl.js";
 
 // Initialize Clerk client
 const clerk = createClerkClient({ secretKey: config.clerk.secretKey });
@@ -15,6 +10,12 @@ function setCorsErrorHeaders(res: Response) {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+}
+
+function isAdminEmail(email: string | null | undefined): boolean {
+  if (!email) return false;
+  const normalized = email.trim().toLowerCase();
+  return config.adminEmails.some((e) => e.trim().toLowerCase() === normalized);
 }
 
 // Extend Express Request to include user info
@@ -136,51 +137,6 @@ export async function requireAdmin(req: Request, res: Response, next: NextFuncti
 }
 
 /**
- * Middleware that requires the user to be approved for app access.
- * Must be used after requireAuth.
- *
- * ON HOLD: when config.accessControlEnabled is false (default), this is a no-op
- * so any authenticated user can generate / use workspaces. Flip ACCESS_CONTROL_ENABLED=true
- * to enforce invite approval again — code below is unchanged.
- */
-export async function requireApprovedAccess(req: Request, res: Response, next: NextFunction) {
-  if (!config.accessControlEnabled) {
-    return next();
-  }
-
-  try {
-    const userId = req.userId;
-    if (!userId) {
-      setCorsErrorHeaders(res);
-      return res.status(401).json({ error: "Authentication required" });
-    }
-
-    const userData = await syncUserToDatabase(userId);
-    if (userData?.email) {
-      await resolveUserApproval(userId, userData.email);
-    }
-
-    const approved = await getUserIsApproved(userId);
-    if (!approved) {
-      setCorsErrorHeaders(res);
-      return res.status(403).json({
-        error: "access_not_granted",
-        message: "Contact the website admin for access.",
-      });
-    }
-
-    next();
-  } catch (err: any) {
-    logger.error({ err: err.message, userId: req.userId }, "Approval check failed");
-    setCorsErrorHeaders(res);
-    return res.status(403).json({
-      error: "access_not_granted",
-      message: "Contact the website admin for access.",
-    });
-  }
-}
-
-/**
  * Sync user data from Clerk to Supabase.
  * Called after successful authentication.
  */
@@ -259,10 +215,6 @@ export async function syncUserToDatabase(userId: string) {
       logger.info({ userId, email: userData.email }, "New user created in database");
     }
 
-    if (userData.email) {
-      await resolveUserApproval(userId, userData.email);
-    }
-
     if (!existingUser) {
       // Send welcome email to new user (non-blocking)
       if (userData.email) {
@@ -291,4 +243,3 @@ export async function syncUserToDatabase(userId: string) {
     return null;
   }
 }
-

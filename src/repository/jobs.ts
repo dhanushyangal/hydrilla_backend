@@ -14,7 +14,6 @@ export async function createJob(params: {
   imageUrl?: string | null;
   sourceImages?: string[] | null; // Actual source image URLs used as input
   generateType: GenerateType;
-  enablePBR?: boolean;
   status?: JobStatus;  // Optional initial status (defaults to "WAIT")
   creditsUsed?: number;  // Credits consumed for this job (default 0)
 }) {
@@ -29,7 +28,6 @@ export async function createJob(params: {
     imageUrl = null,
     sourceImages = null,
     generateType,
-    enablePBR = true,
     status = "WAIT",
     creditsUsed = 0,
   } = params;
@@ -51,7 +49,6 @@ export async function createJob(params: {
       image_url: imageUrl,
       source_images: sourceImages && sourceImages.length > 0 ? JSON.stringify(sourceImages) : null,
       generate_type: generateType,
-      enable_pbr: enablePBR,
       credits_used: creditsUsed,
     });
 
@@ -330,7 +327,7 @@ function mapRow(row: any): JobRecord {
     imageUrl: imageUrl,
     sourceImages,
     generateType: row.generate_type ?? (waterLike ? ("Water" as GenerateType) : row.generate_type),
-    enablePBR: row.enable_pbr,
+    enablePBR: true,
     resultGlbUrl: resultGlbUrl,
     previewImageUrl: previewImageUrl,
     errorCode: row.error_code,

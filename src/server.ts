@@ -6,8 +6,6 @@ import { threeDRouter } from "./routes/threeD.js";
 import { paymentsRouter } from "./routes/payments.js";
 import { dodopaymentsRouter } from "./routes/dodopayments/route.js";
 import { contactRouter } from "./routes/contact.js";
-import { invitesRouter } from "./routes/invites.js";
-import { adminRouter } from "./routes/admin.js";
 import { userRouter } from "./routes/user.js";
 import { codeSculptRouter } from "./routes/codeSculpt.js";
 import { logger } from "./logger.js";
@@ -15,11 +13,9 @@ import { config } from "./config.js";
 import { initDb } from "./db.js";
 import pinoHttp from "pino-http";
 import { syncAllJobs } from "./services/jobSync.js";
-import { ensureInviteAccessSchema } from "./services/inviteMigration.js";
 
 async function main() {
   await initDb();
-  await ensureInviteAccessSchema();
   const app = express();
   app.use(cors());
   app.use(pinoHttp({ logger }));
@@ -49,8 +45,6 @@ async function main() {
   app.use("/api/payments", paymentsRouter);
   app.use("/api/dodo", dodopaymentsRouter);
   app.use("/api/contact", contactRouter);
-  app.use("/api/invites", invitesRouter);
-  app.use("/api/admin", adminRouter);
   app.use("/api/user", userRouter);
   app.use("/api/water", codeSculptRouter);
   app.use("/api/code-sculpt", codeSculptRouter); // legacy alias

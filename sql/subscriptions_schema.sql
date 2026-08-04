@@ -18,7 +18,6 @@ CREATE TABLE IF NOT EXISTS user_subscriptions (
   dodo_subscription_id  TEXT        UNIQUE NOT NULL,
   dodo_customer_id      TEXT,
   product_id            TEXT,
-  quantity              INTEGER     DEFAULT 1,
   recurring_amount      INTEGER,    -- in smallest currency unit (paise)
   currency              TEXT        DEFAULT 'INR',
   current_period_start  TIMESTAMPTZ,

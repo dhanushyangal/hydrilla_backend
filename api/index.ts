@@ -2,8 +2,6 @@ import express from "express";
 import cors from "cors";
 import { threeDRouter } from "../src/routes/threeD.js";
 import { paymentsRouter } from "../src/routes/payments.js";
-import { invitesRouter } from "../src/routes/invites.js";
-import { adminRouter } from "../src/routes/admin.js";
 import { userRouter } from "../src/routes/user.js";
 import { codeSculptRouter } from "../src/routes/codeSculpt.js";
 import { logger } from "../src/logger.js";
@@ -73,10 +71,6 @@ async function initDbMiddleware(req: express.Request, res: express.Response, nex
 
 // 3D routes
 app.use("/api/3d", initDbMiddleware, threeDRouter);
-
-// Invite and admin routes
-app.use("/api/invites", initDbMiddleware, invitesRouter);
-app.use("/api/admin", initDbMiddleware, adminRouter);
 
 // Payments routes
 app.use("/api/payments", initDbMiddleware, paymentsRouter);

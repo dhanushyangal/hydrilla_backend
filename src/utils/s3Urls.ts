@@ -87,9 +87,13 @@ export function normalizePreviewUrl(jobId: string, apiUrl: string | null | undef
     }
   }
 
-  // Gateway-style URLs (e.g. https://api.hydrilla.ai/outputs/edit/... or .../combined/...)
-  // Keep as-is so the image loads from the gateway
-  if (apiUrl.includes("/outputs/edit/") || apiUrl.includes("/outputs/combined/")) {
+  // Gateway output URLs — image lives on the GPU disk; do not rewrite to S3.
+  if (
+    apiUrl.includes("/outputs/preview/") ||
+    apiUrl.includes("/outputs/image/") ||
+    apiUrl.includes("/outputs/edit/") ||
+    apiUrl.includes("/outputs/combined/")
+  ) {
     return urlWithoutParams;
   }
 

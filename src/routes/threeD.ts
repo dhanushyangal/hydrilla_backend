@@ -7,11 +7,10 @@ import { S3Client, PutObjectCommand, GetObjectCommand, type PutObjectCommandInpu
 import { logger } from "../logger.js";
 import { config } from "../config.js";
 import { supabase } from "../db.js";
-import { createJob, getJob, listJobs, listJobsForUser, updateJobResult, updateJobStatus, deleteJob, getJobForUser, getJobLineage, upsertJobParents, getJobParentIds } from "../repository/jobs.js";
-import { createChat, getChat, getChatForUser, listChatsForUser, updateChatName, updateChatUpdatedAt, deleteChat, getOrCreateActiveChat } from "../repository/chats.js";
+import { createJob, getJob, listJobsForUser, updateJobResult, updateJobStatus, deleteJob, getJobForUser, getJobLineage, upsertJobParents, getJobParentIds } from "../repository/jobs.js";
+import { createChat, getChatForUser, listChatsForUser, updateChatName, updateChatUpdatedAt, deleteChat, getOrCreateActiveChat } from "../repository/chats.js";
 import { createWorkspace, getWorkspace, getWorkspaceForUser, listWorkspacesForUser, listJobsForWorkspace, updateWorkspaceName, updateWorkspaceUpdatedAt, deleteWorkspace } from "../repository/workspaces.js";
-import { optionalAuth, requireAuth, requireApprovedAccess, syncUserToDatabase } from "../middleware/auth.js";
-import { getUserIsApproved, isAdminEmail } from "../services/accessControl.js";
+import { optionalAuth, requireAuth, syncUserToDatabase } from "../middleware/auth.js";
 import { normalizeGlbUrl, normalizePreviewUrl } from "../utils/s3Urls.js";
 import { isWaterEngine, isWaterJobId, isWaterJobRow } from "../lib/engines.js";
 import { JobStatus, JobRecord, ChatRecord, WorkspaceRecord, GenerateType } from "../types.js";
@@ -137,14 +136,10 @@ function multerFileToBlob(file: Express.Multer.File, fallbackMime = "image/png")
   return new Blob([new Uint8Array(buf)], { type: file.mimetype || fallbackMime });
 }
 
-/** Dual GPU gateways (no trailing slash) */
+/** Unified GPU gateway (no trailing slash) — image + 3D on api.hydrilla.co */
+const GPU_GATEWAY = config.trellisGateway.url;
 const FLUX_GATEWAY = config.fluxGateway.url;
-const FLUX_GATEWAY_ALT = config.fluxGateway.urlAlternative || FLUX_GATEWAY;
 const TRELLIS_GATEWAY = config.trellisGateway.url;
-const TRELLIS_GATEWAY_ALT = config.trellisGateway.urlAlternative || TRELLIS_GATEWAY;
-/** @deprecated Use FLUX_GATEWAY / TRELLIS_GATEWAY */
-const GATEWAY_PRIMARY = config.hunyuanApi.url;
-const GATEWAY_ALTERNATIVE = config.hunyuanApi.urlAlternative || GATEWAY_PRIMARY;
 
 const FLUX_GENERATE_TYPES: GenerateType[] = ["TextToImage", "EditImage", "Combined"];
 
@@ -152,25 +147,22 @@ function isFluxJobType(generateType: GenerateType | null | undefined): boolean {
   return !!generateType && FLUX_GENERATE_TYPES.includes(generateType);
 }
 
-function gatewayBasesForPath(path: string, job?: JobRecord | null): string[] {
+function gatewayBaseForPath(path: string, job?: JobRecord | null): string {
   const p = path.startsWith("/") ? path : `/${path}`;
   if (/^\/text-to-image|^\/edit-image|^\/combined-edit/.test(p)) {
-    return FLUX_GATEWAY_ALT !== FLUX_GATEWAY ? [FLUX_GATEWAY, FLUX_GATEWAY_ALT] : [FLUX_GATEWAY];
+    return FLUX_GATEWAY;
   }
   if (/^\/text-to-3d|^\/image-to-3d/.test(p)) {
-    return TRELLIS_GATEWAY_ALT !== TRELLIS_GATEWAY ? [TRELLIS_GATEWAY, TRELLIS_GATEWAY_ALT] : [TRELLIS_GATEWAY];
+    return TRELLIS_GATEWAY;
   }
   if ((/^\/status\//.test(p) || /^\/cancel\//.test(p)) && job?.generateType) {
-    const bases = isFluxJobType(job.generateType)
-      ? [FLUX_GATEWAY, FLUX_GATEWAY_ALT]
-      : [TRELLIS_GATEWAY, TRELLIS_GATEWAY_ALT];
-    return bases[0] === bases[1] ? [bases[0]] : bases;
+    return isFluxJobType(job.generateType) ? FLUX_GATEWAY : TRELLIS_GATEWAY;
   }
-  return TRELLIS_GATEWAY_ALT !== TRELLIS_GATEWAY ? [TRELLIS_GATEWAY, TRELLIS_GATEWAY_ALT] : [TRELLIS_GATEWAY];
+  return TRELLIS_GATEWAY;
 }
 
 function defaultBaseForPath(path: string, job?: JobRecord | null): string {
-  return gatewayBasesForPath(path, job)[0];
+  return gatewayBaseForPath(path, job);
 }
 const LEGACY_S3_BUCKETS = (process.env.LEGACY_S3_BUCKETS || "hydrilla-outputs")
   .split(",")
@@ -186,7 +178,7 @@ function resolveGatewayImageUrl(url: string | undefined | null, baseUrl?: string
 }
 
 /**
- * Fetch from the correct GPU gateway (Flux vs Trellis) with optional alternative fallback.
+ * Fetch from the GPU gateway (single host: api.hydrilla.co).
  */
 async function fetchGateway(
   path: string,
@@ -194,51 +186,24 @@ async function fetchGateway(
   options?: { job?: JobRecord | null }
 ): Promise<{ response: Response; baseUrl: string }> {
   const pathStr = path.startsWith("/") ? path : `/${path}`;
-  const urls = gatewayBasesForPath(pathStr, options?.job);
-  let lastErr: unknown = null;
-  const primary = urls[0];
-  for (const baseUrl of urls) {
-    const url = `${baseUrl}${pathStr}`;
-    try {
-      const response = await fetch(url, init);
-      if (response.ok || response.status < 500) {
-        return { response, baseUrl };
-      }
-      lastErr = new Error(`Gateway returned ${response.status}`);
-      if (response.status >= 500 && baseUrl === primary && urls.length > 1) {
-        logger.warn({ status: response.status, url }, "Primary gateway error, trying alternative");
-        continue;
-      }
-      return { response, baseUrl };
-    } catch (err) {
-      lastErr = err;
-      if (baseUrl === primary && urls.length > 1) {
-        logger.warn({ err: (err as Error)?.message, url }, "Primary gateway failed, trying alternative");
-        continue;
-      }
-      throw lastErr;
-    }
-  }
-  throw lastErr || new Error("Gateway request failed");
+  const baseUrl = gatewayBaseForPath(pathStr, options?.job);
+  const url = `${baseUrl}${pathStr}`;
+  const response = await fetch(url, init);
+  return { response, baseUrl };
 }
 
-/** Fetch /queue/info from the first reachable gateway base (primary + alternative in parallel). */
-async function fetchQueueInfoFromGateways(
-  bases: string[],
+/** Fetch /queue/info from the GPU gateway. */
+async function fetchQueueInfoFromGateway(
+  base: string,
   init: RequestInit
 ): Promise<Record<string, unknown> | null> {
-  const unique = [...new Set(bases.filter(Boolean))];
-  const results = await Promise.allSettled(
-    unique.map(async (base) => {
-      const response = await fetch(`${base}/queue/info`, init);
-      if (!response.ok) throw new Error(`queue/info ${response.status}`);
-      return response.json() as Promise<Record<string, unknown>>;
-    })
-  );
-  for (const result of results) {
-    if (result.status === "fulfilled") return result.value;
+  try {
+    const response = await fetch(`${base}/queue/info`, init);
+    if (!response.ok) return null;
+    return (await response.json()) as Record<string, unknown>;
+  } catch {
+    return null;
   }
-  return null;
 }
 
 /** Hosts the remote GPU worker cannot reach (it would try localhost on its own machine). */
@@ -410,6 +375,49 @@ async function loadImageBytesForLocalBackendUrl(imageUrl: string): Promise<{ buf
  * Load image bytes directly from our S3 bucket URL (works even when the bucket/object is private),
  * so image-to-3d can proceed without requiring public read on uploads/*.
  */
+function isGatewayOutputImageUrl(imageUrl: string): boolean {
+  return (
+    imageUrl.includes("/outputs/preview/") ||
+    imageUrl.includes("/outputs/image/") ||
+    imageUrl.includes("/outputs/edit/") ||
+    imageUrl.includes("/outputs/combined/")
+  );
+}
+
+/** Map owned S3 keys to public gateway /outputs/ URLs (file may only exist on GPU disk). */
+function gatewayOutputUrlCandidates(imageUrl: string): string[] {
+  const urls: string[] = [];
+  const trimmed = (imageUrl || "").trim().split("?")[0];
+  if (!trimmed) return urls;
+
+  if (isGatewayOutputImageUrl(trimmed)) {
+    urls.push(trimmed.startsWith("http") ? trimmed : resolveGatewayImageUrl(trimmed, GPU_GATEWAY) || trimmed);
+  }
+
+  const key = extractOwnedS3KeyFromUrl(trimmed);
+  if (key) {
+    const gatewayBase = GPU_GATEWAY.replace(/\/$/, "");
+    for (const candidateKey of imageKeyCandidates(key)) {
+      const match = candidateKey.match(/^(preview|image|edit|combined)\/([^/]+)\/(.+)$/);
+      if (match) {
+        urls.push(`${gatewayBase}/outputs/${match[1]}/${match[2]}/${match[3]}`);
+      }
+    }
+  }
+
+  return uniqueKeys(urls);
+}
+
+async function readResponseBodyToBuffer(body: unknown): Promise<Buffer> {
+  if (!body) throw new Error("Response body missing");
+  const stream = body as Readable;
+  const chunks: Buffer[] = [];
+  for await (const chunk of stream) {
+    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as any));
+  }
+  return Buffer.concat(chunks);
+}
+
 async function loadImageBytesFromOwnedS3Url(
   imageUrl: string
 ): Promise<{ buffer: Buffer; contentType: string; filename: string } | null> {
@@ -417,21 +425,11 @@ async function loadImageBytesFromOwnedS3Url(
   try {
     const key = extractOwnedS3KeyFromUrl(imageUrl);
     if (!key) return null;
-    const out = await s3Client.send(
-      new GetObjectCommand({
-        Bucket: config.s3.bucket,
-        Key: key,
-      })
-    );
+    const { key: resolvedKey, out } = await getFirstExistingS3Object(imageKeyCandidates(key));
     if (!out.Body) throw new Error("S3 object body missing");
-    const stream = out.Body as Readable;
-    const chunks: Buffer[] = [];
-    for await (const chunk of stream) {
-      chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as any));
-    }
-    const buffer = Buffer.concat(chunks);
-    const filename = path.basename(key) || "image.jpg";
-    const contentType = contentTypeForImageKey(key, out.ContentType || "image/jpeg");
+    const buffer = await readResponseBodyToBuffer(out.Body);
+    const filename = path.basename(resolvedKey) || "image.jpg";
+    const contentType = contentTypeForImageKey(resolvedKey, out.ContentType || "image/jpeg");
     if (!buffer.length) throw new Error("S3 object was empty");
     return { buffer, contentType, filename };
   } catch (err: any) {
@@ -440,47 +438,78 @@ async function loadImageBytesFromOwnedS3Url(
   }
 }
 
+/** Load image bytes for image-to-3d — S3, then gateway /outputs/, then direct fetch. */
+async function loadImageBytesFor3dSubmission(
+  imageUrl: string
+): Promise<{ buffer: Buffer; contentType: string; filename: string } | null> {
+  const fromS3 = await loadImageBytesFromOwnedS3Url(imageUrl);
+  if (fromS3) return fromS3;
+
+  for (const gatewayUrl of gatewayOutputUrlCandidates(imageUrl)) {
+    try {
+      const res = await fetch(gatewayUrl);
+      if (!res.ok) continue;
+      const buffer = Buffer.from(await res.arrayBuffer());
+      if (!buffer.length) continue;
+      let pathname = "preview_image.png";
+      try {
+        pathname = new URL(gatewayUrl).pathname;
+      } catch {
+        /* keep default */
+      }
+      const filename = path.basename(pathname) || "preview_image.png";
+      const contentType = res.headers.get("content-type") || contentTypeForImageKey(filename);
+      return { buffer, contentType, filename };
+    } catch (err: any) {
+      logger.warn({ err: err?.message, gatewayUrl }, "Failed to fetch image from gateway output URL");
+    }
+  }
+
+  const resolved = resolveGatewayImageUrl(imageUrl, GPU_GATEWAY) || imageUrl;
+  if (resolved.startsWith("http") && !extractOwnedS3KeyFromUrl(resolved)) {
+    try {
+      const res = await fetch(resolved);
+      if (res.ok) {
+        const buffer = Buffer.from(await res.arrayBuffer());
+        if (buffer.length) {
+          let pathname = "image.jpg";
+          try {
+            pathname = new URL(resolved).pathname;
+          } catch {
+            /* keep default */
+          }
+          const filename = path.basename(pathname) || "image.jpg";
+          const contentType = res.headers.get("content-type") || contentTypeForImageKey(filename);
+          return { buffer, contentType, filename };
+        }
+      }
+    } catch (err: any) {
+      logger.warn({ err: err?.message, imageUrl: resolved }, "Failed to fetch image URL for 3D submission");
+    }
+  }
+
+  return null;
+}
+
 /**
- * image-to-3d with file body (fresh FormData per gateway attempt — body is not reusable across retries).
+ * image-to-3d with file body via the GPU gateway.
  */
 async function fetchGatewayImageTo3DMultipart(
   image: { buffer: Buffer; contentType: string; filename: string },
   userId: string
 ): Promise<{ response: Response; baseUrl: string }> {
   const pathStr = "/image-to-3d";
-  const urls = gatewayBasesForPath(pathStr);
-  let lastErr: unknown = null;
-  const primary = urls[0];
-  for (const baseUrl of urls) {
-    const formData = new FormData();
-    const blob = new Blob([new Uint8Array(image.buffer)], { type: image.contentType });
-    formData.append("image_file", blob, image.filename);
-    formData.append("user_id", userId);
-    const url = `${baseUrl.replace(/\/$/, "")}${pathStr}`;
-    try {
-      const response = await fetch(url, { method: "POST", body: formData });
-      if (response.ok || response.status < 500) {
-        return { response, baseUrl };
-      }
-      lastErr = new Error(`Gateway returned ${response.status}`);
-      if (response.status >= 500 && baseUrl === primary && urls.length > 1) {
-        logger.warn({ status: response.status, url }, "Primary gateway error, trying alternative");
-        continue;
-      }
-      return { response, baseUrl };
-    } catch (err) {
-      lastErr = err;
-      if (baseUrl === primary && urls.length > 1) {
-        logger.warn({ err: (err as Error)?.message, url }, "Primary gateway failed, trying alternative");
-        continue;
-      }
-      throw lastErr;
-    }
-  }
-  throw lastErr || new Error("Gateway request failed");
+  const baseUrl = gatewayBaseForPath(pathStr);
+  const formData = new FormData();
+  const blob = new Blob([new Uint8Array(image.buffer)], { type: image.contentType });
+  formData.append("image", blob, image.filename);
+  formData.append("user_id", userId);
+  const url = `${baseUrl.replace(/\/$/, "")}${pathStr}`;
+  const response = await fetch(url, { method: "POST", body: formData });
+  return { response, baseUrl };
 }
 
-/** Map gateway/network errors to a user-facing message when both APIs have failed. */
+/** Map gateway/network errors to a user-facing message when the GPU API is unreachable. */
 function gatewayErrorToUserMessage(err: unknown): string {
   const msg = err && typeof (err as any).message === "string" ? (err as any).message : "";
   if (/fetch failed|timeout|ECONNREFUSED|ECONNRESET|network|Gateway request failed|Gateway returned 5/i.test(msg))
@@ -534,19 +563,53 @@ function publicUrlForS3Key(key: string): string {
 // Helper functions for status conversion
 function convertStatus(apiStatus: string): "WAIT" | "RUN" | "FAIL" | "DONE" {
   switch (apiStatus) {
-    case "pending": return "WAIT";
-    case "processing": return "RUN";
+    case "pending":
+    case "queued":
+      return "WAIT";
+    case "processing":
+      return "RUN";
     case "failed":
-    case "cancelled": return "FAIL";
-    case "completed": return "DONE";
-    default: return "WAIT";
+    case "cancelled":
+      return "FAIL";
+    case "completed":
+      return "DONE";
+    default:
+      return "WAIT";
   }
+}
+
+/** Map hydrilla_runtime status payload to frontend QueueInfo shape. */
+function buildQueueInfoFromApiJob(apiJob: Record<string, unknown>): Record<string, unknown> | null {
+  if (apiJob.queue && typeof apiJob.queue === "object") {
+    return apiJob.queue as Record<string, unknown>;
+  }
+  const position =
+    typeof apiJob.queue_position === "number" ? apiJob.queue_position : 0;
+  const rawStatus = String(apiJob.status || "").toLowerCase();
+  const isQueued = rawStatus === "queued" || rawStatus === "pending" || rawStatus === "wait";
+  const isProcessing = rawStatus === "processing" || rawStatus === "run";
+  const jobsAhead = isQueued && position > 0 ? Math.max(0, position - 1) : 0;
+  const estimatedTotal =
+    typeof apiJob.estimated_seconds === "number"
+      ? apiJob.estimated_seconds
+      : typeof apiJob.estimated_total_seconds === "number"
+        ? apiJob.estimated_total_seconds
+        : 300;
+  const waitSec = jobsAhead * estimatedTotal;
+  return {
+    position,
+    jobs_ahead: jobsAhead,
+    estimated_wait_seconds: waitSec,
+    estimated_total_seconds: estimatedTotal,
+    queue_length: position,
+    currently_processing: isProcessing,
+  };
 }
 
 // ============================================
 // Generate 3D Model Endpoint (requires auth)
 // ============================================
-threeDRouter.post("/generate", requireAuth, requireApprovedAccess, async (req, res) => {
+threeDRouter.post("/generate", requireAuth, async (req, res) => {
   try {
     const body = req.body as {
       prompt?: string;
@@ -607,16 +670,24 @@ threeDRouter.post("/generate", requireAuth, requireApprovedAccess, async (req, r
         });
       }
 
-      // Remote GPU cannot fetch localhost/private URLs — load bytes here and POST multipart (same as api.hydrilla.co file upload).
-      let multipartForImage: { buffer: Buffer; contentType: string; filename: string } | null = null;
-      // If this is our bucket URL (possibly private uploads/*), read via IAM and send multipart.
-      multipartForImage = await loadImageBytesFromOwnedS3Url(imageUrl);
-      if (isImageUrlUnreachableByRemoteWorker(imageUrl)) {
+      // Remote GPU cannot fetch localhost/private S3 — load bytes here and POST multipart.
+      let multipartForImage: { buffer: Buffer; contentType: string; filename: string } | null =
+        await loadImageBytesFor3dSubmission(imageUrl);
+      if (!multipartForImage && isImageUrlUnreachableByRemoteWorker(imageUrl)) {
         try {
           multipartForImage = await loadImageBytesForLocalBackendUrl(imageUrl);
         } catch (e: any) {
           return res.status(400).json({ error: e?.message || "Could not load image for 3D generation" });
         }
+      }
+      if (
+        !multipartForImage &&
+        (extractOwnedS3KeyFromUrl(imageUrl) || isGatewayOutputImageUrl(imageUrl))
+      ) {
+        return res.status(400).json({
+          error:
+            "Could not load the source image for 3D generation. Try generating the preview again or re-select the image from your library.",
+        });
       }
 
       const deductResult = await deductCredit(userId, CREDITS_IMAGE_TO_3D, true);
@@ -625,11 +696,13 @@ threeDRouter.post("/generate", requireAuth, requireApprovedAccess, async (req, r
       }
 
       const parseImageTo3dError = async (response: Response): Promise<string> => {
+        const text = await response.text();
+        if (!text) return "Failed to submit image-to-3d job";
         try {
-          const errorData = await response.json();
-          return errorData.error || "Failed to submit image-to-3d job";
+          const errorData = JSON.parse(text) as { error?: string; detail?: string };
+          return errorData.error || errorData.detail || text;
         } catch {
-          return (await response.text()) || "Failed to submit image-to-3d job";
+          return text;
         }
       };
 
@@ -680,7 +753,6 @@ threeDRouter.post("/generate", requireAuth, requireApprovedAccess, async (req, r
       imageUrl: body.imageUrl || null,
       sourceImages,
       generateType: detectedGenerateType,
-      enablePBR: true,
       creditsUsed: CREDITS_IMAGE_TO_3D,
     });
 
@@ -694,7 +766,7 @@ threeDRouter.post("/generate", requireAuth, requireApprovedAccess, async (req, r
 // ============================================
 // Text-to-image (preview) – 2 credits
 // ============================================
-threeDRouter.post("/text-to-image", requireAuth, requireApprovedAccess, async (req, res) => {
+threeDRouter.post("/text-to-image", requireAuth, async (req, res) => {
   try {
     const userId = req.userId!;
     await syncUserToDatabase(userId);
@@ -767,14 +839,13 @@ threeDRouter.post("/text-to-image", requireAuth, requireApprovedAccess, async (r
 // ============================================
 // Edit image – 3 credits
 // ============================================
-threeDRouter.post("/edit-image", requireAuth, requireApprovedAccess, upload.single("image"), async (req, res) => {
+threeDRouter.post("/edit-image", requireAuth, upload.single("image"), async (req, res) => {
   try {
     const userId = req.userId!;
     await syncUserToDatabase(userId);
-    const { deductCredit } = await import("../services/credits.js");
-    const deductResult = await deductCredit(userId, CREDITS_IMAGE_EDIT, true);
-    if (!deductResult.ok) {
-      return res.status(402).json({ error: deductResult.error });
+    const featureErr = await requireGpuFeature("edit_image");
+    if (featureErr) {
+      return res.status(403).json({ error: featureErr, code: "FEATURE_UNAVAILABLE" });
     }
     const prompt = (req.body as any)?.prompt ?? "";
     const imageUrl = (req.body as any)?.image_url as string | undefined;
@@ -804,10 +875,45 @@ threeDRouter.post("/edit-image", requireAuth, requireApprovedAccess, upload.sing
     if (!file && !imageUrl) {
       return res.status(400).json({ error: "Either image file or image_url is required" });
     }
+
+    let resolvedImage: { buffer: Buffer; contentType: string; filename: string } | null = null;
+    if (file) {
+      resolvedImage = {
+        buffer: readMulterFile(file),
+        contentType: file.mimetype || "image/png",
+        filename: file.originalname || "image.png",
+      };
+    } else if (imageUrl) {
+      resolvedImage = await loadImageBytesFor3dSubmission(imageUrl);
+      if (!resolvedImage && isImageUrlUnreachableByRemoteWorker(imageUrl)) {
+        try {
+          resolvedImage = await loadImageBytesForLocalBackendUrl(imageUrl);
+        } catch (e: any) {
+          return res.status(400).json({ error: e?.message || "Could not load image for edit" });
+        }
+      }
+      if (
+        !resolvedImage &&
+        (extractOwnedS3KeyFromUrl(imageUrl) || isGatewayOutputImageUrl(imageUrl))
+      ) {
+        return res.status(400).json({
+          error:
+            "Could not load the source image for editing. Try re-selecting the image from your library.",
+        });
+      }
+    }
+
+    const { deductCredit } = await import("../services/credits.js");
+    const deductResult = await deductCredit(userId, CREDITS_IMAGE_EDIT, true);
+    if (!deductResult.ok) {
+      return res.status(402).json({ error: deductResult.error });
+    }
+
     const form = new FormData();
     form.append("prompt", prompt);
-    if (file) {
-      form.append("image", multerFileToBlob(file), file.originalname || "image.png");
+    if (resolvedImage) {
+      const blob = new Blob([new Uint8Array(resolvedImage.buffer)], { type: resolvedImage.contentType });
+      form.append("image", blob, resolvedImage.filename);
     } else if (imageUrl) {
       form.append("image_url", imageUrl);
     }
@@ -819,6 +925,7 @@ threeDRouter.post("/edit-image", requireAuth, requireApprovedAccess, upload.sing
       const errText = await response.text();
       let errJson: any;
       try { errJson = JSON.parse(errText); } catch { errJson = { error: errText }; }
+      if (errJson.detail && !errJson.error) errJson.error = errJson.detail;
       return res.status(response.status).json(errJson);
     }
     const data = await response.json();
@@ -863,10 +970,14 @@ threeDRouter.post("/edit-image", requireAuth, requireApprovedAccess, upload.sing
 // ============================================
 // Combined edit (2 images) – 4 credits
 // ============================================
-threeDRouter.post("/combined-edit", requireAuth, requireApprovedAccess, upload.fields([{ name: "image_1", maxCount: 1 }, { name: "image_2", maxCount: 1 }]), async (req, res) => {
+threeDRouter.post("/combined-edit", requireAuth, upload.fields([{ name: "image_1", maxCount: 1 }, { name: "image_2", maxCount: 1 }]), async (req, res) => {
   try {
     const userId = req.userId!;
     await syncUserToDatabase(userId);
+    const featureErr = await requireGpuFeature("combined_edit");
+    if (featureErr) {
+      return res.status(403).json({ error: featureErr, code: "FEATURE_UNAVAILABLE" });
+    }
     const { deductCredit } = await import("../services/credits.js");
     const deductResult = await deductCredit(userId, CREDITS_COMBINED, true);
     if (!deductResult.ok) {
@@ -1089,7 +1200,6 @@ threeDRouter.get("/status/:jobId", optionalAuth, async (req, res) => {
         prompt: apiJob.result?.prompt || null,
         imageUrl: null,
         generateType: inferredGenerateType,
-        enablePBR: true,
       });
       job = await getJob(jobId);
     }
@@ -1142,12 +1252,23 @@ threeDRouter.get("/status/:jobId", optionalAuth, async (req, res) => {
       job.previewImageUrl = normalizePreviewUrl(jobId, job.previewImageUrl);
     }
     
-    // Include queue info from Python API for accurate time estimation
-    const response_data: any = { job };
-    if (apiJob.queue) {
-      response_data.queue = apiJob.queue;
+    // Include queue info + live GPU progress for accurate UI updates
+    const response_data: Record<string, unknown> = { job };
+    const queue = buildQueueInfoFromApiJob(apiJob as Record<string, unknown>);
+    if (queue) {
+      response_data.queue = queue;
     }
-    
+    if (typeof apiJob.progress === "number") {
+      response_data.progress = apiJob.progress;
+    }
+    if (typeof apiJob.message === "string" && apiJob.message.trim()) {
+      response_data.message = apiJob.message;
+    }
+    if (typeof apiJob.created_at === "number") {
+      response_data.created_at =
+        apiJob.created_at < 1e12 ? apiJob.created_at * 1000 : apiJob.created_at;
+    }
+
     res.json(response_data);
   } catch (err: any) {
     logger.error(err, "failed to query job");
@@ -1278,22 +1399,16 @@ threeDRouter.get("/queue/info", async (_req, res) => {
     const timeoutId = setTimeout(() => controller.abort(), 1500);
 
     const init = { signal: controller.signal };
-    const [trellisQi, fluxQi] = await Promise.all([
-      fetchQueueInfoFromGateways([TRELLIS_GATEWAY, TRELLIS_GATEWAY_ALT], init),
-      fetchQueueInfoFromGateways([FLUX_GATEWAY, FLUX_GATEWAY_ALT], init),
-    ]);
+    const queueInfo = await fetchQueueInfoFromGateway(GPU_GATEWAY, init);
     clearTimeout(timeoutId);
 
-    let queueInfo: Record<string, unknown> = {};
-    if (trellisQi) queueInfo = { ...trellisQi };
-    if (fluxQi) queueInfo = { ...queueInfo, ...fluxQi };
-    if (Object.keys(queueInfo).length > 0) {
+    if (queueInfo && Object.keys(queueInfo).length > 0) {
       if (!res.headersSent) {
         return res.json({ ...queueInfo, api_available: true });
       }
       return;
     }
-    logger.warn("Python API returned no queue info from Flux or Trellis gateways");
+    logger.warn("Python API returned no queue info from GPU gateway");
     // Return 200 with fallback so 3D form is not blocked; only actual submit failure shows GPU offline
     if (!res.headersSent) {
       return res.status(200).json({ ...QUEUE_INFO_FALLBACK, api_available: false });
@@ -1320,72 +1435,215 @@ threeDRouter.get("/queue/info", async (_req, res) => {
 
 // ============================================
 // Health check
-// Aggregates the gateway /health endpoint, which itself probes FLUX,
-// Trellis, the worker heartbeat, Redis, and queue depth. The frontend
-// (or anyone else) can hit `GET /api/3d/health` to know whether the GPU
-// pipeline is actually ready instead of guessing from a failed job.
+// Probes hydrilla_runtime (unified :8000) or dual Flux/Trellis hosts.
+// Returns mode + features so clients can gate Edit/Combine.
 // ============================================
+
+type GpuFeatures = {
+  text_to_image: boolean;
+  text_to_3d: boolean;
+  image_to_3d: boolean;
+  edit_image: boolean;
+  combined_edit: boolean;
+};
+
+const LOW_FEATURES: GpuFeatures = {
+  text_to_image: true,
+  text_to_3d: true,
+  image_to_3d: true,
+  edit_image: false,
+  combined_edit: false,
+};
+
+const HIGH_FEATURES: GpuFeatures = {
+  text_to_image: true,
+  text_to_3d: true,
+  image_to_3d: true,
+  edit_image: true,
+  combined_edit: true,
+};
+
+let _cachedGpuCapabilities: {
+  mode: string;
+  features: GpuFeatures;
+  fetchedAt: number;
+} | null = null;
+
+const CAPABILITIES_TTL_MS = 30_000;
+
+function defaultsFromMode(mode: string | undefined): GpuFeatures {
+  return mode === "high" ? { ...HIGH_FEATURES } : { ...LOW_FEATURES };
+}
+
+function parseFeatures(body: any): GpuFeatures {
+  const base = defaultsFromMode(body?.mode);
+  const f = body?.features;
+  if (!f || typeof f !== "object") return base;
+  return {
+    text_to_image: f.text_to_image ?? base.text_to_image,
+    text_to_3d: f.text_to_3d ?? base.text_to_3d,
+    image_to_3d: f.image_to_3d ?? base.image_to_3d,
+    edit_image: f.edit_image ?? base.edit_image,
+    combined_edit: f.combined_edit ?? base.combined_edit,
+  };
+}
+
+function isImageReady(body: any): boolean {
+  if (!body) return false;
+  return !!(
+    body.image_model_loaded === true ||
+    body.z_image_turbo_loaded === true ||
+    body.flux_ok === true ||
+    body.model_loaded === true ||
+    body.flux?.model_loaded === true
+  );
+}
+
+function isTrellisReady(body: any): boolean {
+  if (!body) return false;
+  return !!(
+    body.trellis_loaded === true ||
+    body.trellis2_pipeline_loaded === true ||
+    body.model_loaded === true ||
+    body.trellis?.model_loaded === true
+  );
+}
+
+async function probeGpuCapabilities(): Promise<{
+  mode: string;
+  features: GpuFeatures;
+  image: { reachable: boolean; ready: boolean; raw?: any };
+  trellis: { reachable: boolean; ready: boolean; raw?: any };
+  status: "ok" | "degraded" | "down";
+}> {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 5000);
+  const init = { signal: controller.signal };
+  const sameHost = FLUX_GATEWAY === TRELLIS_GATEWAY;
+
+  let fluxBody: any = null;
+  let trellisBody: any = null;
+
+  try {
+    if (sameHost) {
+      const res = await fetch(`${FLUX_GATEWAY}/health`, init);
+      if (res.ok) {
+        try {
+          fluxBody = await res.json();
+          trellisBody = fluxBody;
+        } catch {
+          fluxBody = null;
+        }
+      }
+    } else {
+      const [fluxRes, trellisRes] = await Promise.allSettled([
+        fetch(`${FLUX_GATEWAY}/health`, init),
+        fetch(`${TRELLIS_GATEWAY}/health`, init),
+      ]);
+      if (fluxRes.status === "fulfilled" && fluxRes.value.ok) {
+        try {
+          fluxBody = await fluxRes.value.json();
+        } catch {
+          fluxBody = null;
+        }
+      }
+      if (trellisRes.status === "fulfilled" && trellisRes.value.ok) {
+        try {
+          trellisBody = await trellisRes.value.json();
+        } catch {
+          trellisBody = null;
+        }
+      }
+    }
+  } finally {
+    clearTimeout(timeoutId);
+  }
+
+  const primaryBody = trellisBody || fluxBody;
+  const mode = (primaryBody?.mode as string) || "low";
+  const features = parseFeatures(primaryBody || { mode });
+
+  _cachedGpuCapabilities = {
+    mode,
+    features,
+    fetchedAt: Date.now(),
+  };
+
+  const imageReady = isImageReady(fluxBody);
+  const trellisReady = isTrellisReady(trellisBody);
+  const imageReachable = !!fluxBody;
+  const trellisReachable = !!trellisBody;
+
+  let status: "ok" | "degraded" | "down" = "down";
+  if (imageReachable || trellisReachable) {
+    status = imageReady && trellisReady ? "ok" : imageReady || trellisReady ? "degraded" : "down";
+  }
+
+  return {
+    mode,
+    features,
+    image: { reachable: imageReachable, ready: imageReady, raw: fluxBody },
+    trellis: { reachable: trellisReachable, ready: trellisReady, raw: trellisBody },
+    status,
+  };
+}
+
+/** Feature gate before charging credits. Returns error message or null if allowed. */
+async function requireGpuFeature(
+  feature: "edit_image" | "combined_edit"
+): Promise<string | null> {
+  try {
+    if (
+      _cachedGpuCapabilities &&
+      Date.now() - _cachedGpuCapabilities.fetchedAt < CAPABILITIES_TTL_MS
+    ) {
+      if (_cachedGpuCapabilities.features[feature]) return null;
+      return feature === "edit_image"
+        ? "Edit image requires high-GPU mode (Flux). This GPU tier does not support it."
+        : "Combine requires high-GPU mode (Flux). This GPU tier does not support it.";
+    }
+    const caps = await probeGpuCapabilities();
+    if (caps.features[feature]) return null;
+    return feature === "edit_image"
+      ? "Edit image requires high-GPU mode (Flux). This GPU tier does not support it."
+      : "Combine requires high-GPU mode (Flux). This GPU tier does not support it.";
+  } catch {
+    return "GPU capability check failed. Please try again.";
+  }
+}
+
 threeDRouter.get("/health", async (_req, res) => {
   const offlineResponse = {
-    status: "down",
+    status: "down" as const,
+    mode: "low",
+    features: { ...LOW_FEATURES },
     gateway: "unreachable",
+    image: { reachable: false, ready: false },
+    trellis: { reachable: false, ready: false },
     flux: { reachable: false, model_loaded: false },
-    trellis: { reachable: false, model_loaded: false },
-    queues: { "3d": 0, preview: 0, edit: 0, combined: 0 },
+    queues: { "3d": 0, preview: 0, edit: 0, estimated: 0 },
   };
   try {
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 5000);
-    const init = { signal: controller.signal };
-
-    const [fluxRes, trellisRes] = await Promise.allSettled([
-      fetch(`${FLUX_GATEWAY}/health`, init),
-      fetch(`${TRELLIS_GATEWAY}/health`, init),
-    ]);
-    clearTimeout(timeoutId);
-
-    let fluxBody: any = null;
-    let trellisBody: any = null;
-    if (fluxRes.status === "fulfilled" && fluxRes.value.ok) {
-      try {
-        fluxBody = await fluxRes.value.json();
-      } catch {
-        fluxBody = null;
-      }
+    const caps = await probeGpuCapabilities();
+    if (!caps.image.reachable && !caps.trellis.reachable) {
+      return res.status(200).json({ ...offlineResponse, error: "GPU API unreachable" });
     }
-    if (trellisRes.status === "fulfilled" && trellisRes.value.ok) {
-      try {
-        trellisBody = await trellisRes.value.json();
-      } catch {
-        trellisBody = null;
-      }
-    }
-
-    if (!fluxBody && !trellisBody) {
-      return res.status(200).json({ ...offlineResponse, error: "Both GPU APIs unreachable" });
-    }
-
-    const fluxLoaded = fluxBody?.flux?.model_loaded ?? fluxBody?.model_loaded ?? false;
-    const trellisLoaded = trellisBody?.trellis?.model_loaded ?? trellisBody?.model_loaded ?? false;
-    const status =
-      fluxLoaded && trellisLoaded ? "ok" : fluxLoaded || trellisLoaded ? "degraded" : "down";
 
     return res.status(200).json({
-      status,
+      status: caps.status,
+      mode: caps.mode,
+      features: caps.features,
+      image: { reachable: caps.image.reachable, ready: caps.image.ready },
+      trellis: { reachable: caps.trellis.reachable, ready: caps.trellis.ready },
+      // Back-compat aliases
       flux: {
-        reachable: !!fluxBody,
-        model_loaded: fluxLoaded,
-        raw: fluxBody,
-      },
-      trellis: {
-        reachable: !!trellisBody,
-        model_loaded: trellisLoaded,
-        flux_remote: trellisBody?.flux_remote,
-        raw: trellisBody,
+        reachable: caps.image.reachable,
+        model_loaded: caps.image.ready,
+        raw: caps.image.raw,
       },
       queues: {
-        preview: fluxBody?.queues?.preview_queue_length ?? 0,
-        "3d": trellisBody?.queues?.queue_length ?? 0,
+        preview: caps.image.raw?.queues?.preview_queue_length ?? 0,
+        "3d": caps.trellis.raw?.queues?.queue_length ?? 0,
       },
     });
   } catch (err: any) {
@@ -1623,7 +1881,7 @@ threeDRouter.get("/history", optionalAuth, async (req, res) => {
 // ============================================
 // Delete a Job (requires auth)
 // ============================================
-threeDRouter.delete("/jobs/:jobId", requireAuth, requireApprovedAccess, async (req, res) => {
+threeDRouter.delete("/jobs/:jobId", requireAuth, async (req, res) => {
   const { jobId } = req.params;
   const userId = req.userId!;
 
@@ -1651,7 +1909,7 @@ threeDRouter.delete("/jobs/:jobId", requireAuth, requireApprovedAccess, async (r
 // ============================================
 
 // Get all chats for user
-threeDRouter.get("/chats", requireAuth, requireApprovedAccess, async (req, res) => {
+threeDRouter.get("/chats", requireAuth, async (req, res) => {
   try {
     const userId = req.userId!;
     const chats = await listChatsForUser(userId, 100);
@@ -1671,7 +1929,7 @@ threeDRouter.get("/chats", requireAuth, requireApprovedAccess, async (req, res) 
 
 // Get or create active chat (most recent chat, or create new one)
 // IMPORTANT: This must come BEFORE /chats/:chatId to avoid route conflicts
-threeDRouter.get("/chats/active", requireAuth, requireApprovedAccess, async (req, res) => {
+threeDRouter.get("/chats/active", requireAuth, async (req, res) => {
   try {
     const userId = req.userId!;
     
@@ -1725,7 +1983,7 @@ threeDRouter.get("/chats/active", requireAuth, requireApprovedAccess, async (req
 });
 
 // Get a specific chat with its jobs
-threeDRouter.get("/chats/:chatId", requireAuth, requireApprovedAccess, async (req, res) => {
+threeDRouter.get("/chats/:chatId", requireAuth, async (req, res) => {
   try {
     const { chatId } = req.params;
     const userId = req.userId!;
@@ -1770,10 +2028,8 @@ threeDRouter.get("/chats/:chatId", requireAuth, requireApprovedAccess, async (re
         prompt: row.prompt,
         imageUrl: imageUrl,
         generateType: row.generate_type,
-        enablePBR: row.enable_pbr,
         resultGlbUrl: resultGlbUrl,
         previewImageUrl: previewImageUrl,
-        errorCode: row.error_code,
         errorMessage: row.error_message,
         createdAt: row.created_at,
         updatedAt: row.updated_at,
@@ -1788,7 +2044,7 @@ threeDRouter.get("/chats/:chatId", requireAuth, requireApprovedAccess, async (re
 });
 
 // Create a new chat
-threeDRouter.post("/chats", requireAuth, requireApprovedAccess, async (req, res) => {
+threeDRouter.post("/chats", requireAuth, async (req, res) => {
   try {
     const userId = req.userId!;
     const { name } = req.body as { name?: string };
@@ -1809,7 +2065,7 @@ threeDRouter.post("/chats", requireAuth, requireApprovedAccess, async (req, res)
 });
 
 // Update chat name
-threeDRouter.patch("/chats/:chatId/name", requireAuth, requireApprovedAccess, async (req, res) => {
+threeDRouter.patch("/chats/:chatId/name", requireAuth, async (req, res) => {
   try {
     const { chatId } = req.params;
     const userId = req.userId!;
@@ -1828,7 +2084,7 @@ threeDRouter.patch("/chats/:chatId/name", requireAuth, requireApprovedAccess, as
 });
 
 // Delete a chat
-threeDRouter.delete("/chats/:chatId", requireAuth, requireApprovedAccess, async (req, res) => {
+threeDRouter.delete("/chats/:chatId", requireAuth, async (req, res) => {
   try {
     const { chatId } = req.params;
     const userId = req.userId!;
@@ -2155,7 +2411,6 @@ threeDRouter.post("/register-job", optionalAuth, async (req, res) => {
       imageUrl: imageUrl || null,
       sourceImages: resolvedSourceImages,
       generateType: finalGenerateType,
-      enablePBR: true,
       status: initialStatus,
       creditsUsed: creditsToSet,
     });
@@ -2238,7 +2493,6 @@ threeDRouter.post("/webhook/job-update", async (req, res) => {
         prompt: result?.prompt || null,
         imageUrl: null,
         generateType: inferredGenerateType,
-        enablePBR: true,
       });
       job = await getJob(job_id);
     }
@@ -2483,12 +2737,6 @@ threeDRouter.get("/me", requireAuth, async (req, res) => {
       .eq("user_id", userId)
       .eq("status", "DONE");
     
-    // When access control is on hold, report approved so clients never block.
-    const isApproved =
-      !config.accessControlEnabled ||
-      (await getUserIsApproved(userId)) ||
-      isAdminEmail(user.email);
-
     res.json({
       user: {
         id: user.id,
@@ -2497,7 +2745,6 @@ threeDRouter.get("/me", requireAuth, async (req, res) => {
         lastName: user.last_name,
         imageUrl: user.image_url,
         createdAt: user.created_at,
-        isApproved,
       },
       stats: {
         totalJobs: totalJobs || 0,
@@ -2574,7 +2821,7 @@ threeDRouter.post("/notify-gpu-offline", optionalAuth, async (req, res) => {
  * List all workspaces for the current user.
  * Short cache (5s) reduces repeat requests when navigating back to /app/studio.
  */
-threeDRouter.get("/workspaces", requireAuth, requireApprovedAccess, async (req, res) => {
+threeDRouter.get("/workspaces", requireAuth, async (req, res) => {
   try {
     const userId = req.userId!;
     const workspaces = await listWorkspacesForUser(userId);
@@ -2592,7 +2839,7 @@ threeDRouter.get("/workspaces", requireAuth, requireApprovedAccess, async (req, 
 /**
  * Create a new workspace
  */
-threeDRouter.post("/workspaces", requireAuth, requireApprovedAccess, async (req, res) => {
+threeDRouter.post("/workspaces", requireAuth, async (req, res) => {
   try {
     const userId = req.userId!;
     // Ensure users row exists (FK) — avoids create failures right after first login.
@@ -2612,7 +2859,7 @@ threeDRouter.post("/workspaces", requireAuth, requireApprovedAccess, async (req,
 /**
  * Get a workspace by ID
  */
-threeDRouter.get("/workspaces/:workspaceId", requireAuth, requireApprovedAccess, async (req, res) => {
+threeDRouter.get("/workspaces/:workspaceId", requireAuth, async (req, res) => {
   try {
     const userId = req.userId!;
     const { workspaceId } = req.params;
@@ -2630,7 +2877,7 @@ threeDRouter.get("/workspaces/:workspaceId", requireAuth, requireApprovedAccess,
 /**
  * Get all jobs for a specific workspace
  */
-threeDRouter.get("/workspaces/:workspaceId/jobs", requireAuth, requireApprovedAccess, async (req, res) => {
+threeDRouter.get("/workspaces/:workspaceId/jobs", requireAuth, async (req, res) => {
   try {
     const userId = req.userId!;
     const { workspaceId } = req.params;
@@ -2684,15 +2931,11 @@ threeDRouter.get("/workspaces/:workspaceId/jobs", requireAuth, requireApprovedAc
         prompt: row.prompt,
         imageUrl: imageUrl,
         generateType: row.generate_type ?? (waterLike ? "Water" : null),
-        enablePBR: row.enable_pbr,
         resultGlbUrl: resultGlbUrl,
         previewImageUrl: previewImageUrl,
-        errorCode: row.error_code,
         errorMessage: row.error_message,
         engine: row.engine ?? (waterLike ? "water" : "trilles"),
         resultKind: row.result_kind ?? (waterLike ? "three_factory" : "glb"),
-        llmModel: row.llm_model ?? null,
-        llmProvider: row.llm_provider ?? null,
         sculptPass: row.sculpt_pass ?? null,
         // Signal completion without shipping the full TypeScript payload
         factoryCode: hasFactoryCode ? "__present__" : null,
@@ -2712,7 +2955,7 @@ threeDRouter.get("/workspaces/:workspaceId/jobs", requireAuth, requireApprovedAc
 /**
  * Update workspace name
  */
-threeDRouter.patch("/workspaces/:workspaceId/name", requireAuth, requireApprovedAccess, async (req, res) => {
+threeDRouter.patch("/workspaces/:workspaceId/name", requireAuth, async (req, res) => {
   try {
     const userId = req.userId!;
     const { workspaceId } = req.params;
@@ -2733,7 +2976,7 @@ threeDRouter.patch("/workspaces/:workspaceId/name", requireAuth, requireApproved
 /**
  * Delete a workspace
  */
-threeDRouter.delete("/workspaces/:workspaceId", requireAuth, requireApprovedAccess, async (req, res) => {
+threeDRouter.delete("/workspaces/:workspaceId", requireAuth, async (req, res) => {
   try {
     const userId = req.userId!;
     const { workspaceId } = req.params;

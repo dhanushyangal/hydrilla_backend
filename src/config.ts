@@ -4,18 +4,19 @@ import dotenv from "dotenv";
 dotenv.config();
 dotenv.config({ path: ".env.local", override: true });
 
-const GATEWAY_CO = "https://api.hydrilla.co";
-const GATEWAY_AI = "https://api.hydrilla.ai";
+/** Single production GPU runtime (hydrilla_runtime on :8000) */
+const GATEWAY_URL = "https://api.hydrilla.co";
 
 function stripTrailingSlash(url: string): string {
   return url.replace(/\/$/, "");
 }
 
-/** When only one gateway URL is configured, default to the other hydrilla host. */
-function defaultGatewayAlternative(primary: string): string {
-  if (primary.includes("api.hydrilla.co")) return GATEWAY_AI;
-  if (primary.includes("api.hydrilla.ai")) return GATEWAY_CO;
-  return GATEWAY_AI;
+function gatewayUrl(...envKeys: string[]): string {
+  for (const key of envKeys) {
+    const v = process.env[key]?.trim();
+    if (v) return stripTrailingSlash(v);
+  }
+  return GATEWAY_URL;
 }
 
 export const config = {
@@ -29,49 +30,14 @@ export const config = {
     secretKey: process.env.CLERK_SECRET_KEY || "",
   },
   hunyuanApi: {
-    /** Legacy single gateway URL (fallback when dual URLs unset) */
-    url: stripTrailingSlash(process.env.HUNYUAN_API_URL || GATEWAY_CO),
-    urlAlternative: stripTrailingSlash(
-      process.env.HUNYUAN_API_URL_ALTERNATIVE || GATEWAY_AI
-    ),
+    /** Unified GPU gateway (image + 3D on same host) */
+    url: gatewayUrl("HUNYUAN_API_URL"),
   },
   fluxGateway: {
-    /** hydrilla_dual/flux — text-to-image, edit-image, combined-edit */
-    url: stripTrailingSlash(
-      process.env.FLUX_GATEWAY_URL ||
-        process.env.FLUX_API_URL ||
-        process.env.HUNYUAN_API_URL ||
-        GATEWAY_CO
-    ),
-    urlAlternative: stripTrailingSlash(
-      process.env.FLUX_GATEWAY_URL_ALTERNATIVE ||
-        process.env.HUNYUAN_API_URL_ALTERNATIVE ||
-        defaultGatewayAlternative(
-          process.env.FLUX_GATEWAY_URL ||
-            process.env.FLUX_API_URL ||
-            process.env.HUNYUAN_API_URL ||
-            GATEWAY_CO
-        )
-    ),
+    url: gatewayUrl("FLUX_GATEWAY_URL", "FLUX_API_URL", "HUNYUAN_API_URL"),
   },
   trellisGateway: {
-    /** hydrilla_dual/trellis — text-to-3d, image-to-3d */
-    url: stripTrailingSlash(
-      process.env.TRELLIS_GATEWAY_URL ||
-        process.env.TRELLIS_API_URL ||
-        process.env.HUNYUAN_API_URL ||
-        GATEWAY_CO
-    ),
-    urlAlternative: stripTrailingSlash(
-      process.env.TRELLIS_GATEWAY_URL_ALTERNATIVE ||
-        process.env.HUNYUAN_API_URL_ALTERNATIVE ||
-        defaultGatewayAlternative(
-          process.env.TRELLIS_GATEWAY_URL ||
-            process.env.TRELLIS_API_URL ||
-            process.env.HUNYUAN_API_URL ||
-            GATEWAY_CO
-        )
-    ),
+    url: gatewayUrl("TRELLIS_GATEWAY_URL", "TRELLIS_API_URL", "HUNYUAN_API_URL"),
   },
   s3: {
     bucket: process.env.S3_BUCKET || "hydrilla-outputs-1",
@@ -90,13 +56,6 @@ export const config = {
     .split(",")
     .map((e) => e.trim())
     .filter(Boolean),
-  /**
-   * Invite / approval gate. OFF by default (on hold) so any signed-in user
-   * can use workspace + generate. Set ACCESS_CONTROL_ENABLED=true to re-enable.
-   * Invite/admin routes stay in the codebase either way.
-   */
-  accessControlEnabled: process.env.ACCESS_CONTROL_ENABLED === "true",
-  inviteExpiryDays: parseInt(process.env.INVITE_EXPIRY_DAYS || "7", 10),
   frontendUrl: process.env.FRONTEND_URL || "https://hydrilla.co",
   databaseUrl: process.env.DATABASE_URL || "",
   /** AES key material for BYOK API keys (scrypt). Set in Vercel env. */
