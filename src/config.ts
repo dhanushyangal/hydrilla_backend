@@ -33,6 +33,8 @@ function requireEnv(name: string): string {
 const defaultCorsOrigins = [
   "https://hydrilla.co",
   "https://www.hydrilla.co",
+  "https://hydrilla.ai",
+  "https://www.hydrilla.ai",
   "http://localhost:3000",
   "http://127.0.0.1:3000",
 ];
