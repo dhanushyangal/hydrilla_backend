@@ -191,7 +191,7 @@ FRONTEND_URL=https://hydrilla.co
 DODO_PAYMENT_API_KEY=your_api_key_from_dodo_dashboard
 DODO_PAYMENT_MODE=test  # Use "test" for testing, "live" for production
 DODO_PAYMENT_PRODUCT_ID=pdt_your_product_id
-DODO_PAYMENT_WEBHOOK_SECRET=whsec_wn3DwsRii+SZIgpj1r8yZh4IW/9rFOFT
+DODO_PAYMENT_WEBHOOK_SECRET=whsec_your_webhook_secret_from_dodo_dashboard
 DODO_PAYMENTS_RETURN_URL=http://localhost:3000/checkout/success
 
 # Temporary: Skip webhook signature verification for testing (REMOVE IN PRODUCTION!)

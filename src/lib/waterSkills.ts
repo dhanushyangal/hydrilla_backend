@@ -7,9 +7,7 @@ export type WaterSkillId =
   | "object-studio"
   | "character"
   | "animation"
-  | "game"
-  | "environment"
-  | "world";
+  | "game";
 
 export type QualityTier = "fast" | "standard" | "studio";
 
@@ -72,7 +70,7 @@ export const WATER_SKILLS: WaterSkillDef[] = [
     id: "animation",
     label: "Animation Ready",
     shortLabel: "Anim",
-    description: "Sockets, idle tick, clip-ready hierarchy",
+    description: "Sockets, pivot hierarchy — static rest pose",
     status: "partial",
     badge: "Partial",
     roadmapTheme: "v1.8 Animation",
@@ -86,24 +84,6 @@ export const WATER_SKILLS: WaterSkillDef[] = [
     badge: "Partial",
     roadmapTheme: "v1.7 Game Pipeline",
   },
-  {
-    id: "environment",
-    label: "Environment",
-    shortLabel: "Env",
-    description: "Rooms, buildings, multi-object scenes",
-    status: "stub",
-    badge: "Soon",
-    roadmapTheme: "v1.6 Environment",
-  },
-  {
-    id: "world",
-    label: "Procedural World",
-    shortLabel: "World",
-    description: "Multi-view worlds, cities, semantic scenes",
-    status: "stub",
-    badge: "Soon",
-    roadmapTheme: "v2.0 Worlds",
-  },
 ];
 
 export const DEFAULT_WATER_SKILL: WaterSkillId = "object-studio";
@@ -114,9 +94,6 @@ const TIER_IDS = new Set(["fast", "standard", "studio"] as QualityTier[]);
 
 export function parseWaterSkillId(value?: string | null): WaterSkillId {
   if (value && SKILL_IDS.has(value as WaterSkillId)) {
-    const def = WATER_SKILLS.find((s) => s.id === value)!;
-    // Stubs cannot run — fall back to object-studio
-    if (def.status === "stub") return DEFAULT_WATER_SKILL;
     return value as WaterSkillId;
   }
   return DEFAULT_WATER_SKILL;

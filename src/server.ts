@@ -17,7 +17,27 @@ import { syncAllJobs } from "./services/jobSync.js";
 async function main() {
   await initDb();
   const app = express();
-  app.use(cors());
+  app.use(
+    cors({
+      origin(origin, callback) {
+        // Allow non-browser clients (no Origin) and configured frontend origins
+        if (!origin || config.corsOrigins.includes(origin)) {
+          return callback(null, true);
+        }
+        return callback(null, false);
+      },
+      methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+      allowedHeaders: [
+        "Content-Type",
+        "Authorization",
+        "webhook-id",
+        "webhook-signature",
+        "webhook-timestamp",
+        "X-Hydrilla-Internal",
+      ],
+      credentials: true,
+    })
+  );
   app.use(pinoHttp({ logger }));
   
   // Raw body parser for webhook signature verification (must be before json parser)

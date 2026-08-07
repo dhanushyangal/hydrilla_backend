@@ -6,10 +6,8 @@ import { logger } from "../logger.js";
 // Initialize Clerk client
 const clerk = createClerkClient({ secretKey: config.clerk.secretKey });
 
-function setCorsErrorHeaders(res: Response) {
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+function setCorsErrorHeaders(_res: Response) {
+  // CORS is handled centrally in server.ts / api/index.ts — do not set Access-Control-Allow-Origin: *
 }
 
 function isAdminEmail(email: string | null | undefined): boolean {

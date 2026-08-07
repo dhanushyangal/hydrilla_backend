@@ -1,7 +1,10 @@
 import express from 'express';
 import { getDodoPaymentsClient } from '../../lib/dodopayments';
+import { scopeToUserDodoCustomer, getDodoCustomerIdForUser } from './scopeCustomer.js';
 
 const router = express.Router();
+
+router.use(scopeToUserDodoCustomer);
 
 router.get('/', async (req, res) => {
     try {
@@ -11,7 +14,12 @@ router.get('/', async (req, res) => {
             return res.status(400).json({ error: 'payment_id is required' });
         }
 
-        const payment = await getDodoPaymentsClient().payments.retrieve(payment_id);
+        const payment = await getDodoPaymentsClient().payments.retrieve(payment_id) as any;
+        const linked = await getDodoCustomerIdForUser(req.userId!);
+        const paymentCustomerId = payment?.customer_id || payment?.customer?.customer_id || payment?.customer?.id;
+        if (!linked || paymentCustomerId !== linked) {
+            return res.status(403).json({ error: 'Payment does not belong to authenticated user' });
+        }
         res.json(payment);
     } catch (error) {
         console.error('Error fetching payment:', error);
@@ -26,6 +34,8 @@ router.get('/list', async (req, res) => {
         const params: any = {};
         if (customer_id && typeof customer_id === 'string') {
             params.customer_id = customer_id;
+        } else {
+            return res.status(400).json({ error: 'No Dodo customer linked to this user' });
         }
         if (limit && typeof limit === 'string') {
             params.limit = parseInt(limit);

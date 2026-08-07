@@ -133,7 +133,11 @@ export async function syncJobFromApi(jobId: string): Promise<boolean> {
 
     try {
       try {
-        const res = await fetch(url, { signal: controller.signal });
+        const headers: Record<string, string> = {};
+        if (config.internalApiSecret) {
+          headers["X-Hydrilla-Internal"] = config.internalApiSecret;
+        }
+        const res = await fetch(url, { signal: controller.signal, headers });
         response = res;
       } catch (err) {
         lastErr = err;

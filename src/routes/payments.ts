@@ -2,7 +2,7 @@ import { Router, Request, Response } from "express";
 import { logger } from "../logger.js";
 import { config } from "../config.js";
 import { supabase } from "../db.js";
-import { requireAuth, optionalAuth } from "../middleware/auth.js";
+import { requireAuth, requireAdmin } from "../middleware/auth.js";
 import { getDodoPaymentsClient } from "../lib/dodopayments.js";
 import { captureServerEvent, flushPostHog } from "../lib/posthog.js";
 
@@ -13,15 +13,6 @@ import { captureServerEvent, flushPostHog } from "../lib/posthog.js";
 // ============================================================================
 
 export const paymentsRouter = Router();
-
-// CORS
-paymentsRouter.use((req, res, next) => {
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
-  if (req.method === "OPTIONS") { res.sendStatus(200); return; }
-  next();
-});
 
 // ============================================================================
 // HELPERS
@@ -44,7 +35,7 @@ const PLAN_CREDITS: Record<string, number> = {
 // TEST ENDPOINT
 // GET /api/payments/test
 // ============================================================================
-paymentsRouter.get("/test", (_req: Request, res: Response) => {
+paymentsRouter.get("/test", requireAuth, requireAdmin, (_req: Request, res: Response) => {
   res.json({
     ok: true,
     mode: config.dodoPayment.mode,
@@ -60,7 +51,7 @@ paymentsRouter.get("/test", (_req: Request, res: Response) => {
 // POST /api/payments/create-checkout
 // Body: { plan: "creator" | "studio", email: string }
 // ============================================================================
-paymentsRouter.post("/create-checkout", optionalAuth, async (req: Request, res: Response) => {
+paymentsRouter.post("/create-checkout", requireAuth, async (req: Request, res: Response) => {
   try {
     // Validate early so invalid requests fail fast (better TTFB for client)
     const { plan, email } = req.body ?? {};
@@ -149,7 +140,7 @@ paymentsRouter.get("/subscription", requireAuth, async (req: Request, res: Respo
 // Also accepts: POST body { payment_id, subscription_id }
 // Fetches subscription from Dodo API and writes to DB (same as webhook would).
 // ============================================================================
-paymentsRouter.post("/sync", optionalAuth, async (req: Request, res: Response) => {
+paymentsRouter.post("/sync", requireAuth, async (req: Request, res: Response) => {
   try {
     const paymentId = (req.query.payment_id || req.body?.payment_id) as string | undefined;
     const subscriptionIdParam = (req.query.subscription_id || req.body?.subscription_id) as string | undefined;
@@ -413,12 +404,18 @@ paymentsRouter.post("/webhook/dodo", async (req: Request, res: Response) => {
       });
       logger.info({ type: event?.type }, "Webhook signature verified");
     } catch (verifyError: any) {
-      if (process.env.SKIP_WEBHOOK_VERIFICATION === "true") {
-        logger.warn("Skipping webhook verification (dev mode)");
+      const isProd =
+        process.env.NODE_ENV === "production" ||
+        process.env.VERCEL_ENV === "production";
+      if (!isProd && process.env.SKIP_WEBHOOK_VERIFICATION === "true") {
+        logger.warn("Skipping webhook verification (dev mode only)");
         try { event = JSON.parse(payload); } catch {
           return res.status(400).json({ error: "Invalid JSON payload" });
         }
       } else {
+        if (isProd && process.env.SKIP_WEBHOOK_VERIFICATION === "true") {
+          logger.error("SKIP_WEBHOOK_VERIFICATION is set but ignored in production");
+        }
         logger.error({ error: verifyError?.message }, "Webhook signature verification failed");
         return res.status(401).json({ error: "Signature verification failed" });
       }

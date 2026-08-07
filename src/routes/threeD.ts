@@ -5,33 +5,84 @@ import fs from "fs";
 import { Readable } from "stream";
 import { S3Client, PutObjectCommand, GetObjectCommand, type PutObjectCommandInput } from "@aws-sdk/client-s3";
 import { logger } from "../logger.js";
-import { config } from "../config.js";
+import { config, timingSafeEqualString } from "../config.js";
 import { supabase } from "../db.js";
 import { createJob, getJob, listJobsForUser, updateJobResult, updateJobStatus, deleteJob, getJobForUser, getJobLineage, upsertJobParents, getJobParentIds } from "../repository/jobs.js";
 import { createChat, getChatForUser, listChatsForUser, updateChatName, updateChatUpdatedAt, deleteChat, getOrCreateActiveChat } from "../repository/chats.js";
 import { createWorkspace, getWorkspace, getWorkspaceForUser, listWorkspacesForUser, listJobsForWorkspace, updateWorkspaceName, updateWorkspaceUpdatedAt, deleteWorkspace } from "../repository/workspaces.js";
-import { optionalAuth, requireAuth, syncUserToDatabase } from "../middleware/auth.js";
+import { requireAuth, syncUserToDatabase } from "../middleware/auth.js";
 import { normalizeGlbUrl, normalizePreviewUrl } from "../utils/s3Urls.js";
 import { isWaterEngine, isWaterJobId, isWaterJobRow } from "../lib/engines.js";
 import { JobStatus, JobRecord, ChatRecord, WorkspaceRecord, GenerateType } from "../types.js";
 
 export const threeDRouter = Router();
 
-// Global CORS middleware for all routes in this router
-threeDRouter.use((req, res, next) => {
-  // Set CORS headers for all requests
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
-  
-  // Handle preflight requests
-  if (req.method === "OPTIONS") {
-    res.sendStatus(200);
-    return;
+/** Attach shared internal secret on every Node → GPU request */
+function withInternalSecretHeaders(init?: RequestInit): RequestInit {
+  const headers = new Headers(init?.headers || {});
+  if (config.internalApiSecret) {
+    headers.set("X-Hydrilla-Internal", config.internalApiSecret);
   }
-  
-  next();
-});
+  return { ...init, headers };
+}
+
+function assertInternalSecret(req: { headers: Record<string, unknown> | any }, res: any): boolean {
+  const expected = config.internalApiSecret;
+  if (!expected) {
+    res.status(503).json({ error: "Internal API secret not configured" });
+    return false;
+  }
+  const provided = String(req.headers["x-hydrilla-internal"] || "");
+  if (!timingSafeEqualString(provided, expected)) {
+    res.status(401).json({ error: "Unauthorized" });
+    return false;
+  }
+  return true;
+}
+
+/** Deny if authenticated user does not own the job (ownerless jobs allowed for authenticated users). */
+function denyIfNotJobOwner(job: { userId?: string | null }, userId: string | undefined, res: any): boolean {
+  if (!userId) {
+    res.status(401).json({ error: "Authentication required" });
+    return true;
+  }
+  if (job.userId && job.userId !== userId) {
+    res.status(403).json({ error: "You don't have permission to access this job" });
+    return true;
+  }
+  return false;
+}
+
+function isAllowedImageProxyUrl(imageUrl: string): boolean {
+  try {
+    const u = new URL(imageUrl);
+    if (u.protocol !== "https:" && u.protocol !== "http:") return false;
+    const host = u.hostname.toLowerCase();
+    const bucket = (config.s3.bucket || "").toLowerCase();
+    const region = (config.s3.region || "us-east-1").toLowerCase();
+    const allowedHosts = new Set<string>([
+      `${bucket}.s3.amazonaws.com`,
+      `${bucket}.s3.${region}.amazonaws.com`,
+      `s3.${region}.amazonaws.com`,
+      "s3.amazonaws.com",
+      "api.hydrilla.co",
+      "api.hydrilla.ai",
+    ]);
+    for (const legacy of LEGACY_S3_BUCKETS) {
+      allowedHosts.add(`${legacy}.s3.amazonaws.com`);
+      allowedHosts.add(`${legacy}.s3.${region}.amazonaws.com`);
+    }
+    if (allowedHosts.has(host)) return true;
+    // path-style: s3.region.amazonaws.com/bucket/...
+    if ((host === `s3.${region}.amazonaws.com` || host === "s3.amazonaws.com") &&
+        (u.pathname.startsWith(`/${bucket}/`) || LEGACY_S3_BUCKETS.some((b) => u.pathname.startsWith(`/${b}/`)))) {
+      return true;
+    }
+    return false;
+  } catch {
+    return false;
+  }
+}
 
 // Configure multer for file uploads
 // In Vercel/serverless, use /tmp which is writable, otherwise use local uploads directory
@@ -182,23 +233,23 @@ function resolveGatewayImageUrl(url: string | undefined | null, baseUrl?: string
  */
 async function fetchGateway(
   path: string,
-  init: RequestInit,
+  init: RequestInit = {},
   options?: { job?: JobRecord | null }
 ): Promise<{ response: Response; baseUrl: string }> {
   const pathStr = path.startsWith("/") ? path : `/${path}`;
   const baseUrl = gatewayBaseForPath(pathStr, options?.job);
   const url = `${baseUrl}${pathStr}`;
-  const response = await fetch(url, init);
+  const response = await fetch(url, withInternalSecretHeaders(init));
   return { response, baseUrl };
 }
 
 /** Fetch /queue/info from the GPU gateway. */
 async function fetchQueueInfoFromGateway(
   base: string,
-  init: RequestInit
+  init: RequestInit = {}
 ): Promise<Record<string, unknown> | null> {
   try {
-    const response = await fetch(`${base}/queue/info`, init);
+    const response = await fetch(`${base}/queue/info`, withInternalSecretHeaders(init));
     if (!response.ok) return null;
     return (await response.json()) as Record<string, unknown>;
   } catch {
@@ -505,7 +556,7 @@ async function fetchGatewayImageTo3DMultipart(
   formData.append("image", blob, image.filename);
   formData.append("user_id", userId);
   const url = `${baseUrl.replace(/\/$/, "")}${pathStr}`;
-  const response = await fetch(url, { method: "POST", body: formData });
+  const response = await fetch(url, withInternalSecretHeaders({ method: "POST", body: formData }));
   return { response, baseUrl };
 }
 
@@ -1067,7 +1118,7 @@ threeDRouter.post("/combined-edit", requireAuth, upload.fields([{ name: "image_1
 // ============================================
 // Get Job Status (optional auth for viewing)
 // ============================================
-threeDRouter.get("/status/:jobId", optionalAuth, async (req, res) => {
+threeDRouter.get("/status/:jobId", requireAuth, async (req, res) => {
   const { jobId } = req.params;
   const userId = req.userId;
 
@@ -1077,9 +1128,7 @@ threeDRouter.get("/status/:jobId", optionalAuth, async (req, res) => {
 
     // Water jobs are not GPU/mesh jobs — never treat them as GLB pipeline status.
     if (job && (isWaterJobId(jobId) || isWaterJobRow(job as any))) {
-      if (userId && job.userId && job.userId !== userId) {
-        return res.status(403).json({ error: "You don't have permission to view this job" });
-      }
+      if (denyIfNotJobOwner(job, userId, res)) return;
       return res.status(400).json({
         error: "water_job",
         message: "This is a Water job. Use GET /api/water/jobs/:id instead of /api/3d/status.",
@@ -1090,9 +1139,7 @@ threeDRouter.get("/status/:jobId", optionalAuth, async (req, res) => {
     // Also return immediately for preview-only jobs (they don't exist in Python API)
     if (job && (job.status === "DONE" || job.status === "FAIL" || (job.previewImageUrl && !job.resultGlbUrl))) {
       // Check ownership
-      if (userId && job.userId && job.userId !== userId) {
-        return res.status(403).json({ error: "You don't have permission to view this job" });
-      }
+      if (denyIfNotJobOwner(job, userId, res)) return;
       
       // Normalize URLs to ensure they're direct S3 URLs (not expired signed URLs)
       if (job.resultGlbUrl) {
@@ -1126,9 +1173,7 @@ threeDRouter.get("/status/:jobId", optionalAuth, async (req, res) => {
           return res.status(404).json({ error: "Job not found" });
         }
         // If we have it in DB but API says not found, return DB version
-        if (userId && job.userId && job.userId !== userId) {
-          return res.status(403).json({ error: "You don't have permission to view this job" });
-        }
+        if (denyIfNotJobOwner(job, userId, res)) return;
         
         // Normalize URLs to ensure they're direct S3 URLs (not expired signed URLs)
         if (job.resultGlbUrl) {
@@ -1147,9 +1192,7 @@ threeDRouter.get("/status/:jobId", optionalAuth, async (req, res) => {
       
       // If we have the job in database, return it
       if (job) {
-        if (userId && job.userId && job.userId !== userId) {
-          return res.status(403).json({ error: "You don't have permission to view this job" });
-        }
+        if (denyIfNotJobOwner(job, userId, res)) return;
         
         // Normalize URLs to ensure they're direct S3 URLs (not expired signed URLs)
         if (job.resultGlbUrl) {
@@ -1172,9 +1215,7 @@ threeDRouter.get("/status/:jobId", optionalAuth, async (req, res) => {
     if (!apiJob) {
       // Should not reach here, but handle it
       if (job) {
-        if (userId && job.userId && job.userId !== userId) {
-          return res.status(403).json({ error: "You don't have permission to view this job" });
-        }
+        if (denyIfNotJobOwner(job, userId, res)) return;
         
         // Normalize URLs to ensure they're direct S3 URLs (not expired signed URLs)
         if (job.resultGlbUrl) {
@@ -1209,9 +1250,7 @@ threeDRouter.get("/status/:jobId", optionalAuth, async (req, res) => {
     }
 
     // Check ownership (allow viewing if no userId or if user owns the job or if job has no owner)
-    if (userId && job.userId && job.userId !== userId) {
-      return res.status(403).json({ error: "You don't have permission to view this job" });
-    }
+    if (denyIfNotJobOwner(job, userId, res)) return;
 
     // Update job status from API
     const status = convertStatus(apiJob.status);
@@ -1279,16 +1318,14 @@ threeDRouter.get("/status/:jobId", optionalAuth, async (req, res) => {
 // ============================================
 // Cancel 3D Job (proxy to Python gateway)
 // ============================================
-threeDRouter.post("/cancel/:jobId", optionalAuth, async (req, res) => {
+threeDRouter.post("/cancel/:jobId", requireAuth, async (req, res) => {
   const { jobId } = req.params;
   const userId = req.userId;
 
   try {
     const job = await getJob(jobId);
     if (!job) return res.status(404).json({ error: "Job not found" });
-    if (userId && job.userId && job.userId !== userId) {
-      return res.status(403).json({ error: "You don't have permission to cancel this job" });
-    }
+    if (denyIfNotJobOwner(job, userId, res)) return;
 
     const { response } = await fetchGateway(`/cancel/${jobId}`, { method: "POST" }, { job });
     const data = await response.json().catch(() => ({}));
@@ -1308,7 +1345,7 @@ threeDRouter.post("/cancel/:jobId", optionalAuth, async (req, res) => {
 // ============================================
 // Get Job Result
 // ============================================
-threeDRouter.get("/result/:jobId", optionalAuth, async (req, res) => {
+threeDRouter.get("/result/:jobId", requireAuth, async (req, res) => {
   const { jobId } = req.params;
   const userId = req.userId;
 
@@ -1317,9 +1354,7 @@ threeDRouter.get("/result/:jobId", optionalAuth, async (req, res) => {
     if (!job) return res.status(404).json({ error: "Job not found" });
 
     // Check ownership
-    if (userId && job.userId && job.userId !== userId) {
-      return res.status(403).json({ error: "You don't have permission to view this job" });
-    }
+    if (denyIfNotJobOwner(job, userId, res)) return;
 
     // Fetch from API for latest result
     try {
@@ -1659,7 +1694,7 @@ threeDRouter.get("/health", async (_req, res) => {
 // ============================================
 // Proxy GLB file from S3 (to avoid CORS issues)
 // ============================================
-threeDRouter.get("/glb/:jobId", optionalAuth, async (req, res) => {
+threeDRouter.get("/glb/:jobId", requireAuth, async (req, res) => {
   const { jobId } = req.params;
   const userId = req.userId;
 
@@ -1671,9 +1706,7 @@ threeDRouter.get("/glb/:jobId", optionalAuth, async (req, res) => {
     }
 
     // Check ownership
-    if (userId && job.userId && job.userId !== userId) {
-      return res.status(403).json({ error: "You don't have permission to view this job" });
-    }
+    if (denyIfNotJobOwner(job, userId, res)) return;
 
     if (isWaterJobId(jobId) || isWaterJobRow(job as any)) {
       return res.status(404).json({
@@ -1699,7 +1732,6 @@ threeDRouter.get("/glb/:jobId", optionalAuth, async (req, res) => {
         const contentLength = s3Response.ContentLength || s3Response.ContentLength || 0;
           
         // Set CORS and cache headers (browser can cache GLB for 1 hour)
-        res.setHeader("Access-Control-Allow-Origin", "*");
         res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
         res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
         res.setHeader("Content-Type", "model/gltf-binary");
@@ -1732,7 +1764,6 @@ threeDRouter.get("/glb/:jobId", optionalAuth, async (req, res) => {
       }
 
       const contentLength = response.headers.get("content-length");
-      res.setHeader("Access-Control-Allow-Origin", "*");
       res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
       res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
       res.setHeader("Content-Type", "model/gltf-binary");
@@ -1763,15 +1794,14 @@ threeDRouter.get("/glb/:jobId", optionalAuth, async (req, res) => {
 // ============================================
 // Proxy image from S3 (to avoid CORS issues when fetching for combined edits)
 // ============================================
-threeDRouter.get("/image-proxy", optionalAuth, async (req, res) => {
+threeDRouter.get("/image-proxy", requireAuth, async (req, res) => {
   const imageUrl = req.query.url as string;
   if (!imageUrl) {
     return res.status(400).json({ error: "url query parameter is required" });
   }
 
-  // Only allow proxying from our own S3 bucket or known domains
-  const allowed = imageUrl.includes("hydrilla") || imageUrl.includes("amazonaws.com");
-  if (!allowed) {
+  // Only allow proxying from known Hydrilla S3 buckets / GPU hosts
+  if (!isAllowedImageProxyUrl(imageUrl)) {
     return res.status(403).json({ error: "URL not allowed for proxying" });
   }
 
@@ -1782,8 +1812,6 @@ threeDRouter.get("/image-proxy", optionalAuth, async (req, res) => {
       try {
         const { key: resolvedKey, out: s3Response } = await getFirstExistingS3Object(imageKeyCandidates(imageS3Key));
         const contentLength = s3Response.ContentLength || 0;
-
-        res.setHeader("Access-Control-Allow-Origin", "*");
         res.setHeader("Content-Type", contentTypeForImageKey(resolvedKey, s3Response.ContentType || undefined));
         res.setHeader("Cache-Control", "public, max-age=3600");
         if (contentLength > 0) res.setHeader("Content-Length", contentLength.toString());
@@ -1810,7 +1838,6 @@ threeDRouter.get("/image-proxy", optionalAuth, async (req, res) => {
 
     const contentType = response.headers.get("content-type") || "image/png";
     const contentLength = response.headers.get("content-length");
-    res.setHeader("Access-Control-Allow-Origin", "*");
     res.setHeader("Content-Type", contentType);
     res.setHeader("Cache-Control", "public, max-age=3600");
     if (contentLength) res.setHeader("Content-Length", contentLength);
@@ -1832,7 +1859,7 @@ threeDRouter.get("/image-proxy", optionalAuth, async (req, res) => {
 // ============================================
 // Get User's Job History (optional auth - returns empty if not authenticated)
 // ============================================
-threeDRouter.get("/history", optionalAuth, async (req, res) => {
+threeDRouter.get("/history", requireAuth, async (req, res) => {
   try {
     const userId = req.userId;
     
@@ -2105,7 +2132,7 @@ threeDRouter.delete("/chats/:chatId", requireAuth, async (req, res) => {
 // ============================================
 // Register Job (with optional auth)
 // ============================================
-threeDRouter.post("/register-job", optionalAuth, async (req, res) => {
+threeDRouter.post("/register-job", requireAuth, async (req, res) => {
   try {
     const { job_id, prompt, imageUrl, previewImageUrl, previewJobId, parentJobId, parentJobIds, chatId, workspaceId, generateType: reqGenerateType, sourceImages } = req.body as {
       job_id: string;
@@ -2439,12 +2466,18 @@ threeDRouter.post("/register-job", optionalAuth, async (req, res) => {
 // ============================================
 // Job Lineage (iterative prompting DAG)
 // ============================================
-threeDRouter.get("/jobs/:jobId/lineage", optionalAuth, async (req, res) => {
+threeDRouter.get("/jobs/:jobId/lineage", requireAuth, async (req, res) => {
   try {
     const { jobId } = req.params;
     if (!jobId) {
       return res.status(400).json({ error: "jobId is required" });
     }
+    const job = await getJob(jobId);
+    if (!job) {
+      return res.status(404).json({ error: "Job not found" });
+    }
+    if (denyIfNotJobOwner(job, req.userId, res)) return;
+
     const chain = await getJobLineage(jobId);
     res.json({
       lineage: chain.map((j) => ({
@@ -2467,9 +2500,10 @@ threeDRouter.get("/jobs/:jobId/lineage", optionalAuth, async (req, res) => {
 });
 
 // ============================================
-// Webhook for job updates (no auth - internal use)
+// Webhook for job updates (internal shared secret)
 // ============================================
 threeDRouter.post("/webhook/job-update", async (req, res) => {
+  if (!assertInternalSecret(req, res)) return;
   try {
     const { job_id, status, result, error, user_id } = req.body as {
       job_id: string;
@@ -2581,7 +2615,7 @@ threeDRouter.post("/webhook/job-update", async (req, res) => {
 // ============================================
 // Image Upload (with optional auth)
 // ============================================
-threeDRouter.post("/upload-image", optionalAuth, upload.single("image"), async (req, res) => {
+threeDRouter.post("/upload-image", requireAuth, upload.single("image"), async (req, res) => {
   try {
     if (!req.file) {
       return res.status(400).json({ error: "No image file provided" });
@@ -2760,7 +2794,7 @@ threeDRouter.get("/me", requireAuth, async (req, res) => {
 // ============================================
 // GPU Offline Notification Endpoint
 // ============================================
-threeDRouter.post("/notify-gpu-offline", optionalAuth, async (req, res) => {
+threeDRouter.post("/notify-gpu-offline", requireAuth, async (req, res) => {
   try {
     const userId = req.userId || null;
     const { errorMessage } = req.body;

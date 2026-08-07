@@ -13,17 +13,6 @@ const USE_CASES = [
 
 export const contactRouter = Router();
 
-contactRouter.use((req, res, next) => {
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
-  if (req.method === "OPTIONS") {
-    res.sendStatus(200);
-    return;
-  }
-  next();
-});
-
 /** POST /api/contact — submit contact form, store in Supabase contact_messages */
 contactRouter.post("/", async (req: Request, res: Response) => {
   try {

@@ -6,6 +6,7 @@ import { userRouter } from "../src/routes/user.js";
 import { codeSculptRouter } from "../src/routes/codeSculpt.js";
 import { logger } from "../src/logger.js";
 import { initDb } from "../src/db.js";
+import { config as appConfig } from "../src/config.js";
 import pinoHttp from "pino-http";
 
 // Water can make up to four sequential LLM calls. Keep the HTTP response
@@ -25,13 +26,17 @@ async function ensureDb() {
 
 const app = express();
 
-// Middleware
-// Configure CORS to allow all origins (for development and production)
+// Middleware — CORS allowlist (same as server.ts)
 app.use(cors({
-  origin: '*',
-  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'webhook-id', 'webhook-signature', 'webhook-timestamp'],
-  credentials: false
+  origin(origin, callback) {
+    if (!origin || appConfig.corsOrigins.includes(origin)) {
+      return callback(null, true);
+    }
+    return callback(null, false);
+  },
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'webhook-id', 'webhook-signature', 'webhook-timestamp', 'X-Hydrilla-Internal'],
+  credentials: true
 }));
 
 // Raw body parser for webhook signature verification (must be before json parser)

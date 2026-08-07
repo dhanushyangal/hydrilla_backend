@@ -1,4 +1,5 @@
 import dotenv from "dotenv";
+import crypto from "crypto";
 
 // Load .env then .env.local (local overrides — matches Next.js convention)
 dotenv.config();
@@ -19,11 +20,28 @@ function gatewayUrl(...envKeys: string[]): string {
   return GATEWAY_URL;
 }
 
+function requireEnv(name: string): string {
+  const v = process.env[name]?.trim();
+  if (!v) {
+    throw new Error(
+      `[config] Missing required environment variable: ${name}. Set it in .env (do not hardcode secrets in source).`
+    );
+  }
+  return v;
+}
+
+const defaultCorsOrigins = [
+  "https://hydrilla.co",
+  "https://www.hydrilla.co",
+  "http://localhost:3000",
+  "http://127.0.0.1:3000",
+];
+
 export const config = {
   port: parseInt(process.env.PORT || "4000", 10),
   supabase: {
-    url: process.env.SUPABASE_URL || "https://vyyzepmcqeqoxwjqnrxh.supabase.co",
-    serviceRoleKey: process.env.SUPABASE_SERVICE_ROLE_KEY || "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InZ5eXplcG1jcWVxb3h3anFucnhoIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc2NTgxNjQ3MSwiZXhwIjoyMDgxMzkyNDcxfQ.C6j9KLUGqd2erlpKJZlyyjDiN6oetytGaD_X-oMqq9A",
+    url: requireEnv("SUPABASE_URL"),
+    serviceRoleKey: requireEnv("SUPABASE_SERVICE_ROLE_KEY"),
   },
   clerk: {
     publishableKey: process.env.NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY || "",
@@ -39,6 +57,13 @@ export const config = {
   trellisGateway: {
     url: gatewayUrl("TRELLIS_GATEWAY_URL", "TRELLIS_API_URL", "HUNYUAN_API_URL"),
   },
+  /** Shared secret for Node ↔ GPU and internal job webhooks */
+  internalApiSecret: process.env.HYDRILLA_INTERNAL_API_SECRET || "",
+  corsOrigins: (
+    process.env.CORS_ORIGINS
+      ? process.env.CORS_ORIGINS.split(",").map((o) => o.trim()).filter(Boolean)
+      : defaultCorsOrigins
+  ),
   s3: {
     bucket: process.env.S3_BUCKET || "hydrilla-outputs-1",
     region: process.env.S3_REGION || "us-east-1",
@@ -47,12 +72,12 @@ export const config = {
   pollIntervalMs: parseInt(process.env.POLL_INTERVAL_MS || "2000", 10),
   email: {
     url: process.env.ZEPTOMAIL_API_URL || "https://api.zeptomail.in/v1.1/email",
-    token: process.env.ZEPTOMAIL_TOKEN || "Zoho-enczapikey PHtE6r0LFLy5jW4poREJ7PbrEZPxMtwn9O02K1RPstxDWaVWGk1Vq9p+kmKzrxkqUaNBHfPIzolquO+e5e2CIm/rNz5ODmqyqK3sx/VYSPOZsbq6x00VtF8cd0bbVIToddZj3CPevdrZNA==",
+    token: process.env.ZEPTOMAIL_TOKEN || "",
     fromAddress: process.env.ZEPTOMAIL_FROM_ADDRESS || "noreply@hydrilla.co",
     fromName: process.env.ZEPTOMAIL_FROM_NAME || "Hydrilla",
     frontendUrl: process.env.FRONTEND_URL || "https://hydrilla.co",
   },
-  adminEmails: (process.env.ADMIN_EMAILS || "dhanushyangal@gmail.com,dhanushyangal1@gmail.com,tharak.nagaveti@gmail.com")
+  adminEmails: (process.env.ADMIN_EMAILS || "")
     .split(",")
     .map((e) => e.trim())
     .filter(Boolean),
@@ -91,10 +116,6 @@ if (!config.hunyuanApi.url) {
   console.warn("[config] HUNYUAN_API_URL is missing. API calls will fail until set.");
 }
 
-if (!config.supabase.serviceRoleKey) {
-  console.warn("[config] SUPABASE_SERVICE_ROLE_KEY is missing. Database operations will fail until set.");
-}
-
 if (!config.clerk.secretKey) {
   console.warn("[config] CLERK_SECRET_KEY is missing. Authentication will fail until set.");
 }
@@ -125,6 +146,16 @@ if (!config.userApiKeysEncryptionSecret) {
   );
 }
 
+if (!config.internalApiSecret) {
+  console.warn(
+    "[config] HYDRILLA_INTERNAL_API_SECRET is missing. GPU gateway calls and internal job webhooks will be rejected until set."
+  );
+}
+
+if (!config.adminEmails.length) {
+  console.warn("[config] ADMIN_EMAILS is missing. Admin-only routes will deny all users.");
+}
+
 const onVercel = process.env.VERCEL === "1" || !!process.env.VERCEL_ENV;
 if (
   onVercel &&
@@ -133,4 +164,13 @@ if (
   console.warn(
     "[config] Vercel: AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY missing — image uploads will fail until set (with S3_BUCKET, S3_REGION)."
   );
+}
+
+/** Constant-time compare for internal API secret headers */
+export function timingSafeEqualString(a: string, b: string): boolean {
+  if (!a || !b) return false;
+  const bufA = Buffer.from(a);
+  const bufB = Buffer.from(b);
+  if (bufA.length !== bufB.length) return false;
+  return crypto.timingSafeEqual(bufA, bufB);
 }

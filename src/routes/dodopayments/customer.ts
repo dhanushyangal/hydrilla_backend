@@ -1,8 +1,12 @@
 import express from 'express';
 import { getDodoPaymentsClient } from '../../lib/dodopayments';
 import { z } from 'zod';
+import { scopeToUserDodoCustomer } from './scopeCustomer.js';
 
 const router = express.Router();
+
+// Scope customer_id reads/updates to the authenticated user's linked Dodo customer
+router.use(scopeToUserDodoCustomer);
 
 const customerCreateSchema = z.object({
     email: z.string().email("Invalid email format"),

@@ -28,7 +28,7 @@ const OBJECT_STUDIO: SkillPromptPack = {
     lighting:
       "Ensure materials respond under MeshStandardMaterial defaults. Optional subtle emissive accents. No scene lights required in the factory.",
     interaction:
-      "Expose sculptRuntime.nodes, sockets, and a subtle tick idle. Parts that should move get named pivots.",
+      "Expose sculptRuntime.nodes and sockets. Named pivots OK for future use — keep everything static in createModel.",
     optimization:
       "Share geometries/materials where repeated. Keep under ~400 lines if possible. Clear disposal ownership on the root Group.",
   },
@@ -38,7 +38,7 @@ const OBJECT_STUDIO: SkillPromptPack = {
     "Named hierarchy matches the spec (≥60% component names present)",
     "No banned APIs (fetch/eval/loaders)",
     "Materials show purposeful PBR contrast (not one flat grey)",
-    "root.userData.sculptRuntime and tick exist",
+    "root.userData.sculptRuntime exists; pose is static",
   ],
   strictSpecExtra: `Strict quality: for complexity moderate/complex require detailInventory length ≥ 4 / ≥ 8 and at least one repetition or localFeatures note when applicable.`,
 };
@@ -57,7 +57,7 @@ const CHARACTER: SkillPromptPack = {
     material: "Separate materials for skin, hair/cloth, accents. Soft roughness for skin; fabric/metal as needed.",
     surface: "Simple freckle/wear accents optional via CanvasTexture. Keep stylized.",
     lighting: "Skin should not look plastic — roughness ≥ 0.45 unless intentionally glossy.",
-    interaction: "Sockets: head, hand_L, hand_R, root. tick for gentle idle (breath/sway).",
+    interaction: "Sockets: head, hand_L, hand_R, root. Static rest pose only — no time-based animation in createModel.",
     optimization: "Limit draw complexity; share materials across symmetric limbs.",
   },
   evaluatorCriteria: [
@@ -67,31 +67,33 @@ const CHARACTER: SkillPromptPack = {
     "sculptRuntime sockets include head or root",
     "No banned APIs",
     "Materials differentiate skin vs cloth/armor",
+    "Pose is static",
   ],
   strictSpecExtra: `Characters need ≥ 6 components including head and at least two limbs or appendages.`,
 };
 
 const ANIMATION: SkillPromptPack = {
   id: "animation",
-  plannerSystemExtra: `Domain: animation-ready prop or character.
-- Spec animation.sockets must list every pivot that should move.
+  plannerSystemExtra: `Domain: animation-ready prop or character (static pose in preview).
+- Spec animation.sockets must list every pivot that could move later.
 - Prefer clear joint hierarchy for later Mixamo-style retarget (topology only — no auto-skin in v1).
-- qualityContract.mustHaveDetails include idle motion intent.`,
+- qualityContract.mustHaveDetails include named sockets and a clear static rest pose.
+- createModel must not animate; preview is a frozen pose.`,
   passExtras: {
-    blockout: "Hierarchy-first blockout with empty pivot Groups where joints will live.",
+    blockout: "Hierarchy-first blockout with empty pivot Groups where joints will live. Static rest pose.",
     structural: "Joints as THREE.Group pivots; meshes as children. No skinned mesh required yet.",
     form: "Keep joint pivots at anatomically/mechanically sensible origins.",
-    material: "Stable materials that won't fight motion readability.",
-    surface: "Avoid heavy displacement that breaks silhouette in motion.",
-    lighting: "Keep shading readable while rotating.",
+    material: "Stable materials with clear part readability in a static pose.",
+    surface: "Avoid heavy displacement that breaks silhouette.",
+    lighting: "Keep shading readable under default Orbit view.",
     interaction:
-      "Mandatory: root.userData.tick drives a clear idle (bob, sway, or mechanical cycle). Document sockets in sculptRuntime.sockets. Optionally stub AnimationClip-style tracks as comments or userData.clipHints.",
-    optimization: "Ensure tick is cheap (no allocations per frame).",
+      "Document sockets in sculptRuntime.sockets. Optionally stub AnimationClip-style tracks as comments or userData.clipHints. Do not animate in createModel.",
+    optimization: "No per-frame animation work inside the factory.",
   },
   evaluatorCriteria: [
     "sculptRuntime.sockets is non-empty",
-    "tick implements visible idle motion",
-    "Pivot Groups exist for moving parts",
+    "Pose is static (no time-based animation in createModel)",
+    "Pivot Groups exist for future moving parts",
     "createModel contract holds",
     "No banned APIs",
   ],
@@ -125,33 +127,11 @@ const GAME: SkillPromptPack = {
   strictSpecExtra: `At least one component note should mention collider or lod.`,
 };
 
-const ENVIRONMENT: SkillPromptPack = {
-  id: "environment",
-  plannerSystemExtra: `Domain: small environment / diorama (when unlocked). Keep to a bounded set of props + ground.`,
-  passExtras: {
-    blockout: "Ground plane + primary structures.",
-  },
-  evaluatorCriteria: ["Ground present", "Multiple props parented correctly", "No banned APIs"],
-  strictSpecExtra: `Include a ground/floor component.`,
-};
-
-const WORLD: SkillPromptPack = {
-  id: "world",
-  plannerSystemExtra: `Domain: procedural world sketch (when unlocked). Prefer modular repeating blocks.`,
-  passExtras: {
-    blockout: "Modular block layout — not a single megamesh.",
-  },
-  evaluatorCriteria: ["Modular groups", "No banned APIs"],
-  strictSpecExtra: `Prefer repetition systems for city-like layouts.`,
-};
-
 const PACKS: Record<WaterSkillId, SkillPromptPack> = {
   "object-studio": OBJECT_STUDIO,
   character: CHARACTER,
   animation: ANIMATION,
   game: GAME,
-  environment: ENVIRONMENT,
-  world: WORLD,
 };
 
 export function getSkillPromptPack(skillId: WaterSkillId): SkillPromptPack {
