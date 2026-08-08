@@ -64,6 +64,7 @@ export async function generatePass(params: {
   /** Extra user instruction (e.g. retry after refusal). */
   retryHint?: string | null;
   timeoutMs?: number;
+  signal?: AbortSignal;
 }): Promise<{ code: string; usage: LlmTokenUsage | null }> {
   const pack = getSkillPromptPack(params.skillId);
   const skillExtra = pack.passExtras[params.passId] || "";
@@ -115,6 +116,7 @@ Generate the complete TypeScript factory for this pass now. TypeScript only.`;
     imageUrl: params.imageUrl,
     maxTokens: 8192,
     timeoutMs: params.timeoutMs,
+    signal: params.signal,
   });
   const code = extractCode(result.text);
   return { code, usage: result.usage };

@@ -23,6 +23,10 @@ import { buildMinimalFactory } from "./fallbackFactory.js";
 import { runPlanner } from "./planner.js";
 import type { HarnessProgressPass, PassReview, StudioPipelineResult } from "./types.js";
 import { logger } from "../../../logger.js";
+import {
+  isUserCancelError,
+  throwIfAborted,
+} from "../cancelRegistry.js";
 
 /**
  * Soft wall-clock budgets. Cursor Cloud Agents need 1–4 min per call —
@@ -45,6 +49,7 @@ export async function runStudioPipeline(params: {
   skillId: WaterSkillId;
   qualityTier: QualityTier;
   onPass?: (pass: HarnessProgressPass) => void | Promise<void>;
+  signal?: AbortSignal;
 }): Promise<StudioPipelineResult> {
   const started = Date.now();
   const isCursor = params.provider === "cursor";
@@ -62,6 +67,8 @@ export async function runStudioPipeline(params: {
     }
   };
 
+  throwIfAborted(params.signal);
+
   const intake = intakeGate({ prompt: params.prompt, imageUrl: params.imageUrl });
   if (!intake.ok) {
     throw new Error(intake.violations.join(" ") || "intake_failed");
@@ -69,6 +76,7 @@ export async function runStudioPipeline(params: {
 
   await note("assessment");
   await note("planner");
+  throwIfAborted(params.signal);
   const planned = await runPlanner({
     provider: params.provider,
     modelId: params.modelId,
@@ -78,6 +86,7 @@ export async function runStudioPipeline(params: {
     skillId: params.skillId,
     qualityTier: params.qualityTier,
     timeoutMs: stageTimeoutMs(isCursor ? 210_000 : 50_000, isCursor ? 40_000 : 40_000),
+    signal: params.signal,
   });
 
   let tokenUsage = planned.tokenUsage;
@@ -97,6 +106,7 @@ export async function runStudioPipeline(params: {
   let usedFallback = false;
 
   for (const passId of unlocked) {
+    throwIfAborted(params.signal);
     if (remainingMs() < 20_000) {
       partial = true;
       logger.warn(
@@ -126,8 +136,10 @@ export async function runStudioPipeline(params: {
         passId,
         previousCode: factoryCode || null,
         timeoutMs: stageTimeoutMs(),
+        signal: params.signal,
       });
     } catch (err: any) {
+      if (isUserCancelError(err)) throw err;
       logger.warn({ err: err?.message, passId }, "Water generatePass failed — keeping prior code");
       if (factoryCode.length >= 200) {
         partial = true;
@@ -143,6 +155,7 @@ export async function runStudioPipeline(params: {
       // No prior code — retry once with anti-refusal hint
       try {
         if (remainingMs() < 20_000) throw new Error("Water Studio time budget exhausted");
+        throwIfAborted(params.signal);
         gen = await generatePass({
           provider: params.provider,
           modelId: params.modelId,
@@ -156,8 +169,10 @@ export async function runStudioPipeline(params: {
           retryHint:
             "RETRY: Previous call failed. Output a complete createModel() TypeScript module for an ORIGINAL stylized character/object inspired by the brief. No apologies.",
           timeoutMs: stageTimeoutMs(),
+          signal: params.signal,
         });
       } catch (err2: any) {
+        if (isUserCancelError(err2)) throw err2;
         logger.warn({ err: err2?.message, passId }, "Water generatePass retry failed");
         break;
       }
@@ -193,12 +208,14 @@ export async function runStudioPipeline(params: {
           retryHint:
             "RETRY: Your last reply was unusable (too short, missing createModel, or a refusal). Emit ONLY a full TypeScript module. Invent an original stylized design inspired by the brief — never refuse famous names.",
           timeoutMs: stageTimeoutMs(),
+          signal: params.signal,
         });
         tokenUsage = addTokenUsage(tokenUsage, retry.usage);
         if (!looksLikeRefusalOrEmpty(retry.code)) {
           gen = retry;
         }
       } catch (err: any) {
+        if (isUserCancelError(err)) throw err;
         logger.warn({ err: err?.message, passId }, "Water refusal-retry failed");
       }
     }
@@ -234,6 +251,7 @@ export async function runStudioPipeline(params: {
     }
 
     await note("evaluate");
+    throwIfAborted(params.signal);
     let evaluation = await evaluatePass({
       provider: params.provider,
       modelId: params.modelId,
@@ -248,6 +266,7 @@ export async function runStudioPipeline(params: {
         (params.qualityTier === "studio" && passId !== "blockout" && Date.now() - started > budget * 0.55),
       refined: false,
       timeoutMs: stageTimeoutMs(30_000),
+      signal: params.signal,
     });
     tokenUsage = addTokenUsage(tokenUsage, evaluation.usage);
     if (evaluation.usage) {
@@ -283,6 +302,7 @@ export async function runStudioPipeline(params: {
           violations: evaluation.codeGate.ok ? undefined : evaluation.codeGate.violations,
           evaluatorFeedback: evalFeedback,
           timeoutMs: stageTimeoutMs(),
+          signal: params.signal,
         });
         tokenUsage = addTokenUsage(tokenUsage, retryGen.usage);
         if (!looksLikeRefusalOrEmpty(retryGen.code)) {
@@ -298,6 +318,7 @@ export async function runStudioPipeline(params: {
         }
 
         await note("evaluate");
+        throwIfAborted(params.signal);
         evaluation = await evaluatePass({
           provider: params.provider,
           modelId: params.modelId,
@@ -309,10 +330,12 @@ export async function runStudioPipeline(params: {
           skipLlm: params.qualityTier === "fast" || params.qualityTier === "studio",
           refined: true,
           timeoutMs: stageTimeoutMs(30_000),
+          signal: params.signal,
         });
         tokenUsage = addTokenUsage(tokenUsage, evaluation.usage);
         lastCodeGate = evaluation.codeGate;
       } catch (err: any) {
+        if (isUserCancelError(err)) throw err;
         logger.warn({ err: err?.message, passId }, "Water refine failed — keeping prior attempt");
       }
     }
@@ -343,6 +366,7 @@ export async function runStudioPipeline(params: {
   }
 
   if (looksLikeRefusalOrEmpty(factoryCode)) {
+    throwIfAborted(params.signal);
     logger.warn(
       { skillId: params.skillId, qualityTier: params.qualityTier, modelId: params.modelId },
       "Water Studio using deterministic fallback factory"

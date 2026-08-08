@@ -1,4 +1,9 @@
 import type { ApiKeyProvider } from "./userApiKeysCrypto.js";
+import {
+  combineAbortSignals,
+  isUserCancelError,
+  WATER_CANCELLED_MESSAGE,
+} from "./water/cancelRegistry.js";
 
 export type CatalogModel = {
   id: string;
@@ -638,9 +643,10 @@ async function callCursorCloudAgent(params: {
   userText: string;
   imageUrl?: string | null;
   timeoutMs?: number;
+  signal?: AbortSignal;
 }): Promise<LlmCallResult> {
   const timeoutMs = params.timeoutMs ?? 210_000;
-  const signal = AbortSignal.timeout(timeoutMs);
+  const signal = combineAbortSignals(timeoutMs, params.signal);
   let selection = await resolveCursorAgentModel(params.apiKey, params.modelId);
   const promptText = [
     params.system.trim(),
@@ -724,34 +730,50 @@ async function callCursorCloudAgent(params: {
   };
 
   while (Date.now() < deadline) {
-    await new Promise((r) => setTimeout(r, 2000));
-    const runRes = await fetch(`https://api.cursor.com/v1/agents/${agentId}/runs/${runId}`, {
-      signal,
-      headers: { Authorization: `Bearer ${params.apiKey}` },
-    });
-    if (!runRes.ok) {
-      const errBody = await runRes.text().catch(() => "");
-      throw new Error(friendlyProviderError("cursor", runRes.status, errBody));
-    }
-    const run = (await runRes.json()) as {
-      status?: string;
-      result?: string;
-    };
-    lastStatus = run.status || lastStatus;
-    if (run.status && terminal.has(run.status)) {
-      if (run.status !== "FINISHED") {
-        archiveAgent();
-        throw new Error(`Cursor run ended with status ${run.status}`);
-      }
-      const text = (run.result || "").trim();
-      if (!text) {
-        archiveAgent();
-        throw new Error("Cursor run finished with empty result");
-      }
-      // Fetch usage before archive — metering can lag slightly after FINISHED.
-      const usage = await fetchCursorRunUsage(params.apiKey, agentId, runId);
+    if (signal.aborted) {
       archiveAgent();
-      return { text, usage };
+      const err = new Error(WATER_CANCELLED_MESSAGE);
+      err.name = "AbortError";
+      throw err;
+    }
+    await new Promise((r) => setTimeout(r, 2000));
+    try {
+      const runRes = await fetch(`https://api.cursor.com/v1/agents/${agentId}/runs/${runId}`, {
+        signal,
+        headers: { Authorization: `Bearer ${params.apiKey}` },
+      });
+      if (!runRes.ok) {
+        const errBody = await runRes.text().catch(() => "");
+        throw new Error(friendlyProviderError("cursor", runRes.status, errBody));
+      }
+      const run = (await runRes.json()) as {
+        status?: string;
+        result?: string;
+      };
+      lastStatus = run.status || lastStatus;
+      if (run.status && terminal.has(run.status)) {
+        if (run.status !== "FINISHED") {
+          archiveAgent();
+          throw new Error(`Cursor run ended with status ${run.status}`);
+        }
+        const text = (run.result || "").trim();
+        if (!text) {
+          archiveAgent();
+          throw new Error("Cursor run finished with empty result");
+        }
+        // Fetch usage before archive — metering can lag slightly after FINISHED.
+        const usage = await fetchCursorRunUsage(params.apiKey, agentId, runId);
+        archiveAgent();
+        return { text, usage };
+      }
+    } catch (err) {
+      if (isUserCancelError(err) || signal.aborted) {
+        archiveAgent();
+        const e = new Error(WATER_CANCELLED_MESSAGE);
+        e.name = "AbortError";
+        throw e;
+      }
+      throw err;
     }
   }
 
@@ -830,6 +852,8 @@ export async function callLLM(params: {
   maxTokens?: number;
   /** Hard cap per provider call so one pass cannot strand a Water job forever. */
   timeoutMs?: number;
+  /** User cancel (Water). Combined with timeout via AbortSignal.any. */
+  signal?: AbortSignal;
 }): Promise<LlmCallResult> {
   const { provider, apiKey, system, userText } = params;
   const imageUrl = params.imageUrl || null;
@@ -837,7 +861,7 @@ export async function callLLM(params: {
   // Cursor Cloud Agents commonly need 2–4 min; 75s default aborted Studio runs into fallback.
   const timeoutMs =
     params.timeoutMs ?? (provider === "cursor" ? 210_000 : 75_000);
-  const signal = AbortSignal.timeout(timeoutMs);
+  const signal = combineAbortSignals(timeoutMs, params.signal);
   const model = resolveNativeModel(provider, params.modelId);
 
   if (provider === "cursor") {
@@ -848,6 +872,7 @@ export async function callLLM(params: {
       userText,
       imageUrl,
       timeoutMs,
+      signal: params.signal,
     });
   }
 

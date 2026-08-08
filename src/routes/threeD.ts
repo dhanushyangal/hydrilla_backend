@@ -1316,7 +1316,7 @@ threeDRouter.get("/status/:jobId", requireAuth, async (req, res) => {
 });
 
 // ============================================
-// Cancel 3D Job (proxy to Python gateway)
+// Cancel 3D / image Job (proxy to Python gateway)
 // ============================================
 threeDRouter.post("/cancel/:jobId", requireAuth, async (req, res) => {
   const { jobId } = req.params;
@@ -1327,15 +1327,54 @@ threeDRouter.post("/cancel/:jobId", requireAuth, async (req, res) => {
     if (!job) return res.status(404).json({ error: "Job not found" });
     if (denyIfNotJobOwner(job, userId, res)) return;
 
-    const { response } = await fetchGateway(`/cancel/${jobId}`, { method: "POST" }, { job });
-    const data = await response.json().catch(() => ({}));
-
-    if (!response.ok) {
-      return res.status(response.status).json({ error: data.error || "Failed to cancel job" });
+    if (isWaterJobId(jobId) || isWaterJobRow(job as any)) {
+      return res.status(400).json({
+        error: "Use POST /api/water/jobs/:jobId/cancel for Water jobs",
+      });
     }
 
-    await updateJobStatus(jobId, { status: "FAIL", errorMessage: "Cancelled by user" });
-    res.json({ job_id: jobId, status: "cancelled", message: data.message || "Job cancelled" });
+    const status = String(job.status || "").toUpperCase();
+    if (status === "DONE") {
+      return res.status(400).json({ error: "Job already completed" });
+    }
+    if (status === "FAIL" && String(job.errorMessage || "").toLowerCase().includes("cancel")) {
+      return res.json({ job_id: jobId, status: "cancelled", message: "Job cancelled" });
+    }
+
+    // Mark local job cancelled while still in-flight so UI/poll see FAIL immediately.
+    const wasInFlight = status === "WAIT" || status === "RUN" || status === "PENDING" || !status;
+    if (wasInFlight) {
+      await updateJobStatus(jobId, { status: "FAIL", errorMessage: "Cancelled by user" });
+    }
+
+    // Best-effort notify GPU so workers skip remaining stages
+    let gatewayMessage = "Job cancelled";
+    try {
+      const { response } = await fetchGateway(`/cancel/${jobId}`, { method: "POST" }, { job });
+      const data = await response.json().catch(() => ({} as any));
+      if (response.ok) {
+        gatewayMessage = data.message || gatewayMessage;
+      } else if (response.status === 404 || response.status === 400) {
+        // Job never reached GPU, or already terminal there — local cancel still wins
+        logger.info(
+          { jobId, gatewayStatus: response.status, err: data.error },
+          "GPU cancel soft-succeeded"
+        );
+      } else {
+        logger.warn(
+          { jobId, gatewayStatus: response.status, err: data.error },
+          "GPU cancel returned error; local job already marked cancelled"
+        );
+      }
+    } catch (gwErr: any) {
+      logger.warn({ jobId, err: gwErr?.message }, "GPU cancel request failed; local job marked cancelled");
+    }
+
+    if (!wasInFlight && status !== "FAIL") {
+      await updateJobStatus(jobId, { status: "FAIL", errorMessage: "Cancelled by user" });
+    }
+
+    res.json({ job_id: jobId, status: "cancelled", message: gatewayMessage });
   } catch (err: any) {
     logger.error(err, "cancel job");
     res.status(500).json({ error: gatewayErrorToUserMessage(err) });

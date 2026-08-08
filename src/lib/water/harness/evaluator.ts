@@ -8,6 +8,7 @@ import type { ApiKeyProvider } from "../../userApiKeysCrypto.js";
 import type { BuildPassId, WaterSkillId } from "../../waterSkills.js";
 import { getSkillPromptPack } from "../skills/index.js";
 import type { PassReview, PassReviewAction, RichSculptSpec } from "./types.js";
+import { isUserCancelError } from "../cancelRegistry.js";
 
 const EVAL_SYSTEM = `You are a skeptical technical art director reviewing procedural Three.js factory code.
 You did NOT write this code. Be strict. Do not praise mediocre work.
@@ -42,6 +43,7 @@ export async function evaluatePass(params: {
   skipLlm?: boolean;
   refined: boolean;
   timeoutMs?: number;
+  signal?: AbortSignal;
 }): Promise<EvalResult> {
   const codeGate = validateFactoryCode(params.code, params.spec);
   const pack = getSkillPromptPack(params.skillId);
@@ -100,6 +102,7 @@ ${params.code.slice(0, 24000)}
 Return JSON only.`,
       maxTokens: 1024,
       timeoutMs: params.timeoutMs,
+      signal: params.signal,
     });
 
     const parsed = extractEvalJson(result.text);
@@ -120,7 +123,8 @@ Return JSON only.`,
         refined: params.refined,
       },
     };
-  } catch {
+  } catch (err) {
+    if (isUserCancelError(err)) throw err;
     // If evaluator fails, don't block the pipeline — continue on gate pass
     return {
       codeGate,

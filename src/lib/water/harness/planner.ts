@@ -115,6 +115,7 @@ export async function runPlanner(params: {
   skillId: WaterSkillId;
   qualityTier: QualityTier;
   timeoutMs?: number;
+  signal?: AbortSignal;
 }): Promise<{
   spec: RichSculptSpec;
   gate: GateResult;
@@ -152,6 +153,7 @@ Plan the procedural reconstruction. Return the JSON spec only.`;
       imageUrl: params.imageUrl,
       maxTokens: 4096,
       timeoutMs: params.timeoutMs,
+      signal: params.signal,
     });
     usage = addTokenUsage(usage, result.usage);
     if (result.usage) {

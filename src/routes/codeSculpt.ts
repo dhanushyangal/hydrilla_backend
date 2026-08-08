@@ -13,6 +13,13 @@ import {
 import { intakeGate } from "../lib/codeSculptPipeline.js";
 import { runStudioPipeline } from "../lib/water/harness/run.js";
 import {
+  registerWaterCancel,
+  cancelWaterJob,
+  clearWaterCancel,
+  isUserCancelError,
+  WATER_CANCELLED_MESSAGE,
+} from "../lib/water/cancelRegistry.js";
+import {
   parseQualityTier,
   parseWaterSkillId,
 } from "../lib/waterSkills.js";
@@ -164,6 +171,7 @@ codeSculptRouter.post("/generate", requireAuth, async (req, res) => {
 
     // The client polls the job. On Vercel, waitUntil keeps the function alive
     // after the response; locally the normal Node process owns the task.
+    const cancelController = registerWaterCancel(jobId);
     const generationTask = (async () => {
       try {
         const result = await runStudioPipeline({
@@ -174,10 +182,34 @@ codeSculptRouter.post("/generate", requireAuth, async (req, res) => {
           imageUrl,
           skillId,
           qualityTier,
+          signal: cancelController.signal,
           onPass: async (pass) => {
+            if (cancelController.signal.aborted) return;
             await supabase.from("jobs").update({ sculpt_pass: pass }).eq("id", jobId);
           },
         });
+
+        if (cancelController.signal.aborted) {
+          await updateCodeSculptResult(jobId, {
+            status: "FAIL",
+            errorCode: "cancelled",
+            errorMessage: WATER_CANCELLED_MESSAGE,
+            sculptPass: "cancelled",
+          });
+          return;
+        }
+
+        // Don't overwrite a cancel that won the race after the pipeline returned
+        {
+          const { data: latest } = await supabase
+            .from("jobs")
+            .select("status, error_code")
+            .eq("id", jobId)
+            .maybeSingle();
+          if (latest?.error_code === "cancelled") {
+            return;
+          }
+        }
 
         const factoryCode = result.factoryCode;
         if (!factoryCode || factoryCode.length < 200) {
@@ -233,6 +265,18 @@ codeSculptRouter.post("/generate", requireAuth, async (req, res) => {
             : null,
         });
       } catch (err: any) {
+        if (isUserCancelError(err) || cancelController.signal.aborted) {
+          logger.info({ jobId }, "Water Studio generation cancelled by user");
+          try {
+            await updateCodeSculptResult(jobId, {
+              status: "FAIL",
+              errorCode: "cancelled",
+              errorMessage: WATER_CANCELLED_MESSAGE,
+              sculptPass: "cancelled",
+            });
+          } catch {}
+          return;
+        }
         logger.error({ err, jobId }, "Water Studio generation failed");
         try {
           await updateJobStatus(jobId, {
@@ -241,6 +285,8 @@ codeSculptRouter.post("/generate", requireAuth, async (req, res) => {
             errorMessage: err?.message?.slice(0, 500) || "Generation failed",
           });
         } catch {}
+      } finally {
+        clearWaterCancel(jobId);
       }
     })();
 
@@ -261,6 +307,42 @@ codeSculptRouter.post("/generate", requireAuth, async (req, res) => {
   } catch (err: any) {
     logger.error({ err }, "POST /api/water/generate failed");
     res.status(500).json({ error: err?.message || "Water failed" });
+  }
+});
+
+codeSculptRouter.post("/jobs/:jobId/cancel", requireAuth, async (req, res) => {
+  try {
+    const userId = req.userId!;
+    const jobId = req.params.jobId;
+    const job = await getJobForUser(jobId, userId);
+    if (!job) return res.status(404).json({ error: "Job not found" });
+
+    const status = String((job as { status?: string }).status || "").toUpperCase();
+    if (status === "DONE") {
+      return res.status(400).json({ error: "Job already completed" });
+    }
+    const errMsg = String((job as { errorMessage?: string | null }).errorMessage || "");
+    if (status === "FAIL" && /cancel/i.test(errMsg)) {
+      return res.json({ job_id: jobId, status: "cancelled", message: WATER_CANCELLED_MESSAGE });
+    }
+
+    cancelWaterJob(jobId);
+
+    await updateCodeSculptResult(jobId, {
+      status: "FAIL",
+      errorCode: "cancelled",
+      errorMessage: WATER_CANCELLED_MESSAGE,
+      sculptPass: "cancelled",
+    });
+
+    res.json({
+      job_id: jobId,
+      status: "cancelled",
+      message: WATER_CANCELLED_MESSAGE,
+    });
+  } catch (err: any) {
+    logger.error({ err }, "POST /api/water/jobs/:jobId/cancel failed");
+    res.status(500).json({ error: err?.message || "Failed to cancel Water job" });
   }
 });
 
