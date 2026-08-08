@@ -1794,7 +1794,9 @@ threeDRouter.get("/glb/:jobId", requireAuth, async (req, res) => {
 // ============================================
 // Proxy image from S3 (to avoid CORS issues when fetching for combined edits)
 // ============================================
-threeDRouter.get("/image-proxy", requireAuth, async (req, res) => {
+// No requireAuth: <img> tags cannot send Bearer tokens. Access is limited by
+// isAllowedImageProxyUrl (Hydrilla S3 / GPU hosts only) — objects are already public.
+threeDRouter.get("/image-proxy", async (req, res) => {
   const imageUrl = req.query.url as string;
   if (!imageUrl) {
     return res.status(400).json({ error: "url query parameter is required" });

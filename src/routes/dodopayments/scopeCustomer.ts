@@ -1,6 +1,6 @@
 import { Request, Response, NextFunction } from "express";
-import { supabase } from "../db.js";
-import { logger } from "../logger.js";
+import { supabase } from "../../db.js";
+import { logger } from "../../logger.js";
 
 /**
  * Resolve the Dodo customer_id linked to the authenticated Clerk user.
