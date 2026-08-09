@@ -11,7 +11,7 @@ import {
 } from "../repository/userApiKeys.js";
 import {
   isApiKeyProvider,
-  lookLikeKey,
+  lookLikeKeyError,
   providerLabel,
 } from "../lib/userApiKeysCrypto.js";
 import {
@@ -113,11 +113,9 @@ userRouter.put("/api-keys/:provider", requireAuth, async (req, res) => {
       return res.status(400).json({ error: "Unsupported provider" });
     }
     const apiKey = String(req.body?.apiKey || "").trim();
-    if (!apiKey) {
-      return res.status(400).json({ error: "apiKey is required" });
-    }
-    if (!lookLikeKey(provider, apiKey)) {
-      return res.status(400).json({ error: "API key format looks invalid" });
+    const formatError = lookLikeKeyError(provider, apiKey);
+    if (formatError) {
+      return res.status(400).json({ error: formatError });
     }
 
     await syncUserToDatabase(userId);

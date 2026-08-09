@@ -136,6 +136,14 @@ export async function setUserApiKeyStatus(
   if (error) throw error;
 }
 
+/** Retired Claude 4.5 catalog ids → current Water Anthropic models. */
+function migrateDefaultCodeModel(id: string | null): string | null {
+  if (!id) return null;
+  if (id === "claude-sonnet-4-5") return "claude-sonnet-5";
+  if (id === "claude-opus-4-5") return "claude-opus-5";
+  return id;
+}
+
 export async function getUserModelPrefs(userId: string): Promise<{
   defaultMeshModel: string;
   defaultCodeModel: string | null;
@@ -146,9 +154,22 @@ export async function getUserModelPrefs(userId: string): Promise<{
     .eq("user_id", userId)
     .maybeSingle();
 
+  const rawCode = data?.default_code_model || null;
+  const migrated = migrateDefaultCodeModel(rawCode);
+  // Persist migration so subsequent loads / jobs use the current catalog id.
+  if (rawCode && migrated && migrated !== rawCode) {
+    void supabase
+      .from("user_model_prefs")
+      .update({
+        default_code_model: migrated,
+        updated_at: new Date().toISOString(),
+      })
+      .eq("user_id", userId);
+  }
+
   return {
     defaultMeshModel: data?.default_mesh_model || "trilles",
-    defaultCodeModel: data?.default_code_model || null,
+    defaultCodeModel: migrated,
   };
 }
 
@@ -162,10 +183,11 @@ export async function upsertUserModelPrefs(
     prefs.defaultMeshModel !== undefined
       ? prefs.defaultMeshModel || "trilles"
       : current.defaultMeshModel;
-  const code =
+  const code = migrateDefaultCodeModel(
     prefs.defaultCodeModel !== undefined
       ? prefs.defaultCodeModel
-      : current.defaultCodeModel;
+      : current.defaultCodeModel
+  );
 
   const { error } = await supabase.from("user_model_prefs").upsert(
     {

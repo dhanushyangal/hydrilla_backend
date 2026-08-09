@@ -82,11 +82,22 @@ export function providerLabel(provider: ApiKeyProvider): string {
 export function lookLikeKey(provider: ApiKeyProvider, value: string): boolean {
   const v = value.trim();
   if (v.length < 20) return false;
-  if (provider === "anthropic") return v.startsWith("sk-ant-") || v.length > 40;
+  // Anthropic Console keys are always sk-ant-…
+  if (provider === "anthropic") return v.startsWith("sk-ant-");
   if (provider === "openai") return v.startsWith("sk-") || v.length > 40;
   if (provider === "openrouter") return v.startsWith("sk-or-") || v.length > 40;
   if (provider === "gemini") return v.length > 20;
   // Cursor Cloud Agents / SDK keys (often crsr_…)
   if (provider === "cursor") return v.startsWith("crsr_") || v.length >= 24;
   return false;
+}
+
+export function lookLikeKeyError(provider: ApiKeyProvider, value: string): string | null {
+  const v = value.trim();
+  if (!v) return "apiKey is required";
+  if (lookLikeKey(provider, v)) return null;
+  if (provider === "anthropic") {
+    return "Anthropic keys must start with sk-ant-. Create one at https://platform.claude.com/settings/keys";
+  }
+  return "API key format looks invalid";
 }

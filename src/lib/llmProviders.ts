@@ -37,16 +37,24 @@ export const MODEL_CATALOG: CatalogModel[] = [
     comingSoon: true,
   },
   {
-    id: "claude-sonnet-4-5",
-    label: "Claude Sonnet 4.5",
+    id: "claude-sonnet-5",
+    label: "Claude Sonnet 5",
     group: "Anthropic",
     kind: "code",
     provider: "anthropic",
     vision: true,
   },
   {
-    id: "claude-opus-4-5",
-    label: "Claude Opus 4.5",
+    id: "claude-opus-5",
+    label: "Claude Opus 5",
+    group: "Anthropic",
+    kind: "code",
+    provider: "anthropic",
+    vision: true,
+  },
+  {
+    id: "claude-haiku-4-5",
+    label: "Claude Haiku 4.5",
     group: "Anthropic",
     kind: "code",
     provider: "anthropic",
@@ -487,22 +495,30 @@ export async function verifyProviderKey(
   provider: ApiKeyProvider,
   apiKey: string
 ): Promise<{ ok: boolean; error?: string }> {
+  const key = apiKey.trim();
   try {
     if (provider === "anthropic") {
+      if (!key.startsWith("sk-ant-")) {
+        return {
+          ok: false,
+          error:
+            "Anthropic keys must start with sk-ant-. Create one at platform.claude.com/settings/keys",
+        };
+      }
       const res = await fetch("https://api.anthropic.com/v1/models", {
         headers: {
-          "x-api-key": apiKey,
+          "x-api-key": key,
           "anthropic-version": "2023-06-01",
         },
       });
       if (res.ok) return { ok: true };
       const body = await res.text().catch(() => "");
-      return { ok: false, error: `Anthropic ${res.status}: ${body.slice(0, 180)}` };
+      return { ok: false, error: friendlyProviderError("anthropic", res.status, body) };
     }
 
     if (provider === "openai") {
       const res = await fetch("https://api.openai.com/v1/models", {
-        headers: { Authorization: `Bearer ${apiKey}` },
+        headers: { Authorization: `Bearer ${key}` },
       });
       if (res.ok) return { ok: true };
       const body = await res.text().catch(() => "");
@@ -511,7 +527,7 @@ export async function verifyProviderKey(
 
     if (provider === "openrouter") {
       const res = await fetch("https://openrouter.ai/api/v1/models", {
-        headers: { Authorization: `Bearer ${apiKey}` },
+        headers: { Authorization: `Bearer ${key}` },
       });
       if (res.ok) return { ok: true };
       const body = await res.text().catch(() => "");
@@ -520,7 +536,7 @@ export async function verifyProviderKey(
 
     if (provider === "gemini") {
       const res = await fetch(
-        `https://generativelanguage.googleapis.com/v1beta/models?key=${encodeURIComponent(apiKey)}`
+        `https://generativelanguage.googleapis.com/v1beta/models?key=${encodeURIComponent(key)}`
       );
       if (res.ok) return { ok: true };
       const body = await res.text().catch(() => "");
@@ -530,7 +546,7 @@ export async function verifyProviderKey(
     if (provider === "cursor") {
       // Cloud Agents API key probe — https://cursor.com/docs/api
       const res = await fetch("https://api.cursor.com/v1/me", {
-        headers: { Authorization: `Bearer ${apiKey}` },
+        headers: { Authorization: `Bearer ${key}` },
       });
       if (res.ok) return { ok: true };
       const body = await res.text().catch(() => "");
@@ -543,14 +559,25 @@ export async function verifyProviderKey(
   }
 }
 
-/** Known native ids for first-party chat providers (pass through as selected). */
-const ANTHROPIC_IDS = new Set(["claude-sonnet-4-5", "claude-opus-4-5"]);
+/**
+ * Catalog ids (UI) → Anthropic Messages API model ids.
+ * Prefer docs aliases (claude-sonnet-5, etc.). Legacy 4.5 prefs still resolve.
+ * Docs: https://platform.claude.com/docs/en/about-claude/models/overview
+ */
+const ANTHROPIC_API_IDS: Record<string, string> = {
+  "claude-sonnet-5": "claude-sonnet-5",
+  "claude-opus-5": "claude-opus-5",
+  "claude-haiku-4-5": "claude-haiku-4-5",
+  // Legacy catalog / prefs (pre Sonnet 5 / Opus 5 migration)
+  "claude-sonnet-4-5": "claude-sonnet-4-5",
+  "claude-opus-4-5": "claude-opus-4-5",
+};
 const OPENAI_IDS = new Set(["gpt-4.1", "gpt-4.1-mini"]);
 const GEMINI_IDS = new Set(["gemini-2.5-flash", "gemini-2.5-pro"]);
 
 function resolveNativeModel(provider: ApiKeyProvider, modelId: string): string {
   if (provider === "anthropic") {
-    return ANTHROPIC_IDS.has(modelId) ? modelId : "claude-sonnet-4-5";
+    return ANTHROPIC_API_IDS[modelId] || ANTHROPIC_API_IDS["claude-sonnet-5"]!;
   }
   if (provider === "openai") {
     return OPENAI_IDS.has(modelId) ? modelId : "gpt-4.1";
@@ -781,12 +808,60 @@ async function callCursorCloudAgent(params: {
   throw new Error(`Cursor run timed out (last status: ${lastStatus})`);
 }
 
+function parseAnthropicErrorType(body: string): string | null {
+  try {
+    const json = JSON.parse(body) as { error?: { type?: string; message?: string } };
+    return json?.error?.type || null;
+  } catch {
+    return null;
+  }
+}
+
+function anthropicErrorSnippet(body: string): string {
+  try {
+    const json = JSON.parse(body) as { error?: { message?: string } };
+    const msg = json?.error?.message?.trim();
+    if (msg) return msg.slice(0, 160);
+  } catch {
+    /* fall through */
+  }
+  return body.replace(/\s+/g, " ").trim().slice(0, 160);
+}
+
 function friendlyProviderError(provider: ApiKeyProvider, status: number, body: string): string {
   if (status === 429) {
     return provider === "openrouter"
       ? "Free model rate limit reached (~20/min, ~50/day). Wait a minute, or pick Auto Free / another free model."
       : "Provider rate limit reached. Wait a moment and try again.";
   }
+
+  if (provider === "anthropic") {
+    const errType = parseAnthropicErrorType(body);
+    const snippet = anthropicErrorSnippet(body);
+    if (errType === "authentication_error" || status === 401) {
+      return `Anthropic API key invalid or expired. Re-create at platform.claude.com/settings/keys and re-verify in Settings.${
+        snippet ? ` (${snippet})` : ""
+      }`;
+    }
+    if (errType === "permission_error" || status === 403) {
+      return `Anthropic key lacks access to this model or workspace. Check Console permissions/billing.${
+        snippet ? ` (${snippet})` : ""
+      }`;
+    }
+    if (errType === "billing_error" || status === 402) {
+      return `Anthropic billing/payment issue. Add credits in the Claude Console.${
+        snippet ? ` (${snippet})` : ""
+      }`;
+    }
+    if (errType === "not_found_error" || status === 404) {
+      return `Anthropic model id not found (not a key rejection).${snippet ? ` (${snippet})` : ""}`;
+    }
+    if (status === 401 || status === 403) {
+      return `Anthropic auth failed (${status}).${snippet ? ` ${snippet}` : ""}`;
+    }
+    return `Anthropic request failed (${status}): ${snippet || body.slice(0, 240)}`;
+  }
+
   if (status === 401 || status === 403) {
     return "Your API key was rejected. Re-check it in Settings → Models & API Keys.";
   }
@@ -898,7 +973,9 @@ export async function callLLM(params: {
     });
     if (!res.ok) {
       const body = await res.text().catch(() => "");
-      throw new Error(friendlyProviderError(provider, res.status, body));
+      throw new Error(
+        `${friendlyProviderError(provider, res.status, body)} (model=${model})`
+      );
     }
     const data = (await res.json()) as {
       content?: Array<{ type: string; text?: string }>;
