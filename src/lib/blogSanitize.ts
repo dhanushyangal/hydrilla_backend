@@ -1,41 +1,36 @@
-import sanitizeHtml from "sanitize-html";
+import { filterXSS, whiteList as defaultWhiteList } from "xss";
 
-const ALLOWED_TAGS = [
-  "h1",
-  "h2",
-  "h3",
-  "h4",
-  "p",
-  "br",
-  "strong",
-  "em",
-  "a",
-  "ul",
-  "ol",
-  "li",
-  "blockquote",
-  "pre",
-  "code",
-  "img",
-  "hr",
-  "table",
-  "thead",
-  "tbody",
-  "tr",
-  "th",
-  "td",
-];
+const blogWhiteList: typeof defaultWhiteList = {
+  ...defaultWhiteList,
+  h1: [],
+  h2: [],
+  h3: [],
+  h4: [],
+  p: [],
+  br: [],
+  strong: [],
+  em: [],
+  a: ["href", "title", "target", "rel"],
+  ul: [],
+  ol: [],
+  li: [],
+  blockquote: [],
+  pre: [],
+  code: [],
+  img: ["src", "alt", "title", "width", "height"],
+  hr: [],
+  table: [],
+  thead: [],
+  tbody: [],
+  tr: [],
+  th: [],
+  td: [],
+};
 
 export function sanitizeBlogHtml(html: string): string {
-  return sanitizeHtml(html, {
-    allowedTags: ALLOWED_TAGS,
-    allowedAttributes: {
-      a: ["href", "title", "target", "rel"],
-      img: ["src", "alt", "title", "width", "height"],
-    },
-    allowedSchemes: ["http", "https", "mailto"],
-    transformTags: {
-      a: sanitizeHtml.simpleTransform("a", { rel: "noopener noreferrer" }),
-    },
+  return filterXSS(html, {
+    whiteList: blogWhiteList,
+    stripIgnoreTag: true,
+    stripIgnoreTagBody: ["script", "style"],
   });
 }
