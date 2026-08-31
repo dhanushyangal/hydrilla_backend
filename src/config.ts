@@ -35,8 +35,11 @@ const defaultCorsOrigins = [
   "https://www.hydrilla.co",
   "https://hydrilla.ai",
   "https://www.hydrilla.ai",
+  "https://admin.hydrilla.ai",
   "http://localhost:3000",
   "http://127.0.0.1:3000",
+  "http://localhost:3001",
+  "http://127.0.0.1:3001",
 ];
 
 export const config = {
@@ -61,11 +64,16 @@ export const config = {
   },
   /** Shared secret for Node ↔ GPU and internal job webhooks */
   internalApiSecret: process.env.HYDRILLA_INTERNAL_API_SECRET || "",
-  corsOrigins: (
-    process.env.CORS_ORIGINS
-      ? process.env.CORS_ORIGINS.split(",").map((o) => o.trim()).filter(Boolean)
-      : defaultCorsOrigins
-  ),
+  corsOrigins: [
+    ...new Set([
+      ...(process.env.CORS_ORIGINS
+        ? process.env.CORS_ORIGINS.split(",").map((o) => o.trim()).filter(Boolean)
+        : defaultCorsOrigins),
+      "https://admin.hydrilla.ai",
+      "http://localhost:3001",
+      "http://127.0.0.1:3001",
+    ]),
+  ],
   s3: {
     bucket: process.env.S3_BUCKET || "hydrilla-outputs-1",
     region: process.env.S3_REGION || "us-east-1",

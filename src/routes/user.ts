@@ -10,6 +10,10 @@ import {
   upsertUserModelPrefs,
 } from "../repository/userApiKeys.js";
 import {
+  listPlatformApiKeyMeta,
+  resolveWaterApiKey,
+} from "../repository/platformApiKeys.js";
+import {
   isApiKeyProvider,
   lookLikeKeyError,
   providerLabel,
@@ -31,10 +35,11 @@ export const userRouter = Router();
 userRouter.get("/cursor/models", requireAuth, async (req, res) => {
   try {
     const userId = req.userId!;
-    const plaintext = await getDecryptedUserApiKey(userId, "cursor");
-    if (!plaintext) {
+    const resolved = await resolveWaterApiKey(userId, "cursor");
+    if (!resolved) {
       return res.status(404).json({ error: "No Cursor API key saved. Add one in Settings." });
     }
+    const plaintext = resolved.apiKey;
     const models = await fetchCursorModels(plaintext);
     res.setHeader("Cache-Control", "private, max-age=300");
     res.json({
@@ -70,10 +75,11 @@ userRouter.get("/openrouter/free-models", requireAuth, async (_req, res) => {
 userRouter.get("/openrouter/key-status", requireAuth, async (req, res) => {
   try {
     const userId = req.userId!;
-    const plaintext = await getDecryptedUserApiKey(userId, "openrouter");
-    if (!plaintext) {
+    const resolved = await resolveWaterApiKey(userId, "openrouter");
+    if (!resolved) {
       return res.status(404).json({ error: "No OpenRouter key saved" });
     }
+    const plaintext = resolved.apiKey;
     const info = await fetchOpenRouterKeyInfo(plaintext);
     res.json({ status: info });
   } catch (err: any) {
@@ -87,11 +93,22 @@ userRouter.get("/api-keys", requireAuth, async (req, res) => {
     const userId = req.userId!;
     await syncUserToDatabase(userId);
     const keys = await listUserApiKeyMeta(userId);
+    const sharedKeys = await listPlatformApiKeyMeta();
     const prefs = await getUserModelPrefs(userId);
     res.json({
       keys: keys.map((k) => ({
         ...k,
         label: providerLabel(k.provider),
+      })),
+      sharedKeys: sharedKeys.map((k) => ({
+        provider: k.provider,
+        label: providerLabel(k.provider),
+        configured: k.configured,
+        status: k.status,
+        last4: null,
+        lastError: null,
+        verifiedAt: k.verifiedAt,
+        updatedAt: k.updatedAt,
       })),
       prefs,
     });

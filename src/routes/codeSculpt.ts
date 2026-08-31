@@ -3,7 +3,7 @@ import { randomUUID } from "crypto";
 import { waitUntil } from "@vercel/functions";
 import { requireAuth, syncUserToDatabase } from "../middleware/auth.js";
 import { createJob, getJobForUser, updateJobStatus } from "../repository/jobs.js";
-import { getDecryptedUserApiKey, listUserApiKeyMeta } from "../repository/userApiKeys.js";
+import { resolveWaterApiKey } from "../repository/platformApiKeys.js";
 import {
   catalogEntry,
   isOpenRouterModelId,
@@ -102,31 +102,15 @@ codeSculptRouter.post("/generate", requireAuth, async (req, res) => {
       return res.status(400).json({ error: "Invalid model provider" });
     }
 
-    const keys = await listUserApiKeyMeta(userId);
-    const keyMeta = keys.find((k) => k.provider === provider);
-    if (!keyMeta?.configured) {
+    const resolved = await resolveWaterApiKey(userId, provider as ApiKeyProvider);
+    if (!resolved) {
       return res.status(400).json({
         error: "api_key_required",
         provider,
         message: `Add a ${provider} API key in Settings → Models & API Keys`,
       });
     }
-    if (keyMeta.status === "invalid") {
-      return res.status(400).json({
-        error: "api_key_invalid",
-        provider,
-        message: "Your API key failed verification. Update it in Settings.",
-      });
-    }
-
-    const apiKey = await getDecryptedUserApiKey(userId, provider as ApiKeyProvider);
-    if (!apiKey) {
-      return res.status(400).json({
-        error: "api_key_required",
-        provider,
-        message: "Add an API key in Settings → Models & API Keys",
-      });
-    }
+    const apiKey = resolved.apiKey;
 
     const jobId = `wt_${randomUUID().replace(/-/g, "").slice(0, 24)}`;
 
