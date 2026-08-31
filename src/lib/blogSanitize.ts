@@ -1,7 +1,6 @@
-import { filterXSS, whiteList as defaultWhiteList } from "xss";
+import xss from "xss";
 
-const blogWhiteList: typeof defaultWhiteList = {
-  ...defaultWhiteList,
+const blogWhiteList: Record<string, string[]> = {
   h1: [],
   h2: [],
   h3: [],
@@ -28,7 +27,7 @@ const blogWhiteList: typeof defaultWhiteList = {
 };
 
 export function sanitizeBlogHtml(html: string): string {
-  return filterXSS(html, {
+  return xss(html, {
     whiteList: blogWhiteList,
     stripIgnoreTag: true,
     stripIgnoreTagBody: ["script", "style"],
