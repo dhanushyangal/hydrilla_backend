@@ -126,15 +126,16 @@ export function createModel(): THREE.Group {
   const bodyMat = new THREE.MeshStandardMaterial({ color: 0x8a8f98, roughness: 0.4, metalness: 0.7 });
   const accentMat = new THREE.MeshStandardMaterial({ color: 0x2b2f36, roughness: 0.7, metalness: 0.1 });
 
-  const body = new THREE.Mesh(new THREE.BoxGeometry(0.8, 0.5, 0.5), bodyMat);
+  const body = new THREE.Mesh(new THREE.BoxGeometry(0.72, 0.42, 0.48), bodyMat);
   body.name = "body";
-  body.position.y = 0.25;
+  body.position.y = 0.21;
   root.add(body);
 
-  const detail = new THREE.Mesh(new THREE.CylinderGeometry(0.12, 0.12, 0.35, 12), accentMat);
+  const detail = new THREE.Mesh(new THREE.CylinderGeometry(0.09, 0.09, 0.38, 12), accentMat);
   detail.name = "detail";
-  detail.position.set(0, 0.55, 0);
-  root.add(detail);
+  detail.rotation.z = Math.PI / 2;
+  detail.position.set(0.28, 0.21, 0);
+  body.add(detail);
 
   root.userData.sculptRuntime = {
     nodes: { root, body, detail },

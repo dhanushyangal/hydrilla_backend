@@ -5,8 +5,8 @@ import {
   ApiKeyStatus,
   decryptApiKey,
   encryptApiKey,
-  isApiKeyProvider,
 } from "../lib/userApiKeysCrypto.js";
+import { dbProviderAliases, normalizeProviderId } from "../providers/ids.js";
 import { logger } from "../logger.js";
 
 export type PlatformApiKeyMeta = {
@@ -41,11 +41,14 @@ export async function listPlatformApiKeyMeta(): Promise<PlatformApiKeyMeta[]> {
     return API_KEY_PROVIDERS.map(emptyMeta);
   }
 
-  const byProvider = new Map(
-    (data || [])
-      .filter((r) => isApiKeyProvider(String(r.provider)))
-      .map((r) => [r.provider as ApiKeyProvider, r])
-  );
+  const byProvider = new Map<ApiKeyProvider, (typeof data)[number]>();
+  for (const r of data || []) {
+    const provider = normalizeProviderId(String(r.provider));
+    if (!provider) continue;
+    if (!byProvider.has(provider) || String(r.provider) === provider) {
+      byProvider.set(provider, r);
+    }
+  }
 
   return API_KEY_PROVIDERS.map((provider) => {
     const row = byProvider.get(provider);
@@ -96,7 +99,10 @@ export async function savePlatformApiKey(
 }
 
 export async function deletePlatformApiKey(provider: ApiKeyProvider): Promise<void> {
-  const { error } = await supabase.from("platform_api_keys").delete().eq("provider", provider);
+  const { error } = await supabase
+    .from("platform_api_keys")
+    .delete()
+    .in("provider", dbProviderAliases(provider));
   if (error) throw error;
 }
 
@@ -105,12 +111,12 @@ export async function getDecryptedPlatformApiKey(
 ): Promise<string | null> {
   const { data, error } = await supabase
     .from("platform_api_keys")
-    .select("encrypted_key, iv, auth_tag")
-    .eq("provider", provider)
-    .maybeSingle();
+    .select("encrypted_key, iv, auth_tag, provider")
+    .in("provider", dbProviderAliases(provider));
 
-  if (error || !data) return null;
-  return decryptApiKey(data);
+  if (error || !data?.length) return null;
+  const preferred = data.find((r) => r.provider === provider) || data[0];
+  return decryptApiKey(preferred);
 }
 
 export async function setPlatformApiKeyStatus(
@@ -126,7 +132,7 @@ export async function setPlatformApiKeyStatus(
       verified_at: status === "valid" ? new Date().toISOString() : null,
       updated_at: new Date().toISOString(),
     })
-    .eq("provider", provider);
+    .in("provider", dbProviderAliases(provider));
   if (error) throw error;
 }
 
@@ -134,19 +140,25 @@ export function isSharedKeyUsable(meta: { configured: boolean; status: ApiKeySta
   return Boolean(meta?.configured && meta.status !== "invalid");
 }
 
-/** Prefer a valid platform key, then the user's BYOK key. */
+/** Prefer a usable user BYOK key, then a platform key. */
 export async function resolveWaterApiKey(
   userId: string,
   provider: ApiKeyProvider
-): Promise<{ apiKey: string; source: "platform" | "user" } | null> {
-  const { getDecryptedUserApiKey } = await import("./userApiKeys.js");
+): Promise<{ apiKey: string; source: "platform" | "user"; last4: string | null } | null> {
+  const { getDecryptedUserApiKey, listUserApiKeyMeta } = await import("./userApiKeys.js");
+  const userMeta = (await listUserApiKeyMeta(userId)).find((k) => k.provider === provider);
+  if (isSharedKeyUsable(userMeta)) {
+    const userKey = await getDecryptedUserApiKey(userId, provider);
+    if (userKey) return { apiKey: userKey, source: "user", last4: userMeta?.last4 ?? null };
+  }
+
   const platformMeta = (await listPlatformApiKeyMeta()).find((k) => k.provider === provider);
   if (isSharedKeyUsable(platformMeta)) {
     const platformKey = await getDecryptedPlatformApiKey(provider);
-    if (platformKey) return { apiKey: platformKey, source: "platform" };
+    if (platformKey) {
+      return { apiKey: platformKey, source: "platform", last4: platformMeta?.last4 ?? null };
+    }
   }
 
-  const userKey = await getDecryptedUserApiKey(userId, provider);
-  if (userKey) return { apiKey: userKey, source: "user" };
   return null;
 }

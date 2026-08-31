@@ -9,18 +9,18 @@ import type { WaterSkillId } from "../../waterSkills.js";
 
 const OBJECT_STUDIO: SkillPromptPack = {
   id: "object-studio",
-  plannerSystemExtra: `Domain: hard-surface / prop / product object (not a full scene).
-- Prefer topologyClass hints: planar-panel, turned-solid, tube-run, fastener-cluster, soft-organic-accent.
-- Enumerate a detailInventory of identity-defining details (bevels, fasteners, seams, gloss zones, wear).
-- qualityContract.fidelityBar = "production" for standard/studio, "blockout" only for fast.
-- featureReviewTargets: ≤5 critical systems (silhouette, primary volumes, hardware layout, finish zones).
-- Never emit a single-root compound object. Decompose into real parts with parents.`,
+  plannerSystemExtra: `Domain: a single hard-surface / prop / product (not a scene).
+- Prefer simple blocky volumes that read as ONE object.
+- Default complexity "simple" (3–5 named parts). Skip fastener clusters, tube-runs, and panel-split inventories.
+- qualityContract.fidelityBar = "blockout" for fast, "production" only for studio.
+- Every child parented so it physically meets the parent. No floating geometry.
+- Never emit a single-blob mesh — a few attached parts is enough.`,
   passExtras: {
     blockout:
-      "Macro volumes only. Named meshes matching the spec. Map-stripped readability: forms must read without fancy materials.",
+      "Macro volumes only. Named meshes matching the spec. Each child overlaps its parent. No extra primitives.",
     structural:
-      "Attach children correctly (no floating parts). Add seams, panel splits, thickness, pivots. Hierarchy must match parents.",
-    form: "Refine silhouettes: bevels, fillets, lathe/extrude where topologyClass demands. Secondary forms support the role.",
+      "Fix gaps: move children so they intersect/flush the parent. Do not add seams, splits, or extra hardware.",
+    form: "Slight silhouette cleanup only. Do not add secondary floating volumes.",
     material:
       "MeshStandardMaterial / MeshPhysicalMaterial with purposeful roughness/metalness/clearcoat contrast. Independent PBR channels — never bake lighting into albedo.",
     surface:
@@ -40,7 +40,7 @@ const OBJECT_STUDIO: SkillPromptPack = {
     "Materials show purposeful PBR contrast (not one flat grey)",
     "root.userData.sculptRuntime exists; pose is static",
   ],
-  strictSpecExtra: `Strict quality: for complexity moderate/complex require detailInventory length ≥ 4 / ≥ 8 and at least one repetition or localFeatures note when applicable.`,
+  strictSpecExtra: `Keep the spec compact. Do not pad detailInventory. Cap components at 5 for simple.`,
 };
 
 const CHARACTER: SkillPromptPack = {

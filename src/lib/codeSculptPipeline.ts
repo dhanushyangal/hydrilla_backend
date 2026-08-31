@@ -65,8 +65,8 @@ export type GateResult = { ok: boolean; violations: string[] };
 /** Minimum component depth per complexity tier — blocks single-blob specs. */
 const MIN_COMPONENTS: Record<SculptSpec["complexity"], number> = {
   simple: 3,
-  moderate: 6,
-  complex: 10,
+  moderate: 4,
+  complex: 6,
 };
 
 const BANNED_CODE_PATTERNS: Array<{ re: RegExp; why: string }> = [
@@ -189,9 +189,26 @@ export function fallbackSpec(prompt: string): SculptSpec {
       { name: "accent", color: "#2b2f36", finish: "plastic", roughness: 0.7, metalness: 0 },
     ],
     components: [
-      { name: "root", primitive: "box", parent: null, material: "body" },
-      { name: "body", primitive: "box", parent: "root", material: "body" },
-      { name: "detail", primitive: "cylinder", parent: "body", material: "accent" },
+      { name: "root", primitive: "box", parent: null, material: "body", notes: "invisible grouping only" },
+      {
+        name: "body",
+        primitive: "box",
+        parent: "root",
+        material: "body",
+        size: [0.72, 0.42, 0.48],
+        position: [0, 0.21, 0],
+        notes: "sits on y=0; all other parts must overlap this volume",
+      },
+      {
+        name: "detail",
+        primitive: "cylinder",
+        parent: "body",
+        material: "accent",
+        size: [0.1, 0.36, 0.1],
+        position: [0.28, 0.08, 0],
+        rotation: [0, 0, 1.57],
+        notes: "flush with the body side — no gap, no hover",
+      },
     ],
     animation: { idle: "slow yaw rotation", sockets: [] },
   };

@@ -2,13 +2,14 @@
  * Evaluator — deterministic gates first, then skeptic LLM (Anthropic harness pattern).
  */
 
-import { callLLM, type LlmTokenUsage } from "../../llmProviders.js";
+import { callLLMObject, type LlmTokenUsage } from "../../llmProviders.js";
 import { validateFactoryCode, type GateResult } from "../../codeSculptPipeline.js";
 import type { ApiKeyProvider } from "../../userApiKeysCrypto.js";
 import type { BuildPassId, WaterSkillId } from "../../waterSkills.js";
 import { getSkillPromptPack } from "../skills/index.js";
 import type { PassReview, PassReviewAction, RichSculptSpec } from "./types.js";
 import { isUserCancelError } from "../cancelRegistry.js";
+import { evaluatorSchema } from "../../../providers/schemas.js";
 
 const EVAL_SYSTEM = `You are a skeptical technical art director reviewing procedural Three.js factory code.
 You did NOT write this code. Be strict. Do not praise mediocre work.
@@ -80,7 +81,7 @@ export async function evaluatePass(params: {
   }
 
   try {
-    const result = await callLLM({
+    const result = await callLLMObject({
       provider: params.provider,
       modelId: params.modelId,
       apiKey: params.apiKey,
@@ -103,9 +104,10 @@ Return JSON only.`,
       maxTokens: 1024,
       timeoutMs: params.timeoutMs,
       signal: params.signal,
+      schema: evaluatorSchema,
     });
 
-    const parsed = extractEvalJson(result.text);
+    const parsed = result.output;
     const action = normalizeAction(parsed.action);
     const fidelity = clamp01(parsed.fidelity);
     let finalAction: PassReviewAction = action;
@@ -152,22 +154,4 @@ function normalizeAction(a: unknown): PassReviewAction {
   if (s === "refine-spec" || s === "refine_spec") return "refine-spec";
   if (s === "stop") return "stop";
   return "continue";
-}
-
-function extractEvalJson(text: string): {
-  fidelity?: number;
-  action?: string;
-  summary?: string;
-  criteriaScores?: Record<string, number>;
-} {
-  const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
-  const raw = (fenced?.[1] || text).trim();
-  const start = raw.indexOf("{");
-  const end = raw.lastIndexOf("}");
-  if (start === -1 || end === -1) return {};
-  try {
-    return JSON.parse(raw.slice(start, end + 1));
-  } catch {
-    return {};
-  }
 }

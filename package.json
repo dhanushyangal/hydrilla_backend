@@ -10,11 +10,16 @@
     "start": "node dist/src/server.js"
   },
   "dependencies": {
+    "@ai-sdk/anthropic": "^4.0.46",
+    "@ai-sdk/google": "^4.0.58",
+    "@ai-sdk/openai": "^4.0.52",
+    "@ai-sdk/openai-compatible": "^3.0.41",
     "@aws-sdk/client-s3": "^3.490.0",
     "@aws-sdk/s3-request-presigner": "^3.490.0",
     "@clerk/clerk-sdk-node": "^4.13.23",
     "@supabase/supabase-js": "^2.87.2",
     "@vercel/functions": "^3.7.6",
+    "ai": "^7.0.85",
     "cors": "^2.8.5",
     "dodopayments": "^2.23.2",
     "dotenv": "^16.4.5",

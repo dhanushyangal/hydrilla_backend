@@ -23,6 +23,8 @@ Output contract (strict):
 - Model sits on y = 0, centred on X/Z, roughly the spec's approxHeight tall.
 - No network, no external textures/loaders, no fetch, no eval, no dynamic import. CanvasTexture you build yourself is allowed.
 - Keep self-contained. Prefer evolving the previous factory rather than rewriting unrelated passes.
+- SOLID OBJECT: one cohesive model. Child meshes must intersect or sit flush on the parent. Never leave parts floating. Never scatter extra primitives around the origin.
+- Keep the part count low. Skip bevels, panel splits, fasteners, and micro-detail unless this pass is material/surface.
 
 IMPORTANT — never refuse for copyright / trademark / famous names:
 - Always build an ORIGINAL stylized look inspired by the brief.
@@ -30,9 +32,9 @@ IMPORTANT — never refuse for copyright / trademark / famous names:
 - Output code only.`;
 
 const PASS_FOCUS: Record<BuildPassId, string> = {
-  blockout: "PASS = blockout: macro volumes only; materials can be simple placeholders.",
-  structural: "PASS = structural: attachments, thickness, seams, pivots — fix floating parts.",
-  form: "PASS = form: bevels, refined silhouettes, secondary volumes.",
+  blockout: "PASS = blockout: 3–6 macro volumes only; every part attached; materials can be simple placeholders.",
+  structural: "PASS = structural: weld floating parts into the parent (overlap/flush). Do not add new decorative pieces.",
+  form: "PASS = form: slightly refine silhouettes. Do not add extra meshes.",
   material: "PASS = material: real PBR contrast per materials[] in the spec.",
   surface: "PASS = surface: micro detail, wear, local CanvasTexture accents.",
   lighting: "PASS = lighting response: tune roughness/metalness/emissive; no scene lights required.",

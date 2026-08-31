@@ -1,20 +1,17 @@
 import crypto from "crypto";
 import { config } from "../config.js";
+import {
+  API_KEY_PROVIDERS,
+  lookLikeKey as connectorLookLikeKey,
+  lookLikeKeyError as connectorLookLikeKeyError,
+  providerLabel as connectorProviderLabel,
+  type ApiKeyProvider,
+} from "../providers/index.js";
+import { isApiKeyProvider, normalizeProviderId } from "../providers/ids.js";
 
-export type ApiKeyProvider = "anthropic" | "openai" | "gemini" | "openrouter" | "cursor";
+export type { ApiKeyProvider };
 export type ApiKeyStatus = "unchecked" | "valid" | "invalid";
-
-export const API_KEY_PROVIDERS: ApiKeyProvider[] = [
-  "anthropic",
-  "openai",
-  "gemini",
-  "openrouter",
-  "cursor",
-];
-
-export function isApiKeyProvider(value: string): value is ApiKeyProvider {
-  return (API_KEY_PROVIDERS as string[]).includes(value);
-}
+export { API_KEY_PROVIDERS, isApiKeyProvider, normalizeProviderId };
 
 function encryptionKey(): Buffer {
   const secret = config.userApiKeysEncryptionSecret;
@@ -65,39 +62,13 @@ export function decryptApiKey(row: {
 }
 
 export function providerLabel(provider: ApiKeyProvider): string {
-  switch (provider) {
-    case "anthropic":
-      return "Anthropic (Claude)";
-    case "openai":
-      return "OpenAI";
-    case "gemini":
-      return "Google (Gemini)";
-    case "openrouter":
-      return "OpenRouter";
-    case "cursor":
-      return "Cursor";
-  }
+  return connectorProviderLabel(provider);
 }
 
 export function lookLikeKey(provider: ApiKeyProvider, value: string): boolean {
-  const v = value.trim();
-  if (v.length < 20) return false;
-  // Anthropic Console keys are always sk-ant-…
-  if (provider === "anthropic") return v.startsWith("sk-ant-");
-  if (provider === "openai") return v.startsWith("sk-") || v.length > 40;
-  if (provider === "openrouter") return v.startsWith("sk-or-") || v.length > 40;
-  if (provider === "gemini") return v.length > 20;
-  // Cursor Cloud Agents / SDK keys (often crsr_…)
-  if (provider === "cursor") return v.startsWith("crsr_") || v.length >= 24;
-  return false;
+  return connectorLookLikeKey(provider, value);
 }
 
 export function lookLikeKeyError(provider: ApiKeyProvider, value: string): string | null {
-  const v = value.trim();
-  if (!v) return "apiKey is required";
-  if (lookLikeKey(provider, v)) return null;
-  if (provider === "anthropic") {
-    return "Anthropic keys must start with sk-ant-. Create one at https://platform.claude.com/settings/keys";
-  }
-  return "API key format looks invalid";
+  return connectorLookLikeKeyError(provider, value);
 }

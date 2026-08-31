@@ -9,29 +9,37 @@ import {
   setUserApiKeyStatus,
   upsertUserModelPrefs,
 } from "../repository/userApiKeys.js";
-import {
-  listPlatformApiKeyMeta,
-  resolveWaterApiKey,
-} from "../repository/platformApiKeys.js";
-import {
-  isApiKeyProvider,
-  lookLikeKeyError,
-  providerLabel,
-} from "../lib/userApiKeysCrypto.js";
+import { resolveWaterApiKey } from "../repository/platformApiKeys.js";
+import { lookLikeKeyError, providerLabel } from "../lib/userApiKeysCrypto.js";
 import {
   fetchCursorModels,
   fetchOpenRouterFreeModels,
   fetchOpenRouterKeyInfo,
   verifyProviderKey,
 } from "../lib/llmProviders.js";
+import {
+  listModelsCached,
+  publicConnectors,
+  requireProviderParam,
+} from "../providers/index.js";
+import { canonicalModelId } from "../providers/ids.js";
+import { API_KEY_PROVIDERS, type ApiKeyProvider } from "../providers/types.js";
 import { logger } from "../logger.js";
 
 export const userRouter = Router();
 
-/**
- * Live Cursor Cloud Agents models for the picker (requires a saved Cursor key).
- * GET https://api.cursor.com/v1/models
- */
+function keyPayload(k: {
+  provider: ApiKeyProvider;
+  configured: boolean;
+  last4: string | null;
+  status: string;
+  lastError: string | null;
+  verifiedAt: string | null;
+  updatedAt: string | null;
+}) {
+  return { ...k, label: providerLabel(k.provider) };
+}
+
 userRouter.get("/cursor/models", requireAuth, async (req, res) => {
   try {
     const userId = req.userId!;
@@ -39,14 +47,11 @@ userRouter.get("/cursor/models", requireAuth, async (req, res) => {
     if (!resolved) {
       return res.status(404).json({ error: "No Cursor API key saved. Add one in Settings." });
     }
-    const plaintext = resolved.apiKey;
-    const models = await fetchCursorModels(plaintext);
+    const models = await fetchCursorModels(resolved.apiKey);
     res.setHeader("Cache-Control", "private, max-age=300");
     res.json({
       models,
       syncedAt: new Date().toISOString(),
-      note:
-        "From Cursor GET /v1/models for your key. Pass these ids as model.id on create; Auto omits model.",
     });
   } catch (err: any) {
     logger.error({ err }, "GET /api/user/cursor/models failed");
@@ -54,24 +59,17 @@ userRouter.get("/cursor/models", requireAuth, async (req, res) => {
   }
 });
 
-/** Live free-model catalog from OpenRouter (public list, auth optional for consistency). */
 userRouter.get("/openrouter/free-models", requireAuth, async (_req, res) => {
   try {
     const models = await fetchOpenRouterFreeModels();
     res.setHeader("Cache-Control", "private, max-age=300");
-    res.json({
-      models,
-      syncedAt: new Date().toISOString(),
-      note:
-        "Free models: ~50 req/day (never purchased credits) or ~1000/day after a one-time $10 credit purchase. Hard limit ~20 rpm.",
-    });
+    res.json({ models, syncedAt: new Date().toISOString() });
   } catch (err: any) {
     logger.error({ err }, "GET /api/user/openrouter/free-models failed");
     res.status(502).json({ error: err?.message || "Failed to sync free models" });
   }
 });
 
-/** Account usage for the saved OpenRouter key (never returns the key). */
 userRouter.get("/openrouter/key-status", requireAuth, async (req, res) => {
   try {
     const userId = req.userId!;
@@ -79,12 +77,51 @@ userRouter.get("/openrouter/key-status", requireAuth, async (req, res) => {
     if (!resolved) {
       return res.status(404).json({ error: "No OpenRouter key saved" });
     }
-    const plaintext = resolved.apiKey;
-    const info = await fetchOpenRouterKeyInfo(plaintext);
+    const info = await fetchOpenRouterKeyInfo(resolved.apiKey);
     res.json({ status: info });
   } catch (err: any) {
     logger.error({ err }, "GET /api/user/openrouter/key-status failed");
     res.status(502).json({ error: err?.message || "Failed to load OpenRouter key status" });
+  }
+});
+
+userRouter.get("/models", requireAuth, async (req, res) => {
+  try {
+    const userId = req.userId!;
+    await syncUserToDatabase(userId);
+    const groups = [];
+    for (const provider of API_KEY_PROVIDERS) {
+      const resolved = await resolveWaterApiKey(userId, provider);
+      if (!resolved) continue;
+      try {
+        const listed = await listModelsCached(provider, resolved.apiKey, resolved.last4);
+        groups.push({
+          provider,
+          name: providerLabel(provider),
+          source: resolved.source,
+          models: listed.map((m) => ({
+            id: canonicalModelId(provider, m.id),
+            name: m.name,
+            nativeId: m.id,
+            free: m.free,
+          })),
+        });
+      } catch (err: any) {
+        logger.warn({ err, provider }, "listModels failed");
+        groups.push({
+          provider,
+          name: providerLabel(provider),
+          source: resolved.source,
+          models: [],
+          error: err?.message || "Failed to list models",
+        });
+      }
+    }
+    res.setHeader("Cache-Control", "private, max-age=60");
+    res.json({ groups, syncedAt: new Date().toISOString() });
+  } catch (err: any) {
+    logger.error({ err }, "GET /api/user/models failed");
+    res.status(500).json({ error: "Failed to load models" });
   }
 });
 
@@ -93,13 +130,12 @@ userRouter.get("/api-keys", requireAuth, async (req, res) => {
     const userId = req.userId!;
     await syncUserToDatabase(userId);
     const keys = await listUserApiKeyMeta(userId);
+    const { listPlatformApiKeyMeta } = await import("../repository/platformApiKeys.js");
     const sharedKeys = await listPlatformApiKeyMeta();
     const prefs = await getUserModelPrefs(userId);
     res.json({
-      keys: keys.map((k) => ({
-        ...k,
-        label: providerLabel(k.provider),
-      })),
+      connectors: publicConnectors(),
+      keys: keys.map(keyPayload),
       sharedKeys: sharedKeys.map((k) => ({
         provider: k.provider,
         label: providerLabel(k.provider),
@@ -125,8 +161,8 @@ userRouter.get("/api-keys", requireAuth, async (req, res) => {
 userRouter.put("/api-keys/:provider", requireAuth, async (req, res) => {
   try {
     const userId = req.userId!;
-    const provider = String(req.params.provider || "");
-    if (!isApiKeyProvider(provider)) {
+    const provider = requireProviderParam(String(req.params.provider || ""));
+    if (!provider) {
       return res.status(400).json({ error: "Unsupported provider" });
     }
     const apiKey = String(req.body?.apiKey || "").trim();
@@ -137,8 +173,6 @@ userRouter.put("/api-keys/:provider", requireAuth, async (req, res) => {
 
     await syncUserToDatabase(userId);
     const meta = await saveUserApiKey(userId, provider, apiKey);
-
-    // Auto-verify on save
     const probe = await verifyProviderKey(provider, apiKey);
     await setUserApiKeyStatus(
       userId,
@@ -163,8 +197,7 @@ userRouter.put("/api-keys/:provider", requireAuth, async (req, res) => {
     if (msg.includes("USER_API_KEYS_ENCRYPTION_SECRET")) {
       error = "Server missing USER_API_KEYS_ENCRYPTION_SECRET";
     } else if (msg.includes("user_api_keys_provider_check")) {
-      error =
-        "Database is missing the Cursor provider. Run sql/add_cursor_provider.sql in Supabase.";
+      error = "Database provider check is missing google. Run sql/007_provider_google.sql in Supabase.";
     } else if (msg) {
       error = msg.slice(0, 240);
     }
@@ -175,8 +208,8 @@ userRouter.put("/api-keys/:provider", requireAuth, async (req, res) => {
 userRouter.post("/api-keys/:provider/verify", requireAuth, async (req, res) => {
   try {
     const userId = req.userId!;
-    const provider = String(req.params.provider || "");
-    if (!isApiKeyProvider(provider)) {
+    const provider = requireProviderParam(String(req.params.provider || ""));
+    if (!provider) {
       return res.status(400).json({ error: "Unsupported provider" });
     }
     const plaintext = await getDecryptedUserApiKey(userId, provider);
@@ -204,8 +237,8 @@ userRouter.post("/api-keys/:provider/verify", requireAuth, async (req, res) => {
 userRouter.delete("/api-keys/:provider", requireAuth, async (req, res) => {
   try {
     const userId = req.userId!;
-    const provider = String(req.params.provider || "");
-    if (!isApiKeyProvider(provider)) {
+    const provider = requireProviderParam(String(req.params.provider || ""));
+    if (!provider) {
       return res.status(400).json({ error: "Unsupported provider" });
     }
     await deleteUserApiKey(userId, provider);
@@ -222,6 +255,8 @@ userRouter.patch("/model-prefs", requireAuth, async (req, res) => {
     await upsertUserModelPrefs(userId, {
       defaultMeshModel: req.body?.defaultMeshModel,
       defaultCodeModel: req.body?.defaultCodeModel,
+      enabledCodeModels:
+        req.body?.enabledCodeModels !== undefined ? req.body.enabledCodeModels : undefined,
     });
     const prefs = await getUserModelPrefs(userId);
     res.json({ prefs });

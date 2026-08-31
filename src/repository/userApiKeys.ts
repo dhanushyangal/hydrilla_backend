@@ -1,11 +1,12 @@
 import { supabase } from "../db.js";
 import {
+  API_KEY_PROVIDERS,
   ApiKeyProvider,
   ApiKeyStatus,
   decryptApiKey,
   encryptApiKey,
-  isApiKeyProvider,
 } from "../lib/userApiKeysCrypto.js";
+import { dbProviderAliases, migrateCodeModelId, normalizeProviderId } from "../providers/ids.js";
 import { logger } from "../logger.js";
 
 export type UserApiKeyMeta = {
@@ -19,16 +20,14 @@ export type UserApiKeyMeta = {
 };
 
 export async function listUserApiKeyMeta(userId: string): Promise<UserApiKeyMeta[]> {
-  const providers: ApiKeyProvider[] = ["anthropic", "openai", "gemini", "openrouter", "cursor"];
   const { data, error } = await supabase
     .from("user_api_keys")
     .select("provider, last4, status, last_error, verified_at, updated_at")
     .eq("user_id", userId);
 
   if (error) {
-    // Table may not exist yet — return empty configured state
     logger.warn({ err: error }, "listUserApiKeyMeta failed (migration may be pending)");
-    return providers.map((provider) => ({
+    return API_KEY_PROVIDERS.map((provider) => ({
       provider,
       configured: false,
       last4: null,
@@ -39,13 +38,16 @@ export async function listUserApiKeyMeta(userId: string): Promise<UserApiKeyMeta
     }));
   }
 
-  const byProvider = new Map(
-    (data || [])
-      .filter((r) => isApiKeyProvider(String(r.provider)))
-      .map((r) => [r.provider as ApiKeyProvider, r])
-  );
+  const byProvider = new Map<ApiKeyProvider, (typeof data)[number]>();
+  for (const r of data || []) {
+    const provider = normalizeProviderId(String(r.provider));
+    if (!provider) continue;
+    if (!byProvider.has(provider) || String(r.provider) === provider) {
+      byProvider.set(provider, r);
+    }
+  }
 
-  return providers.map((provider) => {
+  return API_KEY_PROVIDERS.map((provider) => {
     const row = byProvider.get(provider);
     return {
       provider,
@@ -98,7 +100,7 @@ export async function deleteUserApiKey(userId: string, provider: ApiKeyProvider)
     .from("user_api_keys")
     .delete()
     .eq("user_id", userId)
-    .eq("provider", provider);
+    .in("provider", dbProviderAliases(provider));
   if (error) throw error;
 }
 
@@ -106,15 +108,16 @@ export async function getDecryptedUserApiKey(
   userId: string,
   provider: ApiKeyProvider
 ): Promise<string | null> {
+  const aliases = dbProviderAliases(provider);
   const { data, error } = await supabase
     .from("user_api_keys")
-    .select("encrypted_key, iv, auth_tag")
+    .select("encrypted_key, iv, auth_tag, provider")
     .eq("user_id", userId)
-    .eq("provider", provider)
-    .maybeSingle();
+    .in("provider", aliases);
 
-  if (error || !data) return null;
-  return decryptApiKey(data);
+  if (error || !data?.length) return null;
+  const preferred = data.find((r) => r.provider === provider) || data[0];
+  return decryptApiKey(preferred);
 }
 
 export async function setUserApiKeyStatus(
@@ -132,31 +135,54 @@ export async function setUserApiKeyStatus(
       updated_at: new Date().toISOString(),
     })
     .eq("user_id", userId)
-    .eq("provider", provider);
+    .in("provider", dbProviderAliases(provider));
   if (error) throw error;
 }
 
-/** Retired Claude 4.5 catalog ids → current Water Anthropic models. */
 function migrateDefaultCodeModel(id: string | null): string | null {
-  if (!id) return null;
-  if (id === "claude-sonnet-4-5") return "claude-sonnet-5";
-  if (id === "claude-opus-4-5") return "claude-opus-5";
-  return id;
+  return migrateCodeModelId(id);
+}
+
+function normalizeEnabledModels(raw: unknown): string[] | null {
+  if (!Array.isArray(raw)) return null;
+  const ids = raw
+    .filter((x): x is string => typeof x === "string")
+    .map((id) => migrateCodeModelId(id) || id)
+    .filter(Boolean);
+  return [...new Set(ids)].slice(0, 80);
 }
 
 export async function getUserModelPrefs(userId: string): Promise<{
   defaultMeshModel: string;
   defaultCodeModel: string | null;
+  enabledCodeModels: string[] | null;
 }> {
-  const { data } = await supabase
-    .from("user_model_prefs")
-    .select("default_mesh_model, default_code_model")
-    .eq("user_id", userId)
-    .maybeSingle();
+  let data: {
+    default_mesh_model?: string | null;
+    default_code_model?: string | null;
+    enabled_code_models?: unknown;
+  } | null = null;
+
+  {
+    const full = await supabase
+      .from("user_model_prefs")
+      .select("default_mesh_model, default_code_model, enabled_code_models")
+      .eq("user_id", userId)
+      .maybeSingle();
+    if (full.error && String(full.error.message || "").includes("enabled_code_models")) {
+      const legacy = await supabase
+        .from("user_model_prefs")
+        .select("default_mesh_model, default_code_model")
+        .eq("user_id", userId)
+        .maybeSingle();
+      data = legacy.data;
+    } else {
+      data = full.data;
+    }
+  }
 
   const rawCode = data?.default_code_model || null;
   const migrated = migrateDefaultCodeModel(rawCode);
-  // Persist migration so subsequent loads / jobs use the current catalog id.
   if (rawCode && migrated && migrated !== rawCode) {
     void supabase
       .from("user_model_prefs")
@@ -170,14 +196,18 @@ export async function getUserModelPrefs(userId: string): Promise<{
   return {
     defaultMeshModel: data?.default_mesh_model || "trilles",
     defaultCodeModel: migrated,
+    enabledCodeModels: normalizeEnabledModels(data?.enabled_code_models),
   };
 }
 
 export async function upsertUserModelPrefs(
   userId: string,
-  prefs: { defaultMeshModel?: string; defaultCodeModel?: string | null }
+  prefs: {
+    defaultMeshModel?: string;
+    defaultCodeModel?: string | null;
+    enabledCodeModels?: string[] | null;
+  }
 ): Promise<void> {
-  // Merge with existing row so omitting a field does not wipe it.
   const current = await getUserModelPrefs(userId);
   const mesh =
     prefs.defaultMeshModel !== undefined
@@ -188,15 +218,32 @@ export async function upsertUserModelPrefs(
       ? prefs.defaultCodeModel
       : current.defaultCodeModel
   );
+  const enabled =
+    prefs.enabledCodeModels !== undefined
+      ? normalizeEnabledModels(prefs.enabledCodeModels)
+      : current.enabledCodeModels;
 
-  const { error } = await supabase.from("user_model_prefs").upsert(
-    {
-      user_id: userId,
-      default_mesh_model: mesh,
-      default_code_model: code,
-      updated_at: new Date().toISOString(),
-    },
-    { onConflict: "user_id" }
-  );
+  const row: Record<string, unknown> = {
+    user_id: userId,
+    default_mesh_model: mesh,
+    default_code_model: code,
+    updated_at: new Date().toISOString(),
+  };
+  if (enabled) row.enabled_code_models = enabled;
+
+  const { error } = await supabase.from("user_model_prefs").upsert(row, { onConflict: "user_id" });
+  if (error && String(error.message || "").includes("enabled_code_models")) {
+    const { error: retry } = await supabase.from("user_model_prefs").upsert(
+      {
+        user_id: userId,
+        default_mesh_model: mesh,
+        default_code_model: code,
+        updated_at: new Date().toISOString(),
+      },
+      { onConflict: "user_id" }
+    );
+    if (retry) throw retry;
+    return;
+  }
   if (error) throw error;
 }

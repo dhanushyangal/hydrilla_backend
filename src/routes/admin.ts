@@ -8,12 +8,9 @@ import {
   savePlatformApiKey,
   setPlatformApiKeyStatus,
 } from "../repository/platformApiKeys.js";
-import {
-  isApiKeyProvider,
-  lookLikeKeyError,
-  providerLabel,
-} from "../lib/userApiKeysCrypto.js";
+import { lookLikeKeyError, providerLabel } from "../lib/userApiKeysCrypto.js";
 import { verifyProviderKey } from "../lib/llmProviders.js";
+import { publicConnectors, requireProviderParam } from "../providers/index.js";
 import { logger } from "../logger.js";
 
 export const adminRouter = Router();
@@ -24,16 +21,22 @@ function publicKeyMeta(k: Awaited<ReturnType<typeof listPlatformApiKeyMeta>>[num
   return { ...k, label: providerLabel(k.provider) };
 }
 
+async function listKeysPayload() {
+  const keys = await listPlatformApiKeyMeta();
+  return { connectors: publicConnectors(), keys: keys.map(publicKeyMeta) };
+}
+
 adminRouter.get("/overview", async (_req, res) => {
   try {
-    const [{ count, error }, keys] = await Promise.all([
+    const [{ count, error }, payload] = await Promise.all([
       supabase.from("users").select("id", { count: "exact", head: true }),
-      listPlatformApiKeyMeta(),
+      listKeysPayload(),
     ]);
     if (error) throw error;
     res.json({
       userCount: count ?? 0,
-      keys: keys.map(publicKeyMeta),
+      connectors: payload.connectors,
+      keys: payload.keys,
     });
   } catch (err: any) {
     logger.error({ err }, "GET /api/admin/overview failed");
@@ -41,20 +44,19 @@ adminRouter.get("/overview", async (_req, res) => {
   }
 });
 
-adminRouter.get("/water-keys", async (_req, res) => {
+async function getKeys(_req: unknown, res: any) {
   try {
-    const keys = await listPlatformApiKeyMeta();
-    res.json({ keys: keys.map(publicKeyMeta) });
+    res.json(await listKeysPayload());
   } catch (err: any) {
-    logger.error({ err }, "GET /api/admin/water-keys failed");
+    logger.error({ err }, "GET admin api-keys failed");
     res.status(500).json({ error: "Failed to load Water API keys" });
   }
-});
+}
 
-adminRouter.put("/water-keys/:provider", async (req, res) => {
+async function putKey(req: any, res: any) {
   try {
-    const provider = String(req.params.provider || "");
-    if (!isApiKeyProvider(provider)) {
+    const provider = requireProviderParam(String(req.params.provider || ""));
+    if (!provider) {
       return res.status(400).json({ error: "Unsupported provider" });
     }
     const apiKey = String(req.body?.apiKey || "").trim();
@@ -81,7 +83,7 @@ adminRouter.put("/water-keys/:provider", async (req, res) => {
       },
     });
   } catch (err: any) {
-    logger.error({ err }, "PUT /api/admin/water-keys failed");
+    logger.error({ err }, "PUT admin api-keys failed");
     const msg = String(err?.message || "");
     res.status(500).json({
       error: msg.includes("USER_API_KEYS_ENCRYPTION_SECRET")
@@ -89,26 +91,26 @@ adminRouter.put("/water-keys/:provider", async (req, res) => {
         : "Failed to save API key",
     });
   }
-});
+}
 
-adminRouter.delete("/water-keys/:provider", async (req, res) => {
+async function deleteKey(req: any, res: any) {
   try {
-    const provider = String(req.params.provider || "");
-    if (!isApiKeyProvider(provider)) {
+    const provider = requireProviderParam(String(req.params.provider || ""));
+    if (!provider) {
       return res.status(400).json({ error: "Unsupported provider" });
     }
     await deletePlatformApiKey(provider);
     res.json({ ok: true });
   } catch (err: any) {
-    logger.error({ err }, "DELETE /api/admin/water-keys failed");
+    logger.error({ err }, "DELETE admin api-keys failed");
     res.status(500).json({ error: "Failed to remove API key" });
   }
-});
+}
 
-adminRouter.post("/water-keys/:provider/verify", async (req, res) => {
+async function verifyKey(req: any, res: any) {
   try {
-    const provider = String(req.params.provider || "");
-    if (!isApiKeyProvider(provider)) {
+    const provider = requireProviderParam(String(req.params.provider || ""));
+    if (!provider) {
       return res.status(400).json({ error: "Unsupported provider" });
     }
     const plaintext = await getDecryptedPlatformApiKey(provider);
@@ -127,7 +129,17 @@ adminRouter.post("/water-keys/:provider/verify", async (req, res) => {
       error: probe.ok ? null : probe.error || "Verification failed",
     });
   } catch (err: any) {
-    logger.error({ err }, "POST /api/admin/water-keys verify failed");
+    logger.error({ err }, "POST admin api-keys verify failed");
     res.status(500).json({ error: "Verification failed" });
   }
-});
+}
+
+adminRouter.get("/api-keys", getKeys);
+adminRouter.put("/api-keys/:provider", putKey);
+adminRouter.delete("/api-keys/:provider", deleteKey);
+adminRouter.post("/api-keys/:provider/verify", verifyKey);
+
+adminRouter.get("/water-keys", getKeys);
+adminRouter.put("/water-keys/:provider", putKey);
+adminRouter.delete("/water-keys/:provider", deleteKey);
+adminRouter.post("/water-keys/:provider/verify", verifyKey);

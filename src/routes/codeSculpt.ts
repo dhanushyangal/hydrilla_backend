@@ -4,12 +4,7 @@ import { waitUntil } from "@vercel/functions";
 import { requireAuth, syncUserToDatabase } from "../middleware/auth.js";
 import { createJob, getJobForUser, updateJobStatus } from "../repository/jobs.js";
 import { resolveWaterApiKey } from "../repository/platformApiKeys.js";
-import {
-  catalogEntry,
-  isOpenRouterModelId,
-  providerForModel,
-  hasReportedTokenUsage,
-} from "../lib/llmProviders.js";
+import { hasReportedTokenUsage, parseWaterModelId } from "../lib/llmProviders.js";
 import { intakeGate } from "../lib/codeSculptPipeline.js";
 import { runStudioPipeline } from "../lib/water/harness/run.js";
 import {
@@ -88,19 +83,11 @@ codeSculptRouter.post("/generate", requireAuth, async (req, res) => {
       });
     }
 
-    const entry = catalogEntry(modelId);
-    if (!entry || entry.kind !== "code") {
-      // Allow OpenRouter free / live slugs / Cursor ids that may not be in the static catalog yet
-      const resolved = providerForModel(modelId);
-      if (!isOpenRouterModelId(modelId) && resolved !== "openrouter" && resolved !== "cursor") {
-        return res.status(400).json({ error: "Select a bring-your-own model for Water" });
-      }
+    const parsed = parseWaterModelId(modelId);
+    if (!parsed) {
+      return res.status(400).json({ error: "Select a bring-your-own model for Water" });
     }
-
-    const provider = providerForModel(modelId);
-    if (!provider || provider === "hydrilla") {
-      return res.status(400).json({ error: "Invalid model provider" });
-    }
+    const provider = parsed.provider;
 
     const resolved = await resolveWaterApiKey(userId, provider as ApiKeyProvider);
     if (!resolved) {

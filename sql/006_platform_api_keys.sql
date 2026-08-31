@@ -3,7 +3,7 @@
 
 CREATE TABLE IF NOT EXISTS platform_api_keys (
   provider TEXT PRIMARY KEY
-    CHECK (provider IN ('anthropic', 'openai', 'gemini', 'openrouter', 'cursor')),
+    CHECK (provider IN ('anthropic', 'openai', 'google', 'openrouter', 'cursor')),
   encrypted_key TEXT NOT NULL,
   iv TEXT NOT NULL,
   auth_tag TEXT NOT NULL,

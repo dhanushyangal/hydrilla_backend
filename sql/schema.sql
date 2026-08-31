@@ -143,7 +143,7 @@ CREATE TABLE IF NOT EXISTS contact_messages (
 CREATE TABLE IF NOT EXISTS user_api_keys (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   user_id TEXT NOT NULL REFERENCES users(id),
-  provider TEXT NOT NULL CHECK (provider = ANY (ARRAY['anthropic'::text, 'openai'::text, 'gemini'::text, 'openrouter'::text, 'cursor'::text])),
+  provider TEXT NOT NULL CHECK (provider = ANY (ARRAY['anthropic'::text, 'openai'::text, 'google'::text, 'openrouter'::text, 'cursor'::text])),
   encrypted_key TEXT NOT NULL,
   iv TEXT NOT NULL,
   auth_tag TEXT NOT NULL,
@@ -159,5 +159,6 @@ CREATE TABLE IF NOT EXISTS user_model_prefs (
   user_id TEXT PRIMARY KEY REFERENCES users(id),
   default_mesh_model TEXT DEFAULT 'trilles',
   default_code_model TEXT,
+  enabled_code_models TEXT[],
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );

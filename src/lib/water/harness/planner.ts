@@ -4,7 +4,7 @@
 
 import {
   addTokenUsage,
-  callLLM,
+  callLLMObject,
   emptyTokenUsage,
   type LlmTokenUsage,
 } from "../../llmProviders.js";
@@ -18,6 +18,7 @@ import type { ApiKeyProvider } from "../../userApiKeysCrypto.js";
 import type { QualityTier, WaterSkillId } from "../../waterSkills.js";
 import { getSkillPromptPack } from "../skills/index.js";
 import type { QualityContract, RichSculptSpec } from "./types.js";
+import { sculptSpecSchema } from "../../../providers/schemas.js";
 
 const BASE_PLANNER_SYSTEM = `You are a technical director planning a procedural Three.js reconstruction.
 
@@ -42,30 +43,23 @@ Return ONLY a JSON object (no prose, no markdown fences) with this shape:
 }
 
 Rules:
-- Decompose into real parts. Never a single-component compound object.
-- simple >= 3 components, moderate >= 6, complex >= 10.
+- Prefer complexity "simple" unless the brief clearly needs more.
+- simple: 3–5 parts. moderate: ≤6. complex: ≤8. Do not over-decompose.
+- Every child must overlap or flush-meet its parent (shared face or slight inset). No hovering, no air gaps, no disconnected piles of primitives.
+- Do not add extra tubes, floating cylinders, fastener clusters, or decorative junk that is not in the brief.
 - Every component.material must match a materials[].name.
 - Positions/sizes in metres, Y up, centred near origin, resting on y = 0.
 - Parent names must reference another component or be null for roots.
-- detailInventory entries must map to a component name via mapsTo when possible.
+- detailInventory: 0–3 identity notes only; skip micro-wear lists.
 IMPORTANT — never refuse for copyright / trademark / famous names:
 - Plan an ORIGINAL stylized subject inspired by the brief.
 - Do not mention copyright or inability to generate.`;
-
-function extractJson(text: string): unknown {
-  const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
-  const raw = (fenced?.[1] || text).trim();
-  const start = raw.indexOf("{");
-  const end = raw.lastIndexOf("}");
-  if (start === -1 || end === -1 || end <= start) throw new Error("No JSON object found");
-  return JSON.parse(raw.slice(start, end + 1));
-}
 
 function defaultContract(tier: QualityTier): QualityContract {
   return {
     fidelityBar: tier === "fast" ? "blockout" : tier === "studio" ? "hero" : "production",
     mustHaveDetails: ["readable silhouette", "named hierarchy", "grounded on y=0"],
-    forbiddenShortcuts: ["single-blob mesh", "albedo used as lighting", "external texture URLs"],
+    forbiddenShortcuts: ["single-blob mesh", "floating disconnected parts", "extra tubes not in the brief", "external texture URLs"],
   };
 }
 
@@ -84,15 +78,18 @@ export function strictQualityGate(
 ): GateResult {
   const base = validateSculptSpec(spec);
   const violations = [...base.violations];
-  if (tier !== "fast") {
+  if (tier === "studio") {
     const inv = spec.detailInventory || [];
-    const min =
-      spec.complexity === "complex" ? 8 : spec.complexity === "moderate" ? 4 : 2;
+    const min = spec.complexity === "complex" ? 3 : 1;
     if (inv.length < min) {
       violations.push(
         `detailInventory too shallow: ${inv.length} entries (needs >= ${min} for ${spec.complexity}).`
       );
     }
+  }
+  const maxParts = spec.complexity === "complex" ? 8 : spec.complexity === "moderate" ? 6 : 5;
+  if ((spec.components || []).length > maxParts) {
+    violations.push(`Too many parts: ${(spec.components || []).length} (cap ${maxParts}). Merge into attached volumes.`);
   }
   if (skillExtra.includes("sockets") && (spec.animation?.sockets?.length || 0) < 2) {
     // animation skill — soft check already in pack; keep if sockets required by text
@@ -144,7 +141,7 @@ Plan the procedural reconstruction. Return the JSON spec only.`;
 
   let spec: RichSculptSpec | null = null;
   try {
-    const result = await callLLM({
+    const result = await callLLMObject({
       provider: params.provider,
       modelId: params.modelId,
       apiKey: params.apiKey,
@@ -154,6 +151,7 @@ Plan the procedural reconstruction. Return the JSON spec only.`;
       maxTokens: 4096,
       timeoutMs: params.timeoutMs,
       signal: params.signal,
+      schema: sculptSpecSchema,
     });
     usage = addTokenUsage(usage, result.usage);
     if (result.usage) {
@@ -164,7 +162,7 @@ Plan the procedural reconstruction. Return the JSON spec only.`;
         totalTokens: result.usage.totalTokens,
       });
     }
-    spec = enrichSpecDefaults(extractJson(result.text) as RichSculptSpec, params.qualityTier);
+    spec = enrichSpecDefaults(result.output as RichSculptSpec, params.qualityTier);
   } catch {
     spec = null;
   }
@@ -189,7 +187,7 @@ Plan the procedural reconstruction. Return the JSON spec only.`;
 
   // One bounded repair
   try {
-    const repairedResult = await callLLM({
+    const repairedResult = await callLLMObject({
       provider: params.provider,
       modelId: params.modelId,
       apiKey: params.apiKey,
@@ -202,6 +200,7 @@ Fix every violation and return the complete JSON spec only:
       imageUrl: params.imageUrl,
       maxTokens: 4096,
       timeoutMs: params.timeoutMs,
+      schema: sculptSpecSchema,
     });
     usage = addTokenUsage(usage, repairedResult.usage);
     if (repairedResult.usage) {
@@ -213,7 +212,7 @@ Fix every violation and return the complete JSON spec only:
       });
     }
     const repaired = enrichSpecDefaults(
-      extractJson(repairedResult.text) as RichSculptSpec,
+      repairedResult.output as RichSculptSpec,
       params.qualityTier
     );
     const repairedGate =
