@@ -4,7 +4,7 @@ import { config } from "../config.js";
 import { logger } from "../logger.js";
 
 // Initialize Clerk client
-const clerk = createClerkClient({ secretKey: config.clerk.secretKey });
+export const clerk = createClerkClient({ secretKey: config.clerk.secretKey });
 
 function setCorsErrorHeaders(_res: Response) {
   // CORS is handled centrally in server.ts / api/index.ts — do not set Access-Control-Allow-Origin: *

@@ -78,3 +78,40 @@ export interface UserRecord {
   createdAt: Date;
   updatedAt: Date;
 }
+
+export type BlogPostStatus = "draft" | "published";
+
+export interface BlogPostRecord {
+  id: string;
+  title: string;
+  headline: string | null;
+  slug: string;
+  excerpt: string;
+  content: string;
+  coverImage: string | null;
+  category: string;
+  author: string;
+  status: BlogPostStatus;
+  publishedAt: string | null;
+  seoTitle: string | null;
+  seoDescription: string | null;
+  seoImage: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface BlogPostInput {
+  title: string;
+  headline?: string | null;
+  slug: string;
+  excerpt: string;
+  content: string;
+  coverImage?: string | null;
+  category: string;
+  author: string;
+  status: BlogPostStatus;
+  publishedAt?: string | null;
+  seoTitle?: string | null;
+  seoDescription?: string | null;
+  seoImage?: string | null;
+}

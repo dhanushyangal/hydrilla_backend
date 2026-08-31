@@ -12,10 +12,12 @@ import { lookLikeKeyError, providerLabel } from "../lib/userApiKeysCrypto.js";
 import { verifyProviderKey } from "../lib/llmProviders.js";
 import { publicConnectors, requireProviderParam } from "../providers/index.js";
 import { logger } from "../logger.js";
+import { adminBlogRouter } from "./adminBlog.js";
 
 export const adminRouter = Router();
 
 adminRouter.use(requireAuth, requireAdmin);
+adminRouter.use("/blog", adminBlogRouter);
 
 function publicKeyMeta(k: Awaited<ReturnType<typeof listPlatformApiKeyMeta>>[number]) {
   return { ...k, label: providerLabel(k.provider) };

@@ -4,6 +4,7 @@ import { threeDRouter } from "../src/routes/threeD.js";
 import { paymentsRouter } from "../src/routes/payments.js";
 import { userRouter } from "../src/routes/user.js";
 import { adminRouter } from "../src/routes/admin.js";
+import { blogRouter } from "../src/routes/blog.js";
 import { codeSculptRouter } from "../src/routes/codeSculpt.js";
 import { logger } from "../src/logger.js";
 import { initDb } from "../src/db.js";
@@ -84,6 +85,7 @@ app.use("/api/payments", initDbMiddleware, paymentsRouter);
 // BYOK keys + Water engine (legacy alias: /api/code-sculpt)
 app.use("/api/user", initDbMiddleware, userRouter);
 app.use("/api/admin", initDbMiddleware, adminRouter);
+app.use("/api/blog", initDbMiddleware, blogRouter);
 app.use("/api/water", initDbMiddleware, codeSculptRouter);
 app.use("/api/code-sculpt", initDbMiddleware, codeSculptRouter);
 

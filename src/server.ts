@@ -8,6 +8,7 @@ import { dodopaymentsRouter } from "./routes/dodopayments/route.js";
 import { contactRouter } from "./routes/contact.js";
 import { userRouter } from "./routes/user.js";
 import { adminRouter } from "./routes/admin.js";
+import { blogRouter } from "./routes/blog.js";
 import { codeSculptRouter } from "./routes/codeSculpt.js";
 import { logger } from "./logger.js";
 import { config } from "./config.js";
@@ -68,6 +69,7 @@ async function main() {
   app.use("/api/contact", contactRouter);
   app.use("/api/user", userRouter);
   app.use("/api/admin", adminRouter);
+  app.use("/api/blog", blogRouter);
   app.use("/api/water", codeSculptRouter);
   app.use("/api/code-sculpt", codeSculptRouter); // legacy alias
 
