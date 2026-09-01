@@ -4,6 +4,7 @@ import path from "node:path";
 import fs from "node:fs";
 import { clerk } from "../middleware/auth.js";
 import { sanitizeBlogHtml } from "../lib/blogSanitize.js";
+import { blogRevalidatePathsForPost, revalidateBlogFrontend } from "../lib/blogRevalidate.js";
 import { uploadBlogImage } from "../lib/blogImageUpload.js";
 import { logger } from "../logger.js";
 import {
@@ -135,6 +136,9 @@ adminBlogRouter.post("/posts", async (req, res) => {
     }
 
     const post = await createPost(input);
+    if (post.status === "published") {
+      void revalidateBlogFrontend(blogRevalidatePathsForPost(post.slug, post.category));
+    }
     res.status(201).json({ post: toAdminPost(post) });
   } catch (err) {
     if (err instanceof Error && err.message === "DUPLICATE_SLUG") {
@@ -180,6 +184,12 @@ adminBlogRouter.put("/posts/:id", async (req, res) => {
     }
 
     const post = await updatePost(id, input);
+    if (post.status === "published" || existing.status === "published") {
+      void revalidateBlogFrontend([
+        ...blogRevalidatePathsForPost(post.slug, post.category),
+        ...blogRevalidatePathsForPost(existing.slug, existing.category),
+      ]);
+    }
     res.json({ post: toAdminPost(post) });
   } catch (err) {
     if (err instanceof Error && err.message === "DUPLICATE_SLUG") {
@@ -196,6 +206,9 @@ adminBlogRouter.delete("/posts/:id", async (req, res) => {
     const existing = await getPostById(id);
     if (!existing) return res.status(404).json({ error: "Post not found" });
     await deletePost(id);
+    if (existing.status === "published") {
+      void revalidateBlogFrontend(blogRevalidatePathsForPost(existing.slug, existing.category));
+    }
     res.json({ ok: true });
   } catch (err) {
     logger.error({ err }, "DELETE /api/admin/blog/posts/:id failed");

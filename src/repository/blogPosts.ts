@@ -75,6 +75,32 @@ export type ListAllOptions = {
   search?: string;
 };
 
+const LIST_COLUMNS =
+  "slug, title, headline, excerpt, cover_image, category, author, published_at, updated_at, seo_title, seo_description, seo_image";
+
+type BlogListRow = Omit<BlogPostRow, "content" | "id" | "status" | "created_at">;
+
+function rowToListRecord(row: BlogListRow): BlogPostRecord {
+  return {
+    id: "",
+    title: row.title,
+    headline: row.headline,
+    slug: row.slug,
+    excerpt: row.excerpt,
+    content: "",
+    coverImage: row.cover_image,
+    category: row.category,
+    author: row.author,
+    status: "published",
+    publishedAt: row.published_at,
+    seoTitle: row.seo_title,
+    seoDescription: row.seo_description,
+    seoImage: row.seo_image,
+    createdAt: row.updated_at,
+    updatedAt: row.updated_at,
+  };
+}
+
 export async function listPublishedPosts(
   opts: ListPublishedOptions = {}
 ): Promise<{ posts: BlogPostRecord[]; total: number }> {
@@ -85,7 +111,7 @@ export async function listPublishedPosts(
 
   let query = supabase
     .from("blog_posts")
-    .select("*", { count: "exact" })
+    .select(LIST_COLUMNS, { count: "exact" })
     .eq("status", "published")
     .order("published_at", { ascending: false, nullsFirst: false });
 
@@ -97,9 +123,48 @@ export async function listPublishedPosts(
   if (error) throw error;
 
   return {
-    posts: (data as BlogPostRow[]).map(rowToRecord),
+    posts: (data as BlogListRow[]).map(rowToListRecord),
     total: count ?? 0,
   };
+}
+
+export type ContinuePost = {
+  slug: string;
+  title: string;
+  category: string;
+};
+
+const CLUSTER_ORDER = ["BlueFox", "Pipeline", "Plans", "General"];
+
+export async function listContinuePosts(excludeSlug?: string): Promise<ContinuePost[]> {
+  const { data, error } = await supabase
+    .from("blog_posts")
+    .select("slug, title, category")
+    .eq("status", "published")
+    .order("published_at", { ascending: false, nullsFirst: false });
+
+  if (error) throw error;
+
+  const latestByCategory = new Map<string, ContinuePost>();
+  for (const row of data || []) {
+    const slug = row.slug as string;
+    if (excludeSlug && slug === excludeSlug) continue;
+    const category = row.category as string;
+    if (!latestByCategory.has(category)) {
+      latestByCategory.set(category, {
+        slug,
+        title: row.title as string,
+        category,
+      });
+    }
+  }
+
+  const keys = [
+    ...CLUSTER_ORDER.filter((key) => latestByCategory.has(key)),
+    ...[...latestByCategory.keys()].filter((key) => !CLUSTER_ORDER.includes(key)),
+  ];
+
+  return keys.map((category) => latestByCategory.get(category)!);
 }
 
 export async function getPublishedBySlug(slug: string): Promise<BlogPostRecord | null> {
@@ -225,13 +290,12 @@ export async function deletePost(id: string): Promise<void> {
   if (error) throw error;
 }
 
-export function toPublicPost(post: BlogPostRecord) {
+export function toPublicListPost(post: BlogPostRecord) {
   return {
     slug: post.slug,
     title: post.title,
     headline: post.headline || post.title,
     excerpt: post.excerpt,
-    content: post.content,
     coverImage: post.coverImage,
     category: post.category,
     author: post.author,
@@ -240,6 +304,13 @@ export function toPublicPost(post: BlogPostRecord) {
     seoTitle: post.seoTitle,
     seoDescription: post.seoDescription,
     seoImage: post.seoImage,
+  };
+}
+
+export function toPublicPost(post: BlogPostRecord) {
+  return {
+    ...toPublicListPost(post),
+    content: post.content,
   };
 }
 

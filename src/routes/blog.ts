@@ -2,9 +2,11 @@ import { Router } from "express";
 import { logger } from "../logger.js";
 import {
   getPublishedBySlug,
+  listContinuePosts,
   listPublishedCategories,
   listPublishedPosts,
   listPublishedSlugs,
+  toPublicListPost,
   toPublicPost,
 } from "../repository/blogPosts.js";
 
@@ -17,7 +19,7 @@ blogRouter.get("/posts", async (req, res) => {
     const category = typeof req.query.category === "string" ? req.query.category : undefined;
     const { posts, total } = await listPublishedPosts({ page, limit, category });
     res.json({
-      posts: posts.map(toPublicPost),
+      posts: posts.map(toPublicListPost),
       total,
       page,
       limit,
@@ -47,6 +49,20 @@ blogRouter.get("/categories", async (_req, res) => {
   } catch (err) {
     logger.error({ err }, "GET /api/blog/categories failed");
     res.status(500).json({ error: "Failed to load categories" });
+  }
+});
+
+blogRouter.get("/continue", async (req, res) => {
+  try {
+    const exclude =
+      typeof req.query.exclude === "string" && req.query.exclude.trim()
+        ? req.query.exclude.trim()
+        : undefined;
+    const items = await listContinuePosts(exclude);
+    res.json({ items });
+  } catch (err) {
+    logger.error({ err }, "GET /api/blog/continue failed");
+    res.status(500).json({ error: "Failed to load continue links" });
   }
 });
 
