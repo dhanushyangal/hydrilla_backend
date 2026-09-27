@@ -50,14 +50,17 @@ S3_REGION
   - `GET /api/user/openrouter/free-models` — live free catalog  
   - `GET /api/user/cursor/models` — live Cloud Agents models (needs Cursor key)  
 - `/api/water` — Water Studio generate / poll / thumbnail / usage  
-  - Body: `skillId`, `qualityTier` (defaults: `object-studio`, `standard`)  
+  - Body: `prompt`, `modelId`, optional `qualityTier` / `imageUrl`. The skill pack is chosen server-side from the prompt (`orchestrator/packs.ts`)
+  - `POST /api/water/chat`: follow-up director (AI SDK `ToolLoopAgent`), scene edit or rebuild  
 - `/api/code-sculpt` — legacy alias (same router)  
 - `/api/3d` — cloud mesh + workspaces + health  
 - `/api/payments` — credits / subscriptions / Dodo webhook  
 
 Invite and admin routers are **removed** (no `/api/invites`, `/api/admin`).
 
-`maxDuration: 300` + `waitUntil` keep Water LLM work alive after the fast `jobId` response. Studio tier may return `partial: true` if the soft time budget is hit.
+`maxDuration: 800` (in `api/index.ts`) + `waitUntil` keep Water LLM work alive after the fast `jobId` response. `"fluid": true` in `vercel.json` turns on Fluid compute, so time spent waiting on the LLM isn't billed as CPU. 800 s is the Pro plan max; the harness caps every run at 760 s (`src/lib/water/runtimeLimits.ts`) to leave time for saving, so a run may return `partial: true`. Keep `maxDuration` and `FUNCTION_MAX_DURATION_S` in sync by hand.
+
+**Needs:** Vercel **Pro** (Hobby max is 300 s). If a deploy rejects `fluid` next to the legacy `builds` key, remove it and enable Fluid compute in Project Settings → Functions.
 
 **Note:** Local `src/server.ts` also mounts `/api/dodo` and `/api/contact`, and runs background `syncAllJobs` for cloud GPU jobs. Vercel serverless does **not** run that background loop.
 
