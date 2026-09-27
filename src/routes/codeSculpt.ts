@@ -31,6 +31,7 @@ import {
 } from "../repository/waterEngine.js";
 import type { Vec3 } from "../lib/water/scene/ir.js";
 import { planWaterCreate } from "../lib/water/orchestrator/routeCreate.js";
+import { STALE_RUN_MS } from "../lib/water/runtimeLimits.js";
 import {
   registerWaterCancel,
   cancelWaterJob,
@@ -672,7 +673,7 @@ codeSculptRouter.get("/jobs/:jobId", requireAuth, async (req, res) => {
     const isStaleRun =
       (dbStatus === "RUN" || dbStatus === "WAIT") &&
       Number.isFinite(updatedAtMs) &&
-      Date.now() - updatedAtMs > 8 * 60 * 1000;
+      Date.now() - updatedAtMs > STALE_RUN_MS;
     if (isStaleRun) {
       await updateCodeSculptResult(jobId, {
         status: "FAIL",

@@ -8,6 +8,14 @@
  *
  * Extension: append to WATER_PRODUCT_STAGES and handle the id in
  * `planWaterCreate`. Do not add a 13th tool id.
+ *
+ * WHY eve IS PARKED (decision: hybrid — AI SDK harness here, eve later for long sessions)
+ * Generation needs the customer's BYOK key and model on every call, deterministic gates, and
+ * a hard wall-clock budget (`runtimeLimits.ts`). Running it in-process with the AI SDK keeps
+ * keys inside this backend and costs no extra orchestrator tokens. The eve package under
+ * hyd-f `agent/` still compiles and mirrors these stage names so it can take over later.
+ * Revisit when runs must resume after a crash or need human approval between stages; at
+ * that point prefer Vercel Workflow steps around `runStudioPipeline` first, eve second.
  */
 
 import { screenSubject, validateCompiledPrompt, type CompiledPrompt } from "../../create/compile.js";

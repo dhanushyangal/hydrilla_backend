@@ -12,10 +12,12 @@ import { initDb } from "../src/db.js";
 import { config as appConfig } from "../src/config.js";
 import pinoHttp from "pino-http";
 
-// Water can make up to four sequential LLM calls. Keep the HTTP response
-// fast; waitUntil owns this function for the full generation (up to 300s).
+// Water generations run after the response via waitUntil, so this function must stay alive
+// for a whole Studio run. 800 s is the GA maximum with Fluid compute; LLM wait time is not
+// billed as Active CPU. Must equal FUNCTION_MAX_DURATION_S in src/lib/water/runtimeLimits.ts
+// (Vercel reads this export statically, so it stays a literal).
 export const config = {
-  maxDuration: 300,
+  maxDuration: 800,
 };
 
 // Initialize database connection

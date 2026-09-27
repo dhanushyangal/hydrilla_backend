@@ -29,6 +29,7 @@ import {
   throwIfAborted,
 } from "../cancelRegistry.js";
 import { runFactoryVisualPass } from "./visualPass.js";
+import { HARNESS_WALL_BUDGET_MS } from "../runtimeLimits.js";
 import { REFINE, type CreateAssetClass, type CreateProfile } from "../../create/quality/thresholds.js";
 import type { ReferenceMask } from "../../create/score.js";
 
@@ -45,15 +46,18 @@ function nextPassLegal(
 }
 
 /**
- * Soft wall-clock budgets. Cursor Cloud Agents need 1–4 min per call —
- * native providers can stay tighter. Local Node has no hard wall; Vercel
- * waitUntil still benefits from finishing early when possible.
+ * Soft wall-clock budgets per tier. Cursor Cloud Agents need 1–4 min per call, so they get
+ * more room than native providers. Every budget is clamped to `HARNESS_WALL_BUDGET_MS` so a
+ * run always returns (partial if needed) before Vercel kills the function — see
+ * `runtimeLimits.ts` for why and for when this should move to durable Workflow steps.
  */
 function budgetFor(provider: ApiKeyProvider, tier: QualityTier): number {
   const cursor = provider === "cursor";
-  if (tier === "fast") return cursor ? 240_000 : 120_000;
-  if (tier === "standard") return cursor ? 600_000 : 420_000;
-  return cursor ? 900_000 : 720_000;
+  const tierBudget =
+    tier === "fast" ? (cursor ? 240_000 : 120_000)
+    : tier === "standard" ? (cursor ? 600_000 : 420_000)
+    : cursor ? 900_000 : 720_000;
+  return Math.min(tierBudget, HARNESS_WALL_BUDGET_MS);
 }
 
 function stageCap(provider: ApiKeyProvider, tier: QualityTier): number {

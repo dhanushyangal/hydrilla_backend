@@ -1,6 +1,25 @@
 /**
- * Hidden Water Director — follow-ups only. Never shown in the Create bar.
- * ToolLoopAgent when the connector has a LanguageModel; JSON intent fallback for Cursor.
+ * Hidden Water Director — follow-ups only ("move it left", "make it red", "how heavy is it").
+ * Never shown in the Create bar; generation itself runs in `harness/run.ts`, not here.
+ *
+ * Two paths:
+ * - AI SDK `ToolLoopAgent` when the provider connector exposes a LanguageModel.
+ * - One structured JSON call (`callLLMObject`) for connectors without one (Cursor), which
+ *   cannot run a tool loop.
+ *
+ * WHY THIS STAYS ON THE AI SDK (and not the eve `create-water` agent)
+ * - BYOK: every call runs on the customer's own key and model. eve binds a model per agent;
+ *   serving arbitrary customer keys would mean handing those keys to the eve runtime, which
+ *   ADR 0001 forbids (keys never leave this backend).
+ * - Cost: a follow-up is 1–6 short steps. eve's durable checkpoints add latency and an
+ *   extra service for work that finishes in seconds.
+ * - Deployment: eve is a separate Vercel service; its channel only admits Vercel OIDC callers
+ *   or custom auth, which this Express backend does not provide today.
+ *
+ * WHEN TO REVISIT
+ * Move follow-ups to eve if they become long multi-turn sessions that must survive restarts,
+ * need human approval mid-run (`ctx.ask`), or need a sandbox to execute factory code. Keep
+ * this file's tool contracts (`applyIntent` + the four tools) so the swap is mechanical.
  */
 
 import { ToolLoopAgent, isStepCount, tool } from "ai";
@@ -221,12 +240,14 @@ Pose is static.`;
   });
 
   const result = await agent.generate({ prompt: params.message });
-  const lastTool = result.steps
-    ?.flatMap((s) => s.toolResults || [])
+  // AI SDK v5+ returns a tool's value on `.output` (it was `.result` before v5). Only the four
+  // director tools return a DirectorResult; prompt.compile / run.route outputs are skipped.
+  const toolOut = result.steps
+    .flatMap((step) => step.toolResults)
+    .map((toolResult) => toolResult.output as Partial<DirectorResult> | undefined)
     .reverse()
-    .find((t) => t && typeof t === "object" && "result" in t);
-  const toolOut = lastTool && "result" in lastTool ? (lastTool as { result: DirectorResult }).result : null;
-  if (toolOut && toolOut.kind) return toolOut;
+    .find((output): output is DirectorResult => typeof output?.kind === "string" && typeof output.reply === "string");
+  if (toolOut) return toolOut;
 
   return {
     kind: "talk",
