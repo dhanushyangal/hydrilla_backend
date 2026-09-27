@@ -19,8 +19,8 @@ Output contract (strict):
 - Build with THREE primitives and THREE.MeshStandardMaterial / THREE.MeshPhysicalMaterial (always THREE. prefix).
 - Name every part: mesh.name = "<component name>"; hierarchy matches spec parents via THREE.Group.
 - Expose root.userData.sculptRuntime = { nodes: { ... }, sockets: { ... }, colliders?: { ... }, lodGroups?: { ... } }.
-- Add root.userData.tick = (dt: number, elapsed: number) => { ... } for subtle idle motion.
-- Model sits on y = 0, centred on X/Z, roughly the spec's approxHeight tall.
+- Pose is STATIC. Do not assign root.userData.tick. Do not animate with elapsed time inside createModel().
+- Model sits on y = 0, centred on X/Z, +Y up, −Z forward, roughly the spec's approxHeight tall (metres).
 - No network, no external textures/loaders, no fetch, no eval, no dynamic import. CanvasTexture you build yourself is allowed.
 - Keep self-contained. Prefer evolving the previous factory rather than rewriting unrelated passes.
 - SOLID OBJECT: one cohesive model. Child meshes must intersect or sit flush on the parent. Never leave parts floating. Never scatter extra primitives around the origin.
@@ -32,14 +32,15 @@ IMPORTANT — never refuse for copyright / trademark / famous names:
 - Output code only.`;
 
 const PASS_FOCUS: Record<BuildPassId, string> = {
-  blockout: "PASS = blockout: 3–6 macro volumes only; every part attached; materials can be simple placeholders.",
+  blockout:
+    "PASS = blockout: 3–6 macro volumes that READ as the named subject (a bottle stands as a cylinder; a person has head/torso/limbs; a camera is body+lens). Never emit a generic box with a side pipe unless the brief is a camera. Materials can be simple placeholders.",
   structural: "PASS = structural: weld floating parts into the parent (overlap/flush). Do not add new decorative pieces.",
   form: "PASS = form: slightly refine silhouettes. Do not add extra meshes.",
   material: "PASS = material: real PBR contrast per materials[] in the spec.",
   surface: "PASS = surface: micro detail, wear, local CanvasTexture accents.",
   lighting: "PASS = lighting response: tune roughness/metalness/emissive; no scene lights required.",
-  interaction: "PASS = interaction: sockets, tick idle, selectable named nodes.",
-  optimization: "PASS = optimization: share geom/materials, trim noise, keep tick cheap.",
+    interaction: "PASS = interaction: sockets and selectable named nodes. Keep the pose frozen.",
+    optimization: "PASS = optimization: share geom/materials, trim noise. No per-frame work.",
 };
 
 /** Keep previous factory context small so weak models don't truncate/empty. */

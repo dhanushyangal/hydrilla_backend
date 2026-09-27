@@ -52,6 +52,19 @@ export type StudioPipelineResult = {
   qualityTier: QualityTier;
   tokenUsage: LlmTokenUsage;
   tokenPasses: TokenPassBreakdown[];
+  visual?: {
+    gatePassed: boolean;
+    fidelity: number | null;
+    failCodes: string[];
+    promoteEligible: boolean;
+    reasons: string[];
+    source: "factory" | "unexecuted";
+    meshNames: string[];
+    turntables: Array<{ angle: number; dataUrl: string }>;
+    sheetDataUrl: string | null;
+  };
+  elapsedMs: number;
+  refineTotal: number;
 };
 
 export type SkillPromptPack = {

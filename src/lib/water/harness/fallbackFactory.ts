@@ -99,10 +99,10 @@ export function createModel(): THREE.Group {
   root.userData.sculptRuntime = {
     nodes: { root, hips, torso, head, cape, armL, armR, legL, legR },
     sockets: { head: head, hand_L: armL, hand_R: armR, root: root },
-  };
-  root.userData.tick = (dt: number, elapsed: number) => {
-    hips.rotation.y = Math.sin(elapsed * 0.6) * 0.08;
-    cape.rotation.x = 0.15 + Math.sin(elapsed * 1.4) * 0.05;
+    colliders: {
+      torso: { type: "capsule", size: [0.26, 0.55, 0.26] },
+      head: { type: "sphere", size: [0.16, 0.16, 0.16] },
+    },
   };
 
   root.traverse((o) => {
@@ -137,12 +137,11 @@ export function createModel(): THREE.Group {
   detail.position.set(0.28, 0.21, 0);
   body.add(detail);
 
+  body.userData.collider = { type: "box", size: [0.72, 0.42, 0.48] };
   root.userData.sculptRuntime = {
     nodes: { root, body, detail },
     sockets: { root: root },
-  };
-  root.userData.tick = (_dt: number, elapsed: number) => {
-    root.rotation.y = elapsed * 0.25;
+    colliders: { body: { type: "box", size: [0.72, 0.42, 0.48] } },
   };
   return root;
 }

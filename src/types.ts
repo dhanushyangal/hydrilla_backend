@@ -49,6 +49,8 @@ export interface JobRecord {
   factoryCode?: string | null;
   sculptPass?: string | null;
   sculptSpec?: Record<string, unknown> | null;
+  /** Wall-clock generate time. Null while running; never inferred from updated_at. */
+  durationMs?: number | null;
   createdAt: Date;
   updatedAt: Date;
 }

@@ -102,29 +102,33 @@ const ANIMATION: SkillPromptPack = {
 
 const GAME: SkillPromptPack = {
   id: "game",
-  plannerSystemExtra: `Domain: game-ready browser asset.
-- Named selectable parts; plan collider proxies as box/sphere hints in notes.
+  plannerSystemExtra: `Domain: game-ready browser asset (still a createModel() factory, not a mesh file).
+- Scale in metres. Longest dimension matches spec.scale.approxHeight. Origin at ground contact (feet / base), +Y up, −Z forward.
+- Named selectable parts; plan collider proxies as box/sphere/capsule hints.
 - LOD: mark primary vs secondary detail in component notes (lod0 / lod1).
-- Exporters (Unity/Unreal/Blender) are out of scope for codegen — only runtime hooks.`,
+- Exporters (Unity/Unreal/Blender) are out of scope for codegen — only runtime hooks on sculptRuntime.`,
   passExtras: {
-    blockout: "Readable silhouette from gameplay camera. Centered pivot at origin, resting on y=0.",
-    structural: "Explodable named parts. Add userData.collider hints on major volumes (type+size).",
-    form: "Secondary game-read detail (panels, trims) without noise.",
-    material: "High-contrast PBR for readability at distance.",
-    surface: "Decal-like accents via CanvasTexture if needed.",
-    lighting: "Emissive only for gameplay callouts.",
+    blockout:
+      "Readable silhouette from a 3/4 gameplay camera. Pivot at origin, resting on y=0, facing −Z. Metres, not arbitrary units.",
+    structural:
+      "Explodable named parts. Add userData.collider = { type: 'box'|'sphere'|'capsule', size: [x,y,z] } on major volumes.",
+    form: "Secondary game-read detail (panels, trims) without noise. Keep colliders aligned to the visible mesh.",
+    material: "High-contrast PBR for readability at distance. Separate materials per named part.",
+    surface: "Decal-like accents via CanvasTexture if needed. No external textures.",
+    lighting: "Emissive only for gameplay callouts. No scene lights in the factory.",
     interaction:
-      "sculptRuntime must include nodes, sockets, and colliders: { [name]: { type, size } }. Optional lodGroups: { lod0: string[], lod1: string[] }.",
-    optimization: "Instance repeated bolts/panels. Keep triangle intent modest for browser.",
+      "sculptRuntime must include nodes, sockets, and colliders: { [name]: { type, size } }. Optional lodGroups: { lod0: string[], lod1: string[] }. Static pose only.",
+    optimization: "Instance repeated bolts/panels. Keep triangle intent modest for browser. No per-frame tick.",
   },
   evaluatorCriteria: [
     "Named meshes for major parts",
     "sculptRuntime.colliders or collider userData present",
-    "Origin-centered, y=0 ground",
-    "Silhouette readable",
+    "Metres, origin at ground, +Y up, −Z forward",
+    "Silhouette readable from gameplay camera",
+    "Pose is static",
     "No banned APIs",
   ],
-  strictSpecExtra: `At least one component note should mention collider or lod.`,
+  strictSpecExtra: `scale.unit must be "m". At least one component note must mention collider or lod.`,
 };
 
 const PACKS: Record<WaterSkillId, SkillPromptPack> = {

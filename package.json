@@ -7,7 +7,12 @@
   "scripts": {
     "dev": "tsx watch src/server.ts",
     "build": "tsc -p tsconfig.json",
-    "start": "node dist/src/server.js"
+    "start": "node dist/src/server.js",
+    "verify:create": "tsx scripts/verify-create-contracts.ts",
+    "verify:mesh": "tsx scripts/verify-create-mesh.ts",
+    "verify:pipeline": "tsx scripts/verify-create-pipeline.ts",
+    "verify:agents": "tsx scripts/verify-agent-surface.ts",
+    "verify:all": "npm run verify:create && npm run verify:mesh && npm run verify:pipeline && npm run verify:agents"
   },
   "dependencies": {
     "@ai-sdk/anthropic": "^4.0.46",

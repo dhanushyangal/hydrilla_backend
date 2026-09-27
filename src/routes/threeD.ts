@@ -17,6 +17,23 @@ import { JobStatus, JobRecord, ChatRecord, WorkspaceRecord, GenerateType } from 
 
 export const threeDRouter = Router();
 
+function compactVisualEvidence(spec: unknown): {
+  gatePassed?: boolean;
+  fidelity?: number | null;
+  failCodes?: string[];
+  source?: string;
+} | null {
+  if (!spec || typeof spec !== "object") return null;
+  const visual = (spec as { visual?: Record<string, unknown> }).visual;
+  if (!visual || typeof visual !== "object") return null;
+  return {
+    gatePassed: visual.gatePassed === true,
+    fidelity: typeof visual.fidelity === "number" ? visual.fidelity : null,
+    failCodes: Array.isArray(visual.failCodes) ? (visual.failCodes as string[]) : [],
+    source: typeof visual.source === "string" ? visual.source : undefined,
+  };
+}
+
 /** Attach shared internal secret on every Node → GPU request */
 function withInternalSecretHeaders(init?: RequestInit): RequestInit {
   const headers = new Headers(init?.headers || {});
@@ -2099,6 +2116,7 @@ threeDRouter.get("/chats/:chatId", requireAuth, async (req, res) => {
         resultGlbUrl: resultGlbUrl,
         previewImageUrl: previewImageUrl,
         errorMessage: row.error_message,
+        durationMs: typeof row.duration_ms === "number" ? row.duration_ms : null,
         createdAt: row.created_at,
         updatedAt: row.updated_at,
       };
@@ -2531,6 +2549,7 @@ threeDRouter.get("/jobs/:jobId/lineage", requireAuth, async (req, res) => {
         resultGlbUrl: j.resultGlbUrl,
         generateType: j.generateType,
         status: j.status,
+        durationMs: j.durationMs ?? null,
         createdAt: j.createdAt,
       })),
     });
@@ -3015,6 +3034,8 @@ threeDRouter.get("/workspaces/:workspaceId/jobs", requireAuth, async (req, res) 
         // Signal completion without shipping the full TypeScript payload
         factoryCode: hasFactoryCode ? "__present__" : null,
         hasFactoryCode,
+        durationMs: typeof row.duration_ms === "number" ? row.duration_ms : null,
+        visualEvidence: compactVisualEvidence(row.sculpt_spec),
         createdAt: row.created_at,
         updatedAt: row.updated_at,
       };

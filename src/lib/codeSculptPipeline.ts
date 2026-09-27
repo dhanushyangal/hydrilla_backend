@@ -1,16 +1,9 @@
 /**
- * Code Sculpt pipeline — text (or optional reference image) → procedural Three.js factory.
- *
- * Workflow adapted from img2threejs (https://github.com/img2threejs/img2threejs):
- * deterministic code enforces the gates, the model only does the judgement work.
- *
- *   intake gate → assessment + spec → spec gate → blockout codegen → code gate → (one refine) → done
- *
- * Model calls: 2 on the happy path, 3 when the code gate rejects once.
+ * Water factory helpers — intake, spec/code gates, fallback spec, factory rewrite.
+ * Generate lives in lib/water/generateWaterAsset.ts (runStudioPipeline).
  */
 
-import { addTokenUsage, callLLM, emptyTokenUsage, type LlmTokenUsage } from "./llmProviders.js";
-import type { ApiKeyProvider } from "./userApiKeysCrypto.js";
+import type { LlmTokenUsage } from "./llmProviders.js";
 
 export type SculptPass =
   | "intake"
@@ -29,6 +22,8 @@ export type SculptComponent = {
   rotation?: number[];
   material?: string;
   notes?: string;
+  /** img2threejs: pick topology before the primitive (organic ≠ box). */
+  topologyClass?: string;
 };
 
 export type SculptSpec = {
@@ -106,40 +101,6 @@ export function intakeGate(params: { prompt?: string | null; imageUrl?: string |
   return { ok: violations.length === 0, violations };
 }
 
-// ---------------------------------------------------------------------------
-// Stage 2 — assessment + spec
-// ---------------------------------------------------------------------------
-
-const SPEC_SYSTEM = `You are a technical director planning a procedural Three.js reconstruction.
-
-Return ONLY a JSON object (no prose, no markdown fences) with this shape:
-{
-  "name": string,
-  "subjectClass": "object" | "character" | "hybrid" | "environment",
-  "complexity": "simple" | "moderate" | "complex",
-  "summary": string,
-  "scale": { "unit": "m", "approxHeight": number },
-  "materials": [{ "name": string, "color": "#rrggbb", "finish": "metal"|"plastic"|"glass"|"rubber"|"wood"|"fabric"|"emissive", "roughness": number, "metalness": number }],
-  "components": [{ "name": string, "primitive": "box"|"sphere"|"cylinder"|"cone"|"torus"|"plane"|"lathe"|"extrude", "parent": string|null, "size": [number, number, number], "position": [number, number, number], "rotation": [number, number, number], "material": string, "notes": string }],
-  "animation": { "idle": string, "sockets": [string] }
-}
-
-Rules:
-- Decompose the subject into real parts. Never emit a single-component spec for a compound object.
-- simple >= 3 components, moderate >= 6, complex >= 10.
-- Every component.material must match a materials[].name.
-- Positions/sizes in metres, Y up, object centred near the origin, resting on y = 0.
-- Parent names must reference another component or be null for roots.`;
-
-function extractJson(text: string): unknown {
-  const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
-  const raw = (fenced?.[1] || text).trim();
-  const start = raw.indexOf("{");
-  const end = raw.lastIndexOf("}");
-  if (start === -1 || end === -1 || end <= start) throw new Error("No JSON object found");
-  return JSON.parse(raw.slice(start, end + 1));
-}
-
 export function validateSculptSpec(spec: SculptSpec): GateResult {
   const violations: string[] = [];
   if (!spec || typeof spec !== "object") return { ok: false, violations: ["Spec is not an object"] };
@@ -175,158 +136,124 @@ export function validateSculptSpec(spec: SculptSpec): GateResult {
   return { ok: violations.length === 0, violations };
 }
 
-/** Deterministic fallback so a weak free model can never dead-end the run. */
-export function fallbackSpec(prompt: string): SculptSpec {
+/** Deterministic fallback so a weak free model can never dead-end the run.
+ *  Shape MUST follow the brief — never the same box + side-pipe for every subject. */
+export function fallbackSpec(prompt: string, skillId?: string | null): SculptSpec {
   const name = (prompt || "Object").split(/[.,\n]/)[0].trim().slice(0, 60) || "Object";
+  const t = `${prompt || ""} ${skillId || ""}`.toLowerCase();
+  const isCharacter =
+    skillId === "character" ||
+    /\b(human|humanoid|person|character|avatar|npc|creature|girl|boy|man|woman|face|portrait)\b/i.test(
+      t
+    );
+  const isBottle = /\b(bottle|flask|vase|jar|can|cup|mug|thermos)\b/i.test(t);
+
+  if (isCharacter) {
+    return {
+      name,
+      subjectClass: "character",
+      complexity: "simple",
+      summary: prompt || name,
+      scale: { unit: "m", approxHeight: 1.7 },
+      materials: [
+        { name: "skin", color: "#c68642", finish: "skin", roughness: 0.65, metalness: 0.05 },
+        { name: "cloth", color: "#1e3a8a", finish: "fabric", roughness: 0.7, metalness: 0.05 },
+      ],
+      components: [
+        { name: "hips", primitive: "box", parent: null, material: "cloth", size: [0.28, 0.12, 0.18], position: [0, 0.95, 0], notes: "pelvis" },
+        { name: "torso", primitive: "cylinder", parent: "hips", material: "cloth", size: [0.22, 0.55, 0.22], position: [0, 0.35, 0], notes: "chest volume" },
+        { name: "head", primitive: "sphere", parent: "torso", material: "skin", size: [0.16, 0.16, 0.16], position: [0, 0.42, 0], notes: "head" },
+        { name: "arm_L", primitive: "cylinder", parent: "torso", material: "cloth", size: [0.06, 0.45, 0.06], position: [0.28, 0.1, 0], notes: "left arm" },
+        { name: "arm_R", primitive: "cylinder", parent: "torso", material: "cloth", size: [0.06, 0.45, 0.06], position: [-0.28, 0.1, 0], notes: "right arm" },
+      ],
+      animation: { idle: "static rest pose", sockets: ["head", "hand_L", "hand_R", "root"] },
+    };
+  }
+
+  if (isBottle) {
+    return {
+      name,
+      subjectClass: "object",
+      complexity: "simple",
+      summary: prompt || name,
+      scale: { unit: "m", approxHeight: 0.28 },
+      materials: [
+        { name: "body", color: "#7eb8c9", finish: "plastic", roughness: 0.25, metalness: 0.05 },
+        { name: "cap", color: "#1f2937", finish: "plastic", roughness: 0.5, metalness: 0.1 },
+      ],
+      components: [
+        { name: "body", primitive: "cylinder", parent: null, material: "body", size: [0.07, 0.22, 0.07], position: [0, 0.11, 0], notes: "standing bottle volume on y=0" },
+        { name: "neck", primitive: "cylinder", parent: "body", material: "body", size: [0.03, 0.04, 0.03], position: [0, 0.13, 0], notes: "neck, flush on top of body" },
+        { name: "cap", primitive: "cylinder", parent: "neck", material: "cap", size: [0.035, 0.025, 0.035], position: [0, 0.032, 0], notes: "cap on neck" },
+      ],
+      animation: { idle: "static", sockets: [] },
+    };
+  }
+
+  const isCamera = /\b(camera|camcorder|lens)\b/i.test(t);
+  if (isCamera) {
+    return {
+      name,
+      subjectClass: "object",
+      complexity: "simple",
+      summary: prompt || name,
+      scale: { unit: "m", approxHeight: 0.1 },
+      materials: [
+        { name: "body", color: "#2b2f36", finish: "plastic", roughness: 0.55, metalness: 0.15 },
+        { name: "lens", color: "#111827", finish: "metal", roughness: 0.25, metalness: 0.7 },
+      ],
+      components: [
+        { name: "body", primitive: "box", parent: null, material: "body", size: [0.14, 0.09, 0.08], position: [0, 0.045, 0], notes: "camera body sitting on y=0" },
+        { name: "lens", primitive: "cylinder", parent: "body", material: "lens", size: [0.035, 0.06, 0.035], position: [0, 0, 0.07], rotation: [1.57, 0, 0], notes: "lens barrel facing −Z" },
+        { name: "viewfinder", primitive: "box", parent: "body", material: "body", size: [0.04, 0.03, 0.03], position: [0, 0.055, -0.02], notes: "prism / EVF on top" },
+      ],
+      animation: { idle: "static", sockets: [] },
+    };
+  }
+
   return {
     name,
     subjectClass: "object",
     complexity: "simple",
     summary: prompt || name,
-    scale: { unit: "m", approxHeight: 1 },
+    scale: { unit: "m", approxHeight: 0.3 },
     materials: [
-      { name: "body", color: "#8a8f98", finish: "metal", roughness: 0.4, metalness: 0.8 },
+      { name: "body", color: "#8a8f98", finish: "plastic", roughness: 0.5, metalness: 0.2 },
       { name: "accent", color: "#2b2f36", finish: "plastic", roughness: 0.7, metalness: 0 },
     ],
     components: [
-      { name: "root", primitive: "box", parent: null, material: "body", notes: "invisible grouping only" },
       {
         name: "body",
         primitive: "box",
-        parent: "root",
+        parent: null,
         material: "body",
-        size: [0.72, 0.42, 0.48],
-        position: [0, 0.21, 0],
-        notes: "sits on y=0; all other parts must overlap this volume",
+        size: [0.24, 0.18, 0.16],
+        position: [0, 0.09, 0],
+        notes: `main volume of ${name}, sits on y=0`,
+      },
+      {
+        name: "top",
+        primitive: "box",
+        parent: "body",
+        material: "accent",
+        size: [0.16, 0.04, 0.12],
+        position: [0, 0.11, 0],
+        notes: "secondary mass on top of body",
       },
       {
         name: "detail",
         primitive: "cylinder",
         parent: "body",
         material: "accent",
-        size: [0.1, 0.36, 0.1],
-        position: [0.28, 0.08, 0],
-        rotation: [0, 0, 1.57],
-        notes: "flush with the body side — no gap, no hover",
+        size: [0.03, 0.08, 0.03],
+        position: [0, 0.02, 0.09],
+        notes: "forward accent attached to the body",
       },
     ],
-    animation: { idle: "slow yaw rotation", sockets: [] },
+    animation: { idle: "static", sockets: [] },
   };
 }
 
-export async function buildSculptSpec(params: {
-  provider: ApiKeyProvider;
-  modelId: string;
-  apiKey: string;
-  prompt: string;
-  imageUrl?: string | null;
-}): Promise<{
-  spec: SculptSpec;
-  gate: GateResult;
-  usedFallback: boolean;
-  tokenUsage: LlmTokenUsage;
-  tokenPasses: TokenPassBreakdown[];
-}> {
-  const subject = params.imageUrl
-    ? `Reference image attached. User note: ${params.prompt || "(none)"}`
-    : `Subject described by the user: "${params.prompt}"`;
-
-  const userText = `${subject}
-
-Plan the procedural reconstruction. Return the JSON spec only.`;
-
-  let usage = emptyTokenUsage();
-  const tokenPasses: TokenPassBreakdown[] = [];
-
-  let spec: SculptSpec | null = null;
-  try {
-    const result = await callLLM({
-      provider: params.provider,
-      modelId: params.modelId,
-      apiKey: params.apiKey,
-      system: SPEC_SYSTEM,
-      userText,
-      imageUrl: params.imageUrl,
-      maxTokens: 4096,
-    });
-    usage = addTokenUsage(usage, result.usage);
-    if (result.usage) {
-      tokenPasses.push({
-        pass: "assessment",
-        inputTokens: result.usage.inputTokens,
-        outputTokens: result.usage.outputTokens,
-        totalTokens: result.usage.totalTokens,
-      });
-    }
-    spec = extractJson(result.text) as SculptSpec;
-  } catch {
-    spec = null;
-  }
-
-  if (!spec) {
-    const fb = fallbackSpec(params.prompt);
-    return { spec: fb, gate: validateSculptSpec(fb), usedFallback: true, tokenUsage: usage, tokenPasses };
-  }
-
-  let gate = validateSculptSpec(spec);
-  if (gate.ok) return { spec, gate, usedFallback: false, tokenUsage: usage, tokenPasses };
-
-  // One bounded repair pass. The model gets deterministic violations instead
-  // of being asked to vaguely "improve" the spec.
-  try {
-    const repairedResult = await callLLM({
-      provider: params.provider,
-      modelId: params.modelId,
-      apiKey: params.apiKey,
-      system: SPEC_SYSTEM,
-      userText: `The following spec failed validation:
-${JSON.stringify(spec, null, 2)}
-
-Fix every violation and return the complete JSON spec only:
-- ${gate.violations.join("\n- ")}`,
-      imageUrl: params.imageUrl,
-      maxTokens: 4096,
-    });
-    usage = addTokenUsage(usage, repairedResult.usage);
-    if (repairedResult.usage) {
-      tokenPasses.push({
-        pass: "spec_repair",
-        inputTokens: repairedResult.usage.inputTokens,
-        outputTokens: repairedResult.usage.outputTokens,
-        totalTokens: repairedResult.usage.totalTokens,
-      });
-    }
-    const repaired = extractJson(repairedResult.text) as SculptSpec;
-    const repairedGate = validateSculptSpec(repaired);
-    if (repairedGate.ok) {
-      return { spec: repaired, gate: repairedGate, usedFallback: false, tokenUsage: usage, tokenPasses };
-    }
-  } catch {
-    // Fall through to a deterministic valid scaffold.
-  }
-
-  const fb = fallbackSpec(params.prompt);
-  gate = validateSculptSpec(fb);
-  return { spec: fb, gate, usedFallback: true, tokenUsage: usage, tokenPasses };
-}
-
-// ---------------------------------------------------------------------------
-// Stage 3 — blockout codegen
-// ---------------------------------------------------------------------------
-
-const CODE_SYSTEM = `You are a senior Three.js engineer generating the BLOCKOUT pass of a procedural model.
-
-Output contract (strict):
-- Output ONLY TypeScript. No markdown fences, no prose, no explanation.
-- Start with: import * as THREE from 'three';
-- Export exactly one entry point: export function createModel(): THREE.Group
-- Build every component from the spec using THREE primitives (THREE.BoxGeometry, THREE.SphereGeometry, THREE.CylinderGeometry, THREE.ConeGeometry, THREE.TorusGeometry, THREE.PlaneGeometry, THREE.LatheGeometry, THREE.ExtrudeGeometry) and THREE.MeshStandardMaterial / THREE.MeshPhysicalMaterial. Always qualify constructors with the THREE. prefix (never bare MeshStandardMaterial).
-- Name every part: mesh.name = "<component name>", and group parts with THREE.Group so the hierarchy matches the spec parents.
-- Expose runtime handles: root.userData.sculptRuntime = { nodes: { ... }, sockets: { ... } }.
-- Add root.userData.tick = (dt: number, elapsed: number) => { ... } for a subtle idle motion.
-- Model sits on y = 0, centred on X/Z, roughly the spec's approxHeight tall.
-- No network access, no external textures, no loaders, no fetch, no eval, no dynamic import. CanvasTexture you build yourself is allowed.
-- Keep it self-contained and under ~320 lines.`;
 
 export function validateFactoryCode(code: string, spec: SculptSpec): GateResult {
   const violations: string[] = [];
@@ -350,6 +277,12 @@ export function validateFactoryCode(code: string, spec: SculptSpec): GateResult 
     violations.push("Use THREE.MeshPhysicalMaterial (not bare MeshPhysicalMaterial).");
   }
   if (/```/.test(src)) violations.push("Code still contains markdown fences.");
+  if (!/sculptRuntime/.test(src)) {
+    violations.push("Missing root.userData.sculptRuntime = { nodes, sockets }.");
+  }
+  if (/userData\.tick\s*=/.test(src)) {
+    violations.push("Forbidden API: userData.tick — factories must stay static.");
+  }
 
   for (const { re, why } of BANNED_CODE_PATTERNS) {
     if (re.test(src)) violations.push(`Forbidden API: ${why}.`);
@@ -448,156 +381,4 @@ export function rewriteBareThreeConstructors(src: string): string {
     });
   }
   return out;
-}
-
-async function generateBlockout(params: {
-  provider: ApiKeyProvider;
-  modelId: string;
-  apiKey: string;
-  spec: SculptSpec;
-  prompt: string;
-  imageUrl?: string | null;
-  violations?: string[];
-}): Promise<{ code: string; usage: LlmTokenUsage | null }> {
-  const fixBlock = params.violations?.length
-    ? `\n\nThe previous attempt was rejected by the build gate. Fix ALL of these and return the full corrected module:\n- ${params.violations.join(
-        "\n- "
-      )}`
-    : "";
-
-  const userText = `Subject: ${params.prompt || params.spec.name}
-
-Spec (authoritative — build every component):
-${JSON.stringify(params.spec, null, 2)}
-
-Generate the blockout pass factory now. TypeScript only.${fixBlock}`;
-
-  const result = await callLLM({
-    provider: params.provider,
-    modelId: params.modelId,
-    apiKey: params.apiKey,
-    system: CODE_SYSTEM,
-    userText,
-    imageUrl: params.imageUrl,
-    maxTokens: 8192,
-  });
-  return { code: extractCode(result.text), usage: result.usage };
-}
-
-// ---------------------------------------------------------------------------
-// Orchestrator
-// ---------------------------------------------------------------------------
-
-/**
- * @deprecated Prefer runStudioPipeline from water/harness/run.ts (multi-pass Studio).
- * Kept for Fast-tier parity tests and legacy imports.
- */
-export async function runCodeSculptPipeline(params: {
-  provider: ApiKeyProvider;
-  modelId: string;
-  apiKey: string;
-  prompt: string;
-  imageUrl?: string | null;
-  onPass?: (pass: SculptPass) => void | Promise<void>;
-}): Promise<PipelineResult> {
-  const note = async (pass: SculptPass) => {
-    try {
-      await params.onPass?.(pass);
-    } catch {
-      // progress reporting must never fail the run
-    }
-  };
-
-  await note("assessment");
-  const {
-    spec,
-    gate: specGate,
-    tokenUsage: specUsage,
-    tokenPasses: specPasses,
-  } = await buildSculptSpec({
-    provider: params.provider,
-    modelId: params.modelId,
-    apiKey: params.apiKey,
-    prompt: params.prompt,
-    imageUrl: params.imageUrl,
-  });
-
-  let tokenUsage = specUsage;
-  const tokenPasses = [...specPasses];
-
-  await note("spec");
-  await note("blockout");
-  const blockout = await generateBlockout({
-    provider: params.provider,
-    modelId: params.modelId,
-    apiKey: params.apiKey,
-    spec,
-    prompt: params.prompt,
-    imageUrl: params.imageUrl,
-  });
-  let factoryCode = blockout.code;
-  tokenUsage = addTokenUsage(tokenUsage, blockout.usage);
-  if (blockout.usage) {
-    tokenPasses.push({
-      pass: "blockout",
-      inputTokens: blockout.usage.inputTokens,
-      outputTokens: blockout.usage.outputTokens,
-      totalTokens: blockout.usage.totalTokens,
-    });
-  }
-
-  await note("review");
-  let codeGate = validateFactoryCode(factoryCode, spec);
-  let refined = false;
-
-  if (!codeGate.ok) {
-    refined = true;
-    const retry = await generateBlockout({
-      provider: params.provider,
-      modelId: params.modelId,
-      apiKey: params.apiKey,
-      spec,
-      prompt: params.prompt,
-      imageUrl: params.imageUrl,
-      violations: codeGate.violations,
-    });
-    tokenUsage = addTokenUsage(tokenUsage, retry.usage);
-    if (retry.usage) {
-      tokenPasses.push({
-        pass: "blockout_refine",
-        inputTokens: retry.usage.inputTokens,
-        outputTokens: retry.usage.outputTokens,
-        totalTokens: retry.usage.totalTokens,
-      });
-    }
-    const retryGate = validateFactoryCode(retry.code, spec);
-    // Keep the better of the two attempts.
-    if (retryGate.violations.length <= codeGate.violations.length) {
-      factoryCode = retry.code;
-      codeGate = retryGate;
-    }
-  }
-
-  if (!codeGate.ok) {
-    const blocking = codeGate.violations.filter(
-      (v) => v.startsWith("Missing") || v.startsWith("Forbidden") || v.includes("too short")
-    );
-    if (blocking.length) {
-      throw new Error(
-        `Model could not produce a valid Three.js module: ${blocking.join(" ")} Try a stronger model.`
-      );
-    }
-  }
-
-  await note("done");
-  return {
-    factoryCode,
-    spec,
-    pass: "blockout",
-    specGate,
-    codeGate,
-    refined,
-    tokenUsage,
-    tokenPasses,
-  };
 }

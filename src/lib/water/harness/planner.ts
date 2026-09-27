@@ -2,12 +2,7 @@
  * Planner — assessment + quality contract + rich SculptSpec (img2threejs spirit).
  */
 
-import {
-  addTokenUsage,
-  callLLMObject,
-  emptyTokenUsage,
-  type LlmTokenUsage,
-} from "../../llmProviders.js";
+import { addTokenUsage, callLLM, callLLMObject, emptyTokenUsage, type LlmTokenUsage } from "../../llmProviders.js";
 import {
   fallbackSpec,
   validateSculptSpec,
@@ -19,6 +14,23 @@ import type { QualityTier, WaterSkillId } from "../../waterSkills.js";
 import { getSkillPromptPack } from "../skills/index.js";
 import type { QualityContract, RichSculptSpec } from "./types.js";
 import { sculptSpecSchema } from "../../../providers/schemas.js";
+import { logger } from "../../../logger.js";
+
+/** Standard/Studio refuse to generate from an invalid spec. Fast may still fall back. */
+export class SpecBlockedError extends Error {
+  readonly code = "spec_blocked";
+  readonly violations: string[];
+  constructor(violations: string[]) {
+    const detail = violations.slice(0, 6).join(" ");
+    super(
+      detail
+        ? `The reconstruction spec failed quality gates after one repair: ${detail}`
+        : "The reconstruction spec failed quality gates after one repair."
+    );
+    this.name = "SpecBlockedError";
+    this.violations = violations;
+  }
+}
 
 const BASE_PLANNER_SYSTEM = `You are a technical director planning a procedural Three.js reconstruction.
 
@@ -43,8 +55,10 @@ Return ONLY a JSON object (no prose, no markdown fences) with this shape:
 }
 
 Rules:
-- Prefer complexity "simple" unless the brief clearly needs more.
+- Prefer complexity "simple" on Fast, "moderate" on Standard/Studio unless the subject is tiny.
 - simple: 3–5 parts. moderate: ≤6. complex: ≤8. Do not over-decompose.
+- Parts must be the REAL named parts of THIS subject. A bottle is a standing cylinder + neck + cap. A person is head/torso/limbs. A camera is body + lens + viewfinder.
+- NEVER reuse a generic 0.72×0.42×0.48 box with a side cylinder unless the brief is actually a camera body + lens.
 - Every child must overlap or flush-meet its parent (shared face or slight inset). No hovering, no air gaps, no disconnected piles of primitives.
 - Do not add extra tubes, floating cylinders, fastener clusters, or decorative junk that is not in the brief.
 - Every component.material must match a materials[].name.
@@ -59,7 +73,13 @@ function defaultContract(tier: QualityTier): QualityContract {
   return {
     fidelityBar: tier === "fast" ? "blockout" : tier === "studio" ? "hero" : "production",
     mustHaveDetails: ["readable silhouette", "named hierarchy", "grounded on y=0"],
-    forbiddenShortcuts: ["single-blob mesh", "floating disconnected parts", "extra tubes not in the brief", "external texture URLs"],
+    forbiddenShortcuts: [
+      "single-blob mesh",
+      "floating disconnected parts",
+      "extra tubes not in the brief",
+      "external texture URLs",
+      "userData.tick or time-based animation in createModel",
+    ],
   };
 }
 
@@ -67,6 +87,20 @@ export function enrichSpecDefaults(spec: RichSculptSpec, tier: QualityTier): Ric
   if (!spec.qualityContract) spec.qualityContract = defaultContract(tier);
   if (!Array.isArray(spec.detailInventory)) spec.detailInventory = [];
   if (!Array.isArray(spec.featureReviewTargets)) spec.featureReviewTargets = [];
+  if (spec.featureReviewTargets.length === 0 && (spec.components || []).length) {
+    spec.featureReviewTargets = (spec.components || []).slice(0, 5).map((c, i) => ({
+      id: c.name || `part-${i}`,
+      importance: i === 0 ? "critical" : "important",
+      pass: "blockout",
+    }));
+  }
+  for (const c of spec.components || []) {
+    if (!c.topologyClass) {
+      const prim = (c.primitive || "").toLowerCase();
+      c.topologyClass =
+        prim === "sphere" || prim === "lathe" ? "organic" : prim === "cylinder" || prim === "cone" ? "revolution" : "hard-surface";
+    }
+  }
   return spec;
 }
 
@@ -98,6 +132,27 @@ export function strictQualityGate(
     const names = (spec.components || []).map((c) => (c.name || "").toLowerCase());
     if (!names.some((n) => n.includes("head"))) {
       violations.push("Character spec missing a head component.");
+    }
+  }
+
+  if (tier !== "fast") {
+    const critical = (spec.featureReviewTargets || []).filter((t) => t.importance === "critical");
+    if (critical.length === 0) {
+      violations.push("Standard/Studio specs need at least one critical identity feature.");
+    }
+    if (critical.length > 5) {
+      violations.push(`Too many critical identity features (${critical.length}); cap is 5.`);
+    }
+    const organicNames = /head|torso|body|limb|arm|leg|neck|bottle|neck|cap|lens/i;
+    for (const c of spec.components || []) {
+      const prim = (c.primitive || "").toLowerCase();
+      const topo = (c.topologyClass || "").toLowerCase();
+      const nm = (c.name || "").toLowerCase();
+      if ((topo === "organic" || organicNames.test(nm)) && prim === "box" && /head|torso|bottle/.test(nm)) {
+        violations.push(
+          `Component "${c.name}" reads organic/round but is a box — pick cylinder/sphere (topology before primitive).`
+        );
+      }
     }
   }
   return { ok: violations.length === 0, violations };
@@ -163,12 +218,57 @@ Plan the procedural reconstruction. Return the JSON spec only.`;
       });
     }
     spec = enrichSpecDefaults(result.output as RichSculptSpec, params.qualityTier);
-  } catch {
-    spec = null;
+  } catch (err: any) {
+    logger.warn(
+      { err: err?.message, modelId: params.modelId, skillId: params.skillId },
+      "Water planner structured output failed — retrying as JSON text"
+    );
+    try {
+      const textResult = await callLLM({
+        provider: params.provider,
+        modelId: params.modelId,
+        apiKey: params.apiKey,
+        system: `${BASE_PLANNER_SYSTEM}\n\nSkill focus:\n${pack.plannerSystemExtra}`,
+        userText: `${userText}\n\nReturn the JSON spec only. No markdown.`,
+        imageUrl: params.imageUrl,
+        maxTokens: 4096,
+        timeoutMs: params.timeoutMs,
+        signal: params.signal,
+      });
+      usage = addTokenUsage(usage, textResult.usage);
+      if (textResult.usage) {
+        tokenPasses.push({
+          pass: "planner_text",
+          inputTokens: textResult.usage.inputTokens,
+          outputTokens: textResult.usage.outputTokens,
+          totalTokens: textResult.usage.totalTokens,
+        });
+      }
+      const raw = textResult.text || "";
+      const start = raw.indexOf("{");
+      const end = raw.lastIndexOf("}");
+      if (start === -1 || end <= start) throw new Error("No JSON object in planner text");
+      spec = enrichSpecDefaults(
+        sculptSpecSchema.parse(JSON.parse(raw.slice(start, end + 1))) as RichSculptSpec,
+        params.qualityTier
+      );
+    } catch (err2: any) {
+      logger.warn(
+        { err: err2?.message, skillId: params.skillId, prompt: params.prompt?.slice(0, 80) },
+        "Water planner text retry failed"
+      );
+      spec = null;
+    }
   }
 
   if (!spec) {
-    const fb = enrichSpecDefaults(fallbackSpec(params.prompt) as RichSculptSpec, params.qualityTier);
+    if (params.qualityTier !== "fast") {
+      throw new SpecBlockedError(["Planner did not return a valid JSON spec."]);
+    }
+    const fb = enrichSpecDefaults(
+      fallbackSpec(params.prompt, params.skillId) as RichSculptSpec,
+      params.qualityTier
+    );
     return {
       spec: fb,
       gate: validateSculptSpec(fb),
@@ -222,11 +322,22 @@ Fix every violation and return the complete JSON spec only:
     if (repairedGate.ok) {
       return { spec: repaired, gate: repairedGate, usedFallback: false, tokenUsage: usage, tokenPasses };
     }
-  } catch {
-    // fall through
+    if (params.qualityTier !== "fast") {
+      throw new SpecBlockedError(repairedGate.violations);
+    }
+  } catch (err) {
+    if (err instanceof SpecBlockedError) throw err;
+    // Fast: fall through to the subject-aware template.
   }
 
-  const fb = enrichSpecDefaults(fallbackSpec(params.prompt) as RichSculptSpec, params.qualityTier);
+  if (params.qualityTier !== "fast") {
+    throw new SpecBlockedError(gate.violations.length ? gate.violations : ["Spec failed the strict quality gate."]);
+  }
+
+  const fb = enrichSpecDefaults(
+    fallbackSpec(params.prompt, params.skillId) as RichSculptSpec,
+    params.qualityTier
+  );
   return {
     spec: fb,
     gate: validateSculptSpec(fb),

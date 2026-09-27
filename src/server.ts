@@ -10,6 +10,7 @@ import { userRouter } from "./routes/user.js";
 import { adminRouter } from "./routes/admin.js";
 import { blogRouter } from "./routes/blog.js";
 import { codeSculptRouter } from "./routes/codeSculpt.js";
+import { createToolsRouter } from "./routes/createTools.js";
 import { logger } from "./logger.js";
 import { config } from "./config.js";
 import { initDb } from "./db.js";
@@ -72,6 +73,7 @@ async function main() {
   app.use("/api/blog", blogRouter);
   app.use("/api/water", codeSculptRouter);
   app.use("/api/code-sculpt", codeSculptRouter); // legacy alias
+  app.use("/api/create/tools", createToolsRouter);
 
   app.use((err: any, _req: any, res: any, _next: any) => {
     logger.error(err);

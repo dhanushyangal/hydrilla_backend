@@ -340,6 +340,7 @@ function mapRow(row: any): JobRecord {
     factoryCode: row.factory_code ?? null,
     sculptPass: row.sculpt_pass ?? null,
     sculptSpec: row.sculpt_spec ?? null,
+    durationMs: typeof row.duration_ms === "number" ? row.duration_ms : null,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };

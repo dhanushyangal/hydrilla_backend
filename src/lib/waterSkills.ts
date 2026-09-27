@@ -1,6 +1,7 @@
 /**
- * Water Skills + quality tiers — mirror of frontend lib/waterSkills.ts.
- * Keep in sync when adding skills or pass unlocks.
+ * Water pack ids + quality tiers — mirror of frontend lib/waterSkills.ts.
+ * Packs are bound by the orchestrator, not by UI chips.
+ * Keep in sync when adding packs or pass unlocks.
  */
 
 export type WaterSkillId =
@@ -87,7 +88,7 @@ export const WATER_SKILLS: WaterSkillDef[] = [
 ];
 
 export const DEFAULT_WATER_SKILL: WaterSkillId = "object-studio";
-export const DEFAULT_QUALITY_TIER: QualityTier = "fast";
+export const DEFAULT_QUALITY_TIER: QualityTier = "standard";
 
 const SKILL_IDS = new Set(WATER_SKILLS.map((s) => s.id));
 const TIER_IDS = new Set(["fast", "standard", "studio"] as QualityTier[]);
