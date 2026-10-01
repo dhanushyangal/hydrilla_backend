@@ -14,6 +14,7 @@
     "verify:agents": "tsx scripts/verify-agent-surface.ts",
     "verify:images": "tsx scripts/verify-image-providers.ts",
     "test:image-prompts": "tsx scripts/test-image-prompts-stress.ts",
+    "test:qa-generation": "tsx scripts/qa-generation-production-flows.ts",
     "verify:all": "npm run verify:create && npm run verify:mesh && npm run verify:pipeline && npm run verify:agents"
   },
   "dependencies": {

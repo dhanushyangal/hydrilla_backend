@@ -3,6 +3,7 @@ import { logger } from "../logger.js";
 import { getJob, getJobsToSync, updateJobStatus, updateJobResult } from "../repository/jobs.js";
 import { JobStatus } from "../types.js";
 import { normalizeGlbUrl, normalizePreviewUrl } from "../utils/s3Urls.js";
+import { refundCredit } from "./credits.js";
 
 // Circuit breaker state to prevent continuous API calls when API is offline
 let circuitBreakerState = {
@@ -157,11 +158,20 @@ export async function syncJobFromApi(jobId: string): Promise<boolean> {
           }
           // Job is WAIT/RUN but not on API (e.g. GPU server restarted). Mark failed so we stop syncing it.
           if (dbJob.status === "WAIT" || dbJob.status === "RUN") {
+            const shouldRefund = Boolean(dbJob.userId) && (dbJob.creditsUsed ?? 0) > 0;
             await updateJobStatus(jobId, {
               status: "FAIL",
               errorCode: null,
               errorMessage: "Job not found on API (GPU server may have restarted).",
+              creditsUsed: shouldRefund ? 0 : undefined,
             });
+            if (shouldRefund && dbJob.userId) {
+              await refundCredit(dbJob.userId, dbJob.creditsUsed);
+              logger.info(
+                { jobId, userId: dbJob.userId, amount: dbJob.creditsUsed },
+                "Refunded credits for lost job after GPU restart"
+              );
+            }
             logger.info({ jobId }, "Job not on API, marked failed to stop repeated sync");
           }
           return true; // Handled; don't count as sync failure
@@ -203,11 +213,23 @@ export async function syncJobFromApi(jobId: string): Promise<boolean> {
 
     // Update status if changed
     if (dbJob.status !== dbStatus) {
+      const shouldRefund =
+        dbStatus === "FAIL" &&
+        Boolean(dbJob.userId) &&
+        (dbJob.creditsUsed ?? 0) > 0;
       await updateJobStatus(jobId, {
         status: dbStatus,
         errorCode: null,
         errorMessage: apiJob.error || null,
+        creditsUsed: shouldRefund ? 0 : undefined,
       });
+      if (shouldRefund && dbJob.userId) {
+        await refundCredit(dbJob.userId, dbJob.creditsUsed);
+        logger.info(
+          { jobId, userId: dbJob.userId, amount: dbJob.creditsUsed },
+          "Refunded credits for failed GPU job during background sync"
+        );
+      }
       logger.info({ jobId, oldStatus: dbJob.status, newStatus: dbStatus }, "Job status updated");
     }
 

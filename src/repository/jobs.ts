@@ -112,20 +112,34 @@ export async function getJobParentIds(jobId: string): Promise<string[]> {
   }
 }
 
-export async function updateJobStatus(jobId: string, data: { status: JobStatus; errorCode?: string | null; errorMessage?: string | null }) {
-  const { status, errorCode = null, errorMessage = null } = data;
+export async function updateJobStatus(
+  jobId: string,
+  data: {
+    status: JobStatus;
+    errorCode?: string | null;
+    errorMessage?: string | null;
+    creditsUsed?: number;
+  }
+) {
+  const { status, errorCode = null, errorMessage = null, creditsUsed } = data;
+  const updatePayload: Record<string, unknown> = {
+    status,
+    error_code: errorCode,
+    error_message: errorMessage,
+    updated_at: new Date().toISOString(),
+  };
+  if (typeof creditsUsed === "number") {
+    updatePayload.credits_used = creditsUsed;
+  }
   try {
     const { error } = await supabase
       .from("jobs")
-      .update({
-        status,
-        error_code: errorCode,
-        error_message: errorMessage,
-        updated_at: new Date().toISOString(),
-      })
+      .update(updatePayload)
       .eq("id", jobId);
 
-    if (error) throw error;
+    if (error) {
+      throw error;
+    }
   } catch (err: any) {
     logger.error(err, "Failed to update job status");
     throw new Error(`Database error: ${err.message}`);

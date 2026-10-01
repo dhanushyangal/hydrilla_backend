@@ -34,7 +34,7 @@ export const HARNESS_WALL_BUDGET_MS = (FUNCTION_MAX_DURATION_S - PERSIST_RESERVE
 
 /**
  * A RUN job with no progress write for this long is treated as dead. Must exceed the
- * longest single stage (Cursor stage cap, 210 s) so a slow but healthy pass is never
- * expired while it is still working.
+ * maximum harness budget (760 s / ~12.7 min) so slow but healthy multi-pass studio
+ * runs are never expired while still actively computing.
  */
-export const STALE_RUN_MS = 8 * 60 * 1000;
+export const STALE_RUN_MS = 14 * 60 * 1000;

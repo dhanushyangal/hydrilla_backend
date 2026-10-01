@@ -35,6 +35,7 @@ import {
   type UsageCall,
 } from "../services/imageProviders/index.js";
 import { recordImageUsage, type ImageUsageRecord } from "../repository/imageUsage.js";
+import { runDeduplicated3DSubmission } from "../services/inFlight3d.js";
 import { JobStatus, JobRecord, ChatRecord, WorkspaceRecord, GenerateType } from "../types.js";
 
 export const threeDRouter = Router();
@@ -714,7 +715,6 @@ threeDRouter.post("/generate", requireAuth, async (req, res) => {
     await syncUserToDatabase(userId);
 
     const { deductCredit } = await import("../services/credits.js");
-    let jobId: string;
 
     if (body.imageUrl || body.imageBase64) {
       if (body.imageBase64) {
@@ -749,88 +749,103 @@ threeDRouter.post("/generate", requireAuth, async (req, res) => {
         });
       }
 
-      const deductResult = await deductCredit(userId, CREDITS_IMAGE_TO_3D, true);
-      if (!deductResult.ok) {
-        return res.status(402).json({ error: deductResult.error });
-      }
-
-      const parseImageTo3dError = async (response: Response): Promise<string> => {
-        const text = await response.text();
-        if (!text) return "Failed to submit image-to-3d job";
-        try {
-          const errorData = JSON.parse(text) as { error?: string; detail?: string };
-          return errorData.error || errorData.detail || text;
-        } catch {
-          return text;
+      const { jobId } = await runDeduplicated3DSubmission(userId, imageUrl, async () => {
+        const deductResult = await deductCredit(userId, CREDITS_IMAGE_TO_3D, true);
+        if (!deductResult.ok) {
+          const creditErr = new Error(deductResult.error);
+          (creditErr as any).status = 402;
+          throw creditErr;
         }
-      };
 
-      const submitToGpu = async (): Promise<string> => {
-        if (multipartForImage) {
-          const { response } = await fetchGatewayImageTo3DMultipart(multipartForImage, userId);
+        const parseImageTo3dError = async (response: Response): Promise<string> => {
+          const text = await response.text();
+          if (!text) {
+            return "Failed to submit image-to-3d job";
+          }
+          try {
+            const errorData = JSON.parse(text) as { error?: string; detail?: string };
+            return errorData.error || errorData.detail || text;
+          } catch {
+            return text;
+          }
+        };
+
+        const submitToGpu = async (): Promise<string> => {
+          if (multipartForImage) {
+            const { response } = await fetchGatewayImageTo3DMultipart(multipartForImage, userId);
+            if (!response.ok) {
+              throw new GpuSubmitHttpError(response.status, await parseImageTo3dError(response));
+            }
+            const data = await response.json();
+            return data.job_id;
+          }
+          const formData = new URLSearchParams();
+          formData.append("image_url", imageUrl);
+          formData.append("user_id", userId);
+          const { response } = await fetchGateway("/image-to-3d", {
+            method: "POST",
+            headers: { "Content-Type": "application/x-www-form-urlencoded" },
+            body: formData.toString(),
+          });
           if (!response.ok) {
             throw new GpuSubmitHttpError(response.status, await parseImageTo3dError(response));
           }
           const data = await response.json();
           return data.job_id;
-        }
-        const formData = new URLSearchParams();
-        formData.append("image_url", imageUrl);
-        formData.append("user_id", userId);
-        const { response } = await fetchGateway("/image-to-3d", {
-          method: "POST",
-          headers: { "Content-Type": "application/x-www-form-urlencoded" },
-          body: formData.toString(),
-        });
-        if (!response.ok) {
-          throw new GpuSubmitHttpError(response.status, await parseImageTo3dError(response));
-        }
-        const data = await response.json();
-        return data.job_id;
-      };
+        };
 
-      try {
-        jobId = await submitWithGpuRestartRetry(submitToGpu);
-      } catch (submitErr) {
-        const { refundCredit } = await import("../services/credits.js");
-        await refundCredit(userId, CREDITS_IMAGE_TO_3D);
-        throw submitErr;
-      }
-    } else if (body.prompt) {
+        const createdJobId = await (async () => {
+          try {
+            return await submitWithGpuRestartRetry(submitToGpu);
+          } catch (submitErr) {
+            const { refundCredit } = await import("../services/credits.js");
+            await refundCredit(userId, CREDITS_IMAGE_TO_3D);
+            throw submitErr;
+          }
+        })();
+
+        // Create job in database with user_id and credits_used
+        const sourceImages = body.imageUrl && (body.imageUrl.startsWith("http://") || body.imageUrl.startsWith("https://"))
+          ? [body.imageUrl]
+          : null;
+        const detectedGenerateType: GenerateType = "ImageTo3D";
+        const finalParentJobId = body.parentJobId || (body.parentJobIds && body.parentJobIds.length > 0 ? body.parentJobIds[0] : null);
+        const finalParentJobIds = body.parentJobIds && body.parentJobIds.length > 0
+          ? body.parentJobIds
+          : (finalParentJobId ? [finalParentJobId] : []);
+
+        await createJob({
+          id: createdJobId,
+          userId,
+          chatId: body.chatId || null,
+          workspaceId: body.workspaceId || null,
+          parentJobId: finalParentJobId,
+          parentJobIds: finalParentJobIds,
+          prompt: body.prompt || null,
+          imageUrl: body.imageUrl || null,
+          sourceImages,
+          generateType: detectedGenerateType,
+          creditsUsed: CREDITS_IMAGE_TO_3D,
+        });
+
+        return { jobId: createdJobId };
+      });
+
+      return res.json({ jobId });
+    }
+
+    if (body.prompt) {
       return res.status(400).json({
         error: "Text-to-3D runs as text-to-image then image-to-3d. Call /text-to-image first, then /generate with imageUrl.",
       });
-    } else {
-      return res.status(400).json({ error: "imageUrl is required" });
     }
 
-    // Create job in database with user_id and credits_used
-    const sourceImages = body.imageUrl && (body.imageUrl.startsWith("http://") || body.imageUrl.startsWith("https://"))
-      ? [body.imageUrl]
-      : null;
-    const detectedGenerateType: GenerateType = "ImageTo3D";
-    const finalParentJobId = body.parentJobId || (body.parentJobIds && body.parentJobIds.length > 0 ? body.parentJobIds[0] : null);
-    const finalParentJobIds = body.parentJobIds && body.parentJobIds.length > 0
-      ? body.parentJobIds
-      : (finalParentJobId ? [finalParentJobId] : []);
-
-    await createJob({
-      id: jobId,
-      userId,
-      chatId: body.chatId || null,
-      workspaceId: body.workspaceId || null,
-      parentJobId: finalParentJobId,
-      parentJobIds: finalParentJobIds,
-      prompt: body.prompt || null,
-      imageUrl: body.imageUrl || null,
-      sourceImages,
-      generateType: detectedGenerateType,
-      creditsUsed: CREDITS_IMAGE_TO_3D,
-    });
-
-    res.json({ jobId });
+    return res.status(400).json({ error: "imageUrl is required" });
   } catch (err: any) {
     logger.error(err, "failed to submit job");
+    if (err?.status === 402) {
+      return res.status(402).json({ error: err.message });
+    }
     res.status(400).json({ error: err.message || "Failed to submit job" });
   }
 });
@@ -1331,11 +1346,19 @@ threeDRouter.get("/status/:jobId", requireAuth, async (req, res) => {
     }
 
     if (apiJob.status === "failed" || apiJob.status === "cancelled") {
+      const wasInFlight = job.status === "WAIT" || job.status === "RUN" || !job.status;
+      const refundAmount = wasInFlight && job.userId ? (job.creditsUsed ?? 0) : 0;
       await updateJobStatus(jobId, {
         status,
         errorCode: null,
         errorMessage: apiJob.error || "Job failed",
+        creditsUsed: refundAmount > 0 ? 0 : undefined,
       });
+      if (refundAmount > 0 && job.userId) {
+        const { refundCredit } = await import("../services/credits.js");
+        await refundCredit(job.userId, refundAmount);
+        job.creditsUsed = 0;
+      }
       job.errorMessage = apiJob.error || "Job failed";
     }
 
@@ -1382,8 +1405,12 @@ threeDRouter.post("/cancel/:jobId", requireAuth, async (req, res) => {
 
   try {
     const job = await getJob(jobId);
-    if (!job) return res.status(404).json({ error: "Job not found" });
-    if (denyIfNotJobOwner(job, userId, res)) return;
+    if (!job) {
+      return res.status(404).json({ error: "Job not found" });
+    }
+    if (denyIfNotJobOwner(job, userId, res)) {
+      return;
+    }
 
     if (isWaterJobId(jobId) || isWaterJobRow(job as any)) {
       return res.status(400).json({
@@ -1402,31 +1429,45 @@ threeDRouter.post("/cancel/:jobId", requireAuth, async (req, res) => {
     // Mark local job cancelled while still in-flight so UI/poll see FAIL immediately.
     const wasInFlight = status === "WAIT" || status === "RUN" || status === "PENDING" || !status;
     if (wasInFlight) {
-      await updateJobStatus(jobId, { status: "FAIL", errorMessage: "Cancelled by user" });
+      const refundAmount = userId ? (job.creditsUsed ?? 0) : 0;
+      await updateJobStatus(jobId, {
+        status: "FAIL",
+        errorMessage: "Cancelled by user",
+        creditsUsed: refundAmount > 0 ? 0 : undefined,
+      });
+      if (refundAmount > 0 && userId) {
+        const { refundCredit } = await import("../services/credits.js");
+        await refundCredit(userId, refundAmount);
+        job.creditsUsed = 0;
+      }
     }
 
     // Best-effort notify GPU so workers skip remaining stages
-    let gatewayMessage = "Job cancelled";
-    try {
-      const { response } = await fetchGateway(`/cancel/${jobId}`, { method: "POST" });
-      const data = await response.json().catch(() => ({} as any));
-      if (response.ok) {
-        gatewayMessage = data.message || gatewayMessage;
-      } else if (response.status === 404 || response.status === 400) {
-        // Job never reached GPU, or already terminal there — local cancel still wins
-        logger.info(
-          { jobId, gatewayStatus: response.status, err: data.error },
-          "GPU cancel soft-succeeded"
-        );
-      } else {
+    const gatewayMessage = await (async (): Promise<string> => {
+      try {
+        const { response } = await fetchGateway(`/cancel/${jobId}`, { method: "POST" });
+        const data = await response.json().catch(() => ({} as any));
+        if (response.ok) {
+          return data.message || "Job cancelled";
+        }
+        if (response.status === 404 || response.status === 400) {
+          // Job never reached GPU, or already terminal there — local cancel still wins
+          logger.info(
+            { jobId, gatewayStatus: response.status, err: data.error },
+            "GPU cancel soft-succeeded"
+          );
+          return "Job cancelled";
+        }
         logger.warn(
           { jobId, gatewayStatus: response.status, err: data.error },
           "GPU cancel returned error; local job already marked cancelled"
         );
+        return "Job cancelled";
+      } catch (gwErr: any) {
+        logger.warn({ jobId, err: gwErr?.message }, "GPU cancel request failed; local job marked cancelled");
+        return "Job cancelled";
       }
-    } catch (gwErr: any) {
-      logger.warn({ jobId, err: gwErr?.message }, "GPU cancel request failed; local job marked cancelled");
-    }
+    })();
 
     if (!wasInFlight && status !== "FAIL") {
       await updateJobStatus(jobId, { status: "FAIL", errorMessage: "Cancelled by user" });

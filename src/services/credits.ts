@@ -16,8 +16,10 @@ export async function getCreditsRow(userId: string): Promise<{ id: string; credi
  * Returns the row (existing or newly created). Uses user_id only (no email).
  */
 export async function ensureCreditsRow(userId: string): Promise<{ id: string; credits_used: number; credits_total: number; plan: string | null } | null> {
-  let row = await getCreditsRow(userId);
-  if (row) return row;
+  const row = await getCreditsRow(userId);
+  if (row) {
+    return row;
+  }
 
   logger.info({ userId }, "Creating free-tier credits row (200 credits)");
   const { data: newRow, error: insertErr } = await supabase
@@ -31,7 +33,9 @@ export async function ensureCreditsRow(userId: string): Promise<{ id: string; cr
     .select("id, credits_used, credits_total, plan")
     .single();
 
-  if (!insertErr && newRow) return newRow;
+  if (!insertErr && newRow) {
+    return newRow;
+  }
 
   if (insertErr?.code === "23505") {
     return getCreditsRow(userId);
@@ -53,7 +57,9 @@ export async function deductCredit(
   const row = await ensureCreditsRow(userId);
 
   if (!row) {
-    if (requireCredits) return { ok: false, error: "No credit balance. Please subscribe to generate." };
+    if (requireCredits) {
+      return { ok: false, error: "No credit balance. Please subscribe to generate." };
+    }
     return { ok: true, remaining: 0 };
   }
 
@@ -102,9 +108,28 @@ export async function deductCredit(
 
 /** Give back credits charged for an operation that failed upstream. Never drops credits_used below 0. */
 export async function refundCredit(userId: string, amount: number): Promise<void> {
-  if (amount <= 0) return;
+  if (amount <= 0) {
+    return;
+  }
   const row = await getCreditsRow(userId);
-  if (!row) return;
+  if (!row) {
+    return;
+  }
+
+  // Prefer atomic RPC (run backend/sql/017_refund_user_credits_function.sql in Supabase)
+  const { data: rpcData, error: rpcError } = await supabase.rpc("refund_user_credits", {
+    p_credits_row_id: row.id,
+    p_amount: amount,
+  });
+
+  if (!rpcError && rpcData && Array.isArray(rpcData) && rpcData.length > 0) {
+    const first = rpcData[0] as { remaining: number; success: boolean };
+    if (first.success) {
+      logger.info({ userId, amount, remaining: first.remaining }, "Credits refunded (atomic)");
+      return;
+    }
+  }
+
   const newUsed = Math.max(0, row.credits_used - amount);
   const { error } = await supabase
     .from("user_credits")
