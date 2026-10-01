@@ -9,6 +9,7 @@ export type GenerateType =
   | "TextTo3D"
   | "ImageTo3D"
   | "EditImage"
+  /** Legacy rows from the removed combine feature; no longer created. */
   | "Combined"
   | "CodeSculpt"
   | "Water";
@@ -34,7 +35,7 @@ export interface JobRecord {
   status: JobStatus;
   prompt: string | null;
   imageUrl: string | null;
-  sourceImages: string[] | null; // Actual source image URLs used as input (e.g. 2 URLs for combined edit)
+  sourceImages: string[] | null; // Actual source image URLs used as input (e.g. the image being edited)
   generateType: GenerateType;
   enablePBR: boolean; // legacy field; always true (column dropped)
   resultGlbUrl: string | null;

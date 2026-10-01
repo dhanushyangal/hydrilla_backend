@@ -9,13 +9,16 @@ export async function createJob(params: {
   chatId?: string | null;  // Chat this job belongs to
   workspaceId?: string | null;  // Workspace this job belongs to
   parentJobId?: string | null;  // Primary parent job for iterative prompting lineage
-  parentJobIds?: string[];       // All parent IDs (for multi-parent merges like combined edits)
+  parentJobIds?: string[];       // All parent IDs
   prompt?: string | null;
   imageUrl?: string | null;
   sourceImages?: string[] | null; // Actual source image URLs used as input
   generateType: GenerateType;
   status?: JobStatus;  // Optional initial status (defaults to "WAIT")
   creditsUsed?: number;  // Credits consumed for this job (default 0)
+  previewImageUrl?: string | null;
+  llmProvider?: string | null;  // Image jobs: "openai" | "gemini"
+  llmModel?: string | null;
 }) {
   const {
     id,
@@ -30,6 +33,9 @@ export async function createJob(params: {
     generateType,
     status = "WAIT",
     creditsUsed = 0,
+    previewImageUrl = null,
+    llmProvider = null,
+    llmModel = null,
   } = params;
 
   try {
@@ -50,6 +56,9 @@ export async function createJob(params: {
       source_images: sourceImages && sourceImages.length > 0 ? JSON.stringify(sourceImages) : null,
       generate_type: generateType,
       credits_used: creditsUsed,
+      ...(previewImageUrl ? { preview_image_url: previewImageUrl } : {}),
+      ...(llmProvider ? { llm_provider: llmProvider } : {}),
+      ...(llmModel ? { llm_model: llmModel } : {}),
     });
 
     if (error) throw error;
@@ -222,6 +231,9 @@ export async function listJobsForUser(userId: string, limit = 50): Promise<JobRe
   }
 }
 
+/** Image job types, including legacy "Combined" rows from the removed combine feature. */
+const IMAGE_GENERATE_TYPES = new Set(["TextToImage", "EditImage", "Combined"]);
+
 /**
  * Get jobs that need status sync (pending or running jobs)
  */
@@ -236,7 +248,7 @@ export async function getJobsToSync(): Promise<JobRecord[]> {
 
     if (error) throw error;
     if (!data) return [];
-    // Water jobs are LLM-backed — never poll the GPU gateway for them.
+    // Water jobs are LLM-backed and image jobs come from OpenAI/Gemini — never poll the GPU gateway for them.
     return data
       .map(mapRow)
       .filter(
@@ -245,6 +257,7 @@ export async function getJobsToSync(): Promise<JobRecord[]> {
           j.engine !== "water" &&
           j.generateType !== "CodeSculpt" &&
           j.generateType !== "Water" &&
+          !IMAGE_GENERATE_TYPES.has(String(j.generateType)) &&
           j.resultKind !== "three_factory"
       );
   } catch (err: any) {

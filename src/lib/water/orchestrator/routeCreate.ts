@@ -21,7 +21,12 @@
 import { screenSubject, validateCompiledPrompt, type CompiledPrompt } from "../../create/compile.js";
 import { planRoute, type RoutePlan } from "../../create/route.js";
 import type { CreateProfile } from "../../create/quality/thresholds.js";
-import { parseQualityTier, type QualityTier, type WaterSkillId } from "../../waterSkills.js";
+import {
+  parseQualityTier,
+  parseWaterSkillId,
+  type QualityTier,
+  type WaterSkillId,
+} from "../../waterSkills.js";
 import { bindWaterPack, profileToQualityTier, tierToProfile } from "./packs.js";
 
 /** Shipped threejs product stages. Mesh-post / visual evaluate plug in later. */
@@ -82,15 +87,30 @@ function compileFromBrief(
   return validated.compiled;
 }
 
+function tryCompileFromBrief(
+  prompt: string,
+  pack: WaterSkillId,
+  profile: CreateProfile
+): { ok: true; compiled: CompiledPrompt } | { ok: false; error: string } {
+  try {
+    const compiled = compileFromBrief(prompt, pack, profile);
+    return { ok: true, compiled };
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : "Could not compile the Water brief.";
+    return { ok: false, error: message };
+  }
+}
+
 /**
  * Compile + route a Water brief. Does not spend the customer's generate tokens.
- * Pack is bound from the brief. Quality tier is the user's power control
+ * Pack is bound from the brief (or explicitly provided). Quality tier is the user's power control
  * (Fast / Standard / Studio); if omitted, Standard is used.
  */
 export function planWaterCreate(params: {
   prompt: string;
   imageUrl?: string | null;
   qualityTier?: string | null;
+  skillId?: string | null;
 }): WaterCreatePlanResult {
   const prompt = (params.prompt || "").trim();
   const screen = screenSubject({ text: prompt, engine: "water" });
@@ -98,7 +118,9 @@ export function planWaterCreate(params: {
     return { ok: false, message: screen.refuseReason };
   }
 
+  const explicitSkill = parseWaterSkillId(params.skillId);
   const bound = bindWaterPack(prompt);
+  const skillId = explicitSkill || bound.skillId;
   const qualityTier: QualityTier = params.qualityTier
     ? parseQualityTier(params.qualityTier)
     : profileToQualityTier(bound.profile);
@@ -106,12 +128,11 @@ export function planWaterCreate(params: {
     ? tierToProfile(qualityTier, bound.profile)
     : bound.profile;
 
-  let compiled: CompiledPrompt;
-  try {
-    compiled = compileFromBrief(prompt, bound.skillId, profile);
-  } catch (err: any) {
-    return { ok: false, message: err?.message || "Could not compile the Water brief." };
+  const compiledResult = tryCompileFromBrief(prompt, skillId, profile);
+  if (!compiledResult.ok) {
+    return { ok: false, message: compiledResult.error };
   }
+  const compiled = compiledResult.compiled;
 
   const routed = planRoute({
     engine: "water",
@@ -127,7 +148,7 @@ export function planWaterCreate(params: {
   return {
     ok: true,
     plan: {
-      skillId: bound.skillId,
+      skillId,
       qualityTier,
       profile,
       compiled,

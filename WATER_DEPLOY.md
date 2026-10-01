@@ -33,6 +33,16 @@ Generate once, set in Vercel → Project → Settings → Environment Variables 
 
 Redeploy backend after setting.
 
+**Image generation (text-to-image + edit):**
+
+```text
+OPENAI_API_KEY        # optional if the admin "openai" platform key is set
+GEMINI_API_KEY        # optional if the admin "google" platform key is set
+HYDRILLA_GPU_API_URL  # GPU VM for image-to-3d (https://api.hydrilla.co)
+```
+
+`FLUX_GATEWAY_URL` / `FLUX_API_URL` are no longer read (images don't use the VM). `TRELLIS_GATEWAY_URL`, `TRELLIS_API_URL` and `HUNYUAN_API_URL` still work as fallbacks for `HYDRILLA_GPU_API_URL`.
+
 **Already needed for uploads / Water thumbnails (should already be set):**
 
 ```text

@@ -59,7 +59,7 @@ export function normalizeGlbUrl(jobId: string, apiUrl: string | null | undefined
 
 /**
  * Normalize preview image URL - use direct S3 URL if API URL points to our bucket
- * Handles: preview/, image/, edit/, combined/ paths (S3 or gateway /outputs/ paths).
+ * Handles: preview/, image/, edit/ paths (S3 or gateway /outputs/ paths); combined/ only for legacy rows.
  * If no URL provided, returns preview path (for text-to-image previews)
  */
 export function normalizePreviewUrl(jobId: string, apiUrl: string | null | undefined): string | null {

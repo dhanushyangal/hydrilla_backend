@@ -1,4 +1,5 @@
 import { Router } from "express";
+import { randomUUID } from "crypto";
 import multer from "multer";
 import path from "path";
 import fs from "fs";
@@ -13,6 +14,27 @@ import { createWorkspace, getWorkspace, getWorkspaceForUser, listWorkspacesForUs
 import { requireAuth, syncUserToDatabase } from "../middleware/auth.js";
 import { normalizeGlbUrl, normalizePreviewUrl } from "../utils/s3Urls.js";
 import { isWaterEngine, isWaterJobId, isWaterJobRow } from "../lib/engines.js";
+import {
+  generateImage,
+  imageProviderAvailability,
+  isImageProviderError,
+  runDeduplicatedImageJob,
+  validateImagePrompt,
+  IMAGE_CREDITS,
+  parseImageAspect,
+  parseImageProvider,
+  parseImageQuality,
+  runWithUsage,
+  summarizeUsage,
+  type GeneratedImage,
+  type ImageAspect,
+  type ImageOperation,
+  type ImageProvider,
+  type ImageQuality,
+  type InputImage,
+  type UsageCall,
+} from "../services/imageProviders/index.js";
+import { recordImageUsage, type ImageUsageRecord } from "../repository/imageUsage.js";
 import { JobStatus, JobRecord, ChatRecord, WorkspaceRecord, GenerateType } from "../types.js";
 
 export const threeDRouter = Router();
@@ -35,7 +57,7 @@ function compactVisualEvidence(spec: unknown): {
 }
 
 /** Attach shared internal secret on every Node → GPU request */
-function withInternalSecretHeaders(init?: RequestInit): RequestInit {
+export function withInternalSecretHeaders(init?: RequestInit): RequestInit {
   const headers = new Headers(init?.headers || {});
   if (config.internalApiSecret) {
     headers.set("X-Hydrilla-Internal", config.internalApiSecret);
@@ -83,7 +105,6 @@ function isAllowedImageProxyUrl(imageUrl: string): boolean {
       `s3.${region}.amazonaws.com`,
       "s3.amazonaws.com",
       "api.hydrilla.co",
-      "api.hydrilla.ai",
     ]);
     for (const legacy of LEGACY_S3_BUCKETS) {
       allowedHosts.add(`${legacy}.s3.amazonaws.com`);
@@ -190,7 +211,7 @@ const upload = multer({
  *
  * Repacking via `new Uint8Array(file.buffer)` when the buffer is undefined
  * produces an empty Uint8Array, which silently uploads a 0-byte file —
- * causing downstream errors like FLUX's "cannot identify image file".
+ * causing downstream "cannot identify image file" errors.
  */
 function readMulterFile(file: Express.Multer.File): Buffer {
   if (file.buffer && file.buffer.length > 0) return file.buffer;
@@ -198,66 +219,33 @@ function readMulterFile(file: Express.Multer.File): Buffer {
   throw new Error("Uploaded file has neither buffer nor path");
 }
 
-/** Build a Blob from a multer file that works with both memory and disk storage. */
-function multerFileToBlob(file: Express.Multer.File, fallbackMime = "image/png"): Blob {
-  const buf = readMulterFile(file);
-  return new Blob([new Uint8Array(buf)], { type: file.mimetype || fallbackMime });
-}
+/** GPU VM gateway (no trailing slash) — BlueFox3D image-to-3d on api.hydrilla.co */
+const GPU_GATEWAY = config.gpuGateway.url;
 
-/** Unified GPU gateway (no trailing slash) — image + 3D on api.hydrilla.co */
-const GPU_GATEWAY = config.trellisGateway.url;
-const FLUX_GATEWAY = config.fluxGateway.url;
-const TRELLIS_GATEWAY = config.trellisGateway.url;
+/** Image jobs are produced by OpenAI/Gemini in-request; they never exist on the VM. */
+const PROVIDER_IMAGE_TYPES: GenerateType[] = ["TextToImage", "EditImage"];
 
-const FLUX_GENERATE_TYPES: GenerateType[] = ["TextToImage", "EditImage", "Combined"];
-
-function isFluxJobType(generateType: GenerateType | null | undefined): boolean {
-  return !!generateType && FLUX_GENERATE_TYPES.includes(generateType);
-}
-
-function gatewayBaseForPath(path: string, job?: JobRecord | null): string {
-  const p = path.startsWith("/") ? path : `/${path}`;
-  if (/^\/text-to-image|^\/edit-image|^\/combined-edit/.test(p)) {
-    return FLUX_GATEWAY;
-  }
-  if (/^\/text-to-3d|^\/image-to-3d/.test(p)) {
-    return TRELLIS_GATEWAY;
-  }
-  if ((/^\/status\//.test(p) || /^\/cancel\//.test(p)) && job?.generateType) {
-    return isFluxJobType(job.generateType) ? FLUX_GATEWAY : TRELLIS_GATEWAY;
-  }
-  return TRELLIS_GATEWAY;
-}
-
-function defaultBaseForPath(path: string, job?: JobRecord | null): string {
-  return gatewayBaseForPath(path, job);
-}
 const LEGACY_S3_BUCKETS = (process.env.LEGACY_S3_BUCKETS || "hydrilla-outputs")
   .split(",")
   .map((bucket) => bucket.trim().toLowerCase())
   .filter(Boolean);
 
-/** Resolve relative image URL from gateway to full URL (uses provided baseUrl or path default) */
-function resolveGatewayImageUrl(url: string | undefined | null, baseUrl?: string, pathHint = "/text-to-image"): string | null {
+/** Resolve a relative gateway image URL (e.g. /outputs/...) to a full URL. */
+function resolveGatewayImageUrl(url: string | undefined | null, baseUrl: string = GPU_GATEWAY): string | null {
   if (!url || typeof url !== "string") return null;
   if (url.startsWith("http://") || url.startsWith("https://")) return url;
-  const base = (baseUrl || defaultBaseForPath(pathHint)).replace(/\/$/, "");
+  const base = baseUrl.replace(/\/$/, "");
   return url.startsWith("/") ? `${base}${url}` : `${base}/${url}`;
 }
 
-/**
- * Fetch from the GPU gateway (single host: api.hydrilla.co).
- */
+/** Fetch from the GPU VM gateway. */
 async function fetchGateway(
   path: string,
-  init: RequestInit = {},
-  options?: { job?: JobRecord | null }
+  init: RequestInit = {}
 ): Promise<{ response: Response; baseUrl: string }> {
   const pathStr = path.startsWith("/") ? path : `/${path}`;
-  const baseUrl = gatewayBaseForPath(pathStr, options?.job);
-  const url = `${baseUrl}${pathStr}`;
-  const response = await fetch(url, withInternalSecretHeaders(init));
-  return { response, baseUrl };
+  const response = await fetch(`${GPU_GATEWAY}${pathStr}`, withInternalSecretHeaders(init));
+  return { response, baseUrl: GPU_GATEWAY };
 }
 
 /** Fetch /queue/info from the GPU gateway. */
@@ -343,6 +331,7 @@ function contentTypeForImageKey(key: string, fallback?: string): string {
 function getJobIdFromS3Key(key: string): string | null {
   const [prefix, jobId] = key.split("/");
   if (!jobId) return null;
+  // "combined" is kept so legacy Combined rows still resolve in the image proxy.
   return ["preview", "image", "text", "edit", "combined"].includes(prefix) ? jobId : null;
 }
 
@@ -447,8 +436,7 @@ function isGatewayOutputImageUrl(imageUrl: string): boolean {
   return (
     imageUrl.includes("/outputs/preview/") ||
     imageUrl.includes("/outputs/image/") ||
-    imageUrl.includes("/outputs/edit/") ||
-    imageUrl.includes("/outputs/combined/")
+    imageUrl.includes("/outputs/edit/")
   );
 }
 
@@ -466,7 +454,7 @@ function gatewayOutputUrlCandidates(imageUrl: string): string[] {
   if (key) {
     const gatewayBase = GPU_GATEWAY.replace(/\/$/, "");
     for (const candidateKey of imageKeyCandidates(key)) {
-      const match = candidateKey.match(/^(preview|image|edit|combined)\/([^/]+)\/(.+)$/);
+      const match = candidateKey.match(/^(preview|image|edit)\/([^/]+)\/(.+)$/);
       if (match) {
         urls.push(`${gatewayBase}/outputs/${match[1]}/${match[2]}/${match[3]}`);
       }
@@ -566,15 +554,50 @@ async function fetchGatewayImageTo3DMultipart(
   image: { buffer: Buffer; contentType: string; filename: string },
   userId: string
 ): Promise<{ response: Response; baseUrl: string }> {
-  const pathStr = "/image-to-3d";
-  const baseUrl = gatewayBaseForPath(pathStr);
   const formData = new FormData();
   const blob = new Blob([new Uint8Array(image.buffer)], { type: image.contentType });
   formData.append("image", blob, image.filename);
   formData.append("user_id", userId);
-  const url = `${baseUrl.replace(/\/$/, "")}${pathStr}`;
-  const response = await fetch(url, withInternalSecretHeaders({ method: "POST", body: formData }));
-  return { response, baseUrl };
+  return fetchGateway("/image-to-3d", { method: "POST", body: formData });
+}
+
+/** Non-2xx reply from the GPU VM when submitting a job. */
+class GpuSubmitHttpError extends Error {
+  constructor(readonly status: number, message: string) {
+    super(message);
+    this.name = "GpuSubmitHttpError";
+  }
+}
+
+/** The VM restarts itself every few generations; ~30s covers process exit + uvicorn start. */
+const GPU_SUBMIT_RETRY_DELAYS_MS = [2000, 3000, 5000, 5000, 5000, 5000, 5000];
+
+function isTransientGpuSubmitError(err: unknown): boolean {
+  if (err instanceof GpuSubmitHttpError) {
+    if (/queue full/i.test(err.message)) {
+      return false;
+    }
+    return err.status === 502 || err.status === 503 || err.status === 504;
+  }
+  const msg = err && typeof (err as any).message === "string" ? (err as any).message : "";
+  return /fetch failed|ECONNREFUSED|ECONNRESET|socket hang up|other side closed|network/i.test(msg);
+}
+
+async function submitWithGpuRestartRetry<T>(submit: () => Promise<T>, attempt = 0): Promise<T> {
+  try {
+    return await submit();
+  } catch (err) {
+    const delayMs = GPU_SUBMIT_RETRY_DELAYS_MS[attempt];
+    if (delayMs === undefined || !isTransientGpuSubmitError(err)) {
+      throw err;
+    }
+    logger.warn(
+      { attempt: attempt + 1, delayMs, err: (err as any)?.message },
+      "GPU VM temporarily unavailable (likely restarting); retrying job submission"
+    );
+    await new Promise((resolve) => setTimeout(resolve, delayMs));
+    return submitWithGpuRestartRetry(submit, attempt + 1);
+  }
 }
 
 /** Map gateway/network errors to a user-facing message when the GPU API is unreachable. */
@@ -585,11 +608,8 @@ function gatewayErrorToUserMessage(err: unknown): string {
   return msg || "GPU is unavailable";
 }
 
-// Credits per operation (charged when user runs the operation)
-const CREDITS_IMAGE_GEN = 2;      // text-to-image (preview)
-const CREDITS_IMAGE_EDIT = 3;     // edit-image
-const CREDITS_COMBINED = 4;       // 2-image combined edit
-const CREDITS_IMAGE_TO_3D = 10;   // image-to-3d / text-to-3d
+// Credits for image-to-3d. Image credits depend on the tier (IMAGE_CREDITS in services/imageProviders).
+const CREDITS_IMAGE_TO_3D = 10;
 
 // Initialize S3 client (Vercel/serverless has no writable disk — uploads must use S3 with valid AWS creds)
 let s3Client: S3Client | null = null;
@@ -696,36 +716,7 @@ threeDRouter.post("/generate", requireAuth, async (req, res) => {
     const { deductCredit } = await import("../services/credits.js");
     let jobId: string;
 
-    if (body.prompt) {
-      const deductResult = await deductCredit(userId, CREDITS_IMAGE_TO_3D, true);
-      if (!deductResult.ok) {
-        return res.status(402).json({ error: deductResult.error });
-      }
-      // Text-to-3D
-      const formData = new URLSearchParams();
-      formData.append("prompt", body.prompt);
-      formData.append("user_id", userId);  // Pass user_id to Python API
-
-      const { response } = await fetchGateway("/text-to-3d", {
-        method: "POST",
-        headers: { "Content-Type": "application/x-www-form-urlencoded" },
-        body: formData.toString(),
-      });
-
-      if (!response.ok) {
-        let errorText: string;
-        try {
-          const errorData = await response.json();
-          errorText = errorData.error || "Failed to submit text-to-3d job";
-        } catch {
-          errorText = await response.text() || "Failed to submit text-to-3d job";
-        }
-        throw new Error(errorText);
-      }
-
-      const data = await response.json();
-      jobId = data.job_id;
-    } else if (body.imageUrl || body.imageBase64) {
+    if (body.imageUrl || body.imageBase64) {
       if (body.imageBase64) {
         return res.status(400).json({ error: "Please provide imageUrl instead of imageBase64" });
       }
@@ -774,14 +765,15 @@ threeDRouter.post("/generate", requireAuth, async (req, res) => {
         }
       };
 
-      if (multipartForImage) {
-        const { response } = await fetchGatewayImageTo3DMultipart(multipartForImage, userId);
-        if (!response.ok) {
-          throw new Error(await parseImageTo3dError(response));
+      const submitToGpu = async (): Promise<string> => {
+        if (multipartForImage) {
+          const { response } = await fetchGatewayImageTo3DMultipart(multipartForImage, userId);
+          if (!response.ok) {
+            throw new GpuSubmitHttpError(response.status, await parseImageTo3dError(response));
+          }
+          const data = await response.json();
+          return data.job_id;
         }
-        const data = await response.json();
-        jobId = data.job_id;
-      } else {
         const formData = new URLSearchParams();
         formData.append("image_url", imageUrl);
         formData.append("user_id", userId);
@@ -791,20 +783,32 @@ threeDRouter.post("/generate", requireAuth, async (req, res) => {
           body: formData.toString(),
         });
         if (!response.ok) {
-          throw new Error(await parseImageTo3dError(response));
+          throw new GpuSubmitHttpError(response.status, await parseImageTo3dError(response));
         }
         const data = await response.json();
-        jobId = data.job_id;
+        return data.job_id;
+      };
+
+      try {
+        jobId = await submitWithGpuRestartRetry(submitToGpu);
+      } catch (submitErr) {
+        const { refundCredit } = await import("../services/credits.js");
+        await refundCredit(userId, CREDITS_IMAGE_TO_3D);
+        throw submitErr;
       }
+    } else if (body.prompt) {
+      return res.status(400).json({
+        error: "Text-to-3D runs as text-to-image then image-to-3d. Call /text-to-image first, then /generate with imageUrl.",
+      });
     } else {
-      return res.status(400).json({ error: "Either prompt or imageUrl is required" });
+      return res.status(400).json({ error: "imageUrl is required" });
     }
 
     // Create job in database with user_id and credits_used
     const sourceImages = body.imageUrl && (body.imageUrl.startsWith("http://") || body.imageUrl.startsWith("https://"))
       ? [body.imageUrl]
       : null;
-    const detectedGenerateType: GenerateType = body.prompt ? "TextTo3D" : "ImageTo3D";
+    const detectedGenerateType: GenerateType = "ImageTo3D";
     const finalParentJobId = body.parentJobId || (body.parentJobIds && body.parentJobIds.length > 0 ? body.parentJobIds[0] : null);
     const finalParentJobIds = body.parentJobIds && body.parentJobIds.length > 0
       ? body.parentJobIds
@@ -832,124 +836,297 @@ threeDRouter.post("/generate", requireAuth, async (req, res) => {
 });
 
 // ============================================
-// Text-to-image (preview) – 2 credits
+// Image generation (OpenAI / Gemini) — credits by tier
 // ============================================
+
+type ImageOptions = { provider: ImageProvider; quality: ImageQuality; aspect: ImageAspect };
+
+type ImageJobContext = {
+  chatId: string | null;
+  workspaceId: string | null;
+  parentJobId: string | null;
+  parentJobIds: string[];
+  sourceImages: string[] | null;
+  imageUrl: string | null;
+};
+
+function parseStringArray(raw: unknown): string[] {
+  if (Array.isArray(raw)) return raw.filter((x): x is string => typeof x === "string");
+  if (typeof raw !== "string" || !raw.trim()) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed.filter((x): x is string => typeof x === "string") : [];
+  } catch {
+    return [];
+  }
+}
+
+/** Validates provider / quality / aspect; sends 400 and returns null when invalid. */
+function parseImageOptions(body: any, res: any): ImageOptions | null {
+  const provider = parseImageProvider(body?.provider);
+  const quality = parseImageQuality(body?.quality);
+  const aspect = parseImageAspect(body?.aspect);
+  if (!provider) {
+    res.status(400).json({ error: "provider must be one of: openai, gemini" });
+    return null;
+  }
+  if (!quality) {
+    res.status(400).json({ error: "quality must be one of: low, high" });
+    return null;
+  }
+  if (!aspect) {
+    res.status(400).json({ error: "aspect must be one of: 1:1, 3:2, 2:3" });
+    return null;
+  }
+  return { provider, quality, aspect };
+}
+
+async function storeGeneratedImage(key: string, image: GeneratedImage): Promise<string> {
+  if (!s3Enabled || !s3Client || !config.s3.bucket) {
+    throw new Error("S3 is not configured; generated images cannot be stored.");
+  }
+  const putInput: PutObjectCommandInput = {
+    Bucket: config.s3.bucket,
+    Key: key,
+    Body: image.bytes,
+    ContentType: image.mime,
+  };
+  const acl = process.env.S3_PUT_ACL?.trim();
+  if (acl) {
+    putInput.ACL = acl as PutObjectCommandInput["ACL"];
+  }
+  await s3Client.send(new PutObjectCommand(putInput));
+  return publicUrlForS3Key(key);
+}
+
+/** Fire-and-forget: usage bookkeeping must never fail or slow the user's request. */
+function saveImageUsage(record: Omit<ImageUsageRecord, "usage">, calls: UsageCall[]) {
+  if (record.status === "failed" && calls.length === 0) {
+    return;
+  }
+  const usage = summarizeUsage(calls);
+  recordImageUsage({ ...record, usage }).catch((err: any) => {
+    logger.warn(
+      { err: err?.message, jobId: record.jobId, userId: record.userId, costUsd: usage.costUsd },
+      "Failed to record image usage (non-critical)"
+    );
+  });
+}
+
+/** Charge the tier, call the provider, store the result in S3, record a DONE job. Refunds on failure. */
+async function runProviderImageJob(
+  res: any,
+  userId: string,
+  op: ImageOperation,
+  prompt: string,
+  options: ImageOptions,
+  ctx: ImageJobContext,
+  inputImage: InputImage | null
+) {
+  const executeGeneration = async () => {
+    const credits = IMAGE_CREDITS[op][options.quality];
+    const { deductCredit, refundCredit } = await import("../services/credits.js");
+    const deductResult = await deductCredit(userId, credits, true);
+    if (!deductResult.ok) {
+      return { ok: false as const, status: 402, payload: { error: deductResult.error } };
+    }
+
+    const jobId = randomUUID();
+    const usageCalls: UsageCall[] = [];
+    const usageBase = { userId, operation: op, provider: options.provider, quality: options.quality };
+    const outcome = await runWithUsage(usageCalls, async () => {
+      const generated = await generateImage({ ...options, prompt, inputImage });
+      const key = op === "edit" ? `edit/${jobId}/edited.png` : `preview/${jobId}/preview_image.png`;
+      return { image: generated, imageUrl: await storeGeneratedImage(key, generated) };
+    }).then(
+      (value) => ({ ok: true as const, ...value }),
+      (err: any) => ({ ok: false as const, err })
+    );
+
+    if (!outcome.ok) {
+      const err = outcome.err;
+      await refundCredit(userId, credits);
+      saveImageUsage(
+        {
+          ...usageBase,
+          jobId: null,
+          model: usageCalls.filter((c) => c.kind === "image").at(-1)?.model ?? null,
+          status: "failed",
+          errorCode: isImageProviderError(err) ? err.code : "IMAGE_GENERATION_FAILED",
+          creditsCharged: 0,
+        },
+        usageCalls
+      );
+      if (isImageProviderError(err)) {
+        logger.warn(
+          {
+            err: err.message,
+            detail: err.detail,
+            code: err.code,
+            provider: options.provider,
+            op,
+            ...(err.status === 422 ? { prompt: prompt.slice(0, 200) } : {}),
+          },
+          "image provider failed"
+        );
+        return {
+          ok: false as const,
+          status: err.status,
+          payload: {
+            success: false,
+            error: {
+              code: err.code,
+              message: err.message,
+            },
+            code: err.code,
+            message: err.message,
+          },
+        };
+      }
+      logger.error({ err: err?.message, op }, "image generation failed");
+      return {
+        ok: false as const,
+        status: 500,
+        payload: {
+          success: false,
+          error: {
+            code: "IMAGE_GENERATION_FAILED",
+            message: "Failed to generate image. Please try again.",
+          },
+          code: "IMAGE_GENERATION_FAILED",
+          message: "Failed to generate image. Please try again.",
+        },
+      };
+    }
+
+    const { image, imageUrl } = outcome;
+    saveImageUsage(
+      {
+        ...usageBase,
+        jobId,
+        model: image.model,
+        status: "succeeded",
+        errorCode: null,
+        creditsCharged: credits,
+      },
+      usageCalls
+    );
+
+    try {
+      await createJob({
+        id: jobId,
+        userId,
+        chatId: ctx.chatId,
+        workspaceId: ctx.workspaceId,
+        parentJobId: ctx.parentJobId || (ctx.parentJobIds[0] ?? null),
+        parentJobIds: ctx.parentJobIds.length > 0 ? ctx.parentJobIds : ctx.parentJobId ? [ctx.parentJobId] : [],
+        prompt: prompt.trim() || null,
+        imageUrl: ctx.imageUrl,
+        sourceImages: ctx.sourceImages,
+        generateType: op === "edit" ? "EditImage" : "TextToImage",
+        status: "DONE",
+        creditsUsed: credits,
+        previewImageUrl: imageUrl,
+        llmProvider: options.provider,
+        llmModel: image.model,
+      });
+    } catch (jobErr: any) {
+      logger.warn({ err: jobErr?.message, jobId }, "Failed to record image job (non-critical)");
+    }
+
+    return {
+      ok: true as const,
+      status: 200,
+      payload: {
+        job_id: jobId,
+        ...(op === "edit" ? { edit_id: jobId } : { preview_id: jobId }),
+        status: "completed",
+        image_url: imageUrl,
+        prompt,
+        provider: options.provider,
+        quality: options.quality,
+        ...(op === "edit" ? {} : { aspect: options.aspect }),
+        model: image.model,
+        credits_used: credits,
+      },
+    };
+  };
+
+  const finalOutcome = inputImage
+    ? await executeGeneration()
+    : (await runDeduplicatedImageJob(
+        userId,
+        op,
+        prompt,
+        options.provider,
+        options.quality,
+        options.aspect,
+        executeGeneration
+      )).result;
+
+  return res.status(finalOutcome.status).json(finalOutcome.payload);
+}
+
 threeDRouter.post("/text-to-image", requireAuth, async (req, res) => {
   try {
     const userId = req.userId!;
     await syncUserToDatabase(userId);
-    const { deductCredit } = await import("../services/credits.js");
-    const deductResult = await deductCredit(userId, CREDITS_IMAGE_GEN, true);
-    if (!deductResult.ok) {
-      return res.status(402).json({ error: deductResult.error });
+    const body = (req.body || {}) as Record<string, unknown>;
+    const promptValidation = validateImagePrompt(body.prompt);
+    if (!promptValidation.ok) {
+      return res.status(400).json({ error: promptValidation.error, code: promptValidation.code });
     }
-    const body = req.body as {
-      prompt?: string;
-      chatId?: string;
-      workspaceId?: string;
-      parentJobId?: string;
-      parentJobIds?: string[];
-    };
-    const prompt = body?.prompt ?? (req as any).body;
-    const promptStr = typeof prompt === "string" ? prompt : "";
-    if (!promptStr.trim()) {
-      return res.status(400).json({ error: "prompt is required" });
+    const prompt = promptValidation.prompt;
+    const options = parseImageOptions(body, res);
+    if (!options) {
+      return;
     }
-    const form = new URLSearchParams();
-    form.append("prompt", promptStr);
-    const { response, baseUrl } = await fetchGateway("/text-to-image", {
-      method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: form.toString(),
-    });
-    if (!response.ok) {
-      const errText = await response.text();
-      let errJson: any;
-      try { errJson = JSON.parse(errText); } catch { errJson = { error: errText }; }
-      return res.status(response.status).json(errJson);
-    }
-    const data = await response.json();
-    const jobId = data.preview_id ?? data.job_id;
-    if (jobId && userId) {
-      try {
-        const existing = await getJob(jobId);
-        if (!existing) {
-          const previewUrl = resolveGatewayImageUrl(data.image_url ?? data.result?.image_url, baseUrl);
-          await createJob({
-            id: jobId,
-            userId,
-            chatId: body.chatId || null,
-            workspaceId: body.workspaceId || null,
-            parentJobId: body.parentJobId || (body.parentJobIds?.[0] ?? null),
-            parentJobIds: body.parentJobIds && body.parentJobIds.length > 0
-              ? body.parentJobIds
-              : (body.parentJobId ? [body.parentJobId] : []),
-            prompt: promptStr.trim() || null,
-            generateType: "TextToImage",
-            status: previewUrl ? "DONE" : "WAIT",
-            creditsUsed: CREDITS_IMAGE_GEN,
-          });
-          if (previewUrl) {
-            await updateJobResult(jobId, { previewImageUrl: previewUrl });
-          }
-        }
-      } catch (jobErr: any) {
-        logger.warn({ err: jobErr, jobId }, "Failed to create preview job record (non-critical)");
-      }
-    }
-    res.json(data);
+
+    await runProviderImageJob(res, userId, "text-to-image", prompt, options, {
+      chatId: typeof body.chatId === "string" ? body.chatId : null,
+      workspaceId: typeof body.workspaceId === "string" ? body.workspaceId : null,
+      parentJobId: typeof body.parentJobId === "string" ? body.parentJobId : null,
+      parentJobIds: parseStringArray(body.parentJobIds),
+      sourceImages: null,
+      imageUrl: null,
+    }, null);
   } catch (err: any) {
     logger.error({ err: err.message }, "text-to-image failed");
-    res.status(500).json({ error: gatewayErrorToUserMessage(err) });
+    if (!res.headersSent) {
+      res.status(500).json({ error: err.message || "Image generation failed" });
+    }
   }
 });
 
 // ============================================
-// Edit image – 3 credits
+// Edit image (OpenAI / Gemini) — credits by tier
 // ============================================
 threeDRouter.post("/edit-image", requireAuth, upload.single("image"), async (req, res) => {
   try {
     const userId = req.userId!;
     await syncUserToDatabase(userId);
-    const featureErr = await requireGpuFeature("edit_image");
-    if (featureErr) {
-      return res.status(403).json({ error: featureErr, code: "FEATURE_UNAVAILABLE" });
+    const body = (req.body || {}) as Record<string, unknown>;
+    const promptValidation = validateImagePrompt(body.prompt);
+    if (!promptValidation.ok) {
+      return res.status(400).json({ error: promptValidation.error, code: promptValidation.code });
     }
-    const prompt = (req.body as any)?.prompt ?? "";
-    const imageUrl = (req.body as any)?.image_url as string | undefined;
-    const chatId = ((req.body as any)?.chatId as string | undefined) ?? null;
-    const workspaceId = ((req.body as any)?.workspaceId as string | undefined) ?? null;
-    const parentJobId = ((req.body as any)?.parentJobId as string | undefined) ?? null;
-    const parentJobIdsRaw = ((req.body as any)?.parentJobIds as string | undefined) ?? null;
-    const sourceImagesRaw = ((req.body as any)?.sourceImages as string | undefined) ?? null;
-    let parentJobIds: string[] = [];
-    let sourceImages: string[] | null = null;
-    if (parentJobIdsRaw) {
-      try {
-        const parsed = JSON.parse(parentJobIdsRaw);
-        if (Array.isArray(parsed)) parentJobIds = parsed.filter((x) => typeof x === "string");
-      } catch { /* ignore */ }
-    }
-    if (sourceImagesRaw) {
-      try {
-        const parsed = JSON.parse(sourceImagesRaw);
-        if (Array.isArray(parsed)) sourceImages = parsed.filter((x) => typeof x === "string");
-      } catch { /* ignore */ }
-    }
+    const prompt = promptValidation.prompt;
+    const imageUrl = typeof body.image_url === "string" && body.image_url.trim() ? body.image_url.trim() : undefined;
     const file = req.file;
-    if (!prompt.trim()) {
-      return res.status(400).json({ error: "prompt is required" });
-    }
     if (!file && !imageUrl) {
       return res.status(400).json({ error: "Either image file or image_url is required" });
     }
+    const options = parseImageOptions(body, res);
+    if (!options) return;
+    const sourceImagesList = parseStringArray(body.sourceImages);
 
     let resolvedImage: { buffer: Buffer; contentType: string; filename: string } | null = null;
     if (file) {
+      const filename = file.originalname || "image.png";
       resolvedImage = {
         buffer: readMulterFile(file),
-        contentType: file.mimetype || "image/png",
-        filename: file.originalname || "image.png",
+        contentType: contentTypeForImageKey(filename, file.mimetype),
+        filename,
       };
     } else if (imageUrl) {
       resolvedImage = await loadImageBytesFor3dSubmission(imageUrl);
@@ -970,165 +1147,25 @@ threeDRouter.post("/edit-image", requireAuth, upload.single("image"), async (req
         });
       }
     }
+    if (!resolvedImage) {
+      return res.status(400).json({ error: "Could not load the source image for editing." });
+    }
+    resolvedImage = {
+      ...resolvedImage,
+      contentType: contentTypeForImageKey(resolvedImage.filename, resolvedImage.contentType),
+    };
 
-    const { deductCredit } = await import("../services/credits.js");
-    const deductResult = await deductCredit(userId, CREDITS_IMAGE_EDIT, true);
-    if (!deductResult.ok) {
-      return res.status(402).json({ error: deductResult.error });
-    }
-
-    const form = new FormData();
-    form.append("prompt", prompt);
-    if (resolvedImage) {
-      const blob = new Blob([new Uint8Array(resolvedImage.buffer)], { type: resolvedImage.contentType });
-      form.append("image", blob, resolvedImage.filename);
-    } else if (imageUrl) {
-      form.append("image_url", imageUrl);
-    }
-    const { response, baseUrl } = await fetchGateway("/edit-image", {
-      method: "POST",
-      body: form as any,
-    });
-    if (!response.ok) {
-      const errText = await response.text();
-      let errJson: any;
-      try { errJson = JSON.parse(errText); } catch { errJson = { error: errText }; }
-      if (errJson.detail && !errJson.error) errJson.error = errJson.detail;
-      return res.status(response.status).json(errJson);
-    }
-    const data = await response.json();
-    const jobId = data.edit_id ?? data.job_id;
-    const previewUrl = resolveGatewayImageUrl(data.image_url ?? data.result?.image_url, baseUrl);
-    if (previewUrl) {
-      data.image_url = previewUrl;
-    }
-    if (jobId && userId) {
-      try {
-        const existing = await getJob(jobId);
-        if (!existing) {
-          await createJob({
-            id: jobId,
-            userId,
-            chatId,
-            workspaceId,
-            parentJobId: parentJobId || (parentJobIds[0] ?? null),
-            parentJobIds: parentJobIds.length > 0 ? parentJobIds : (parentJobId ? [parentJobId] : []),
-            prompt: prompt.trim() || null,
-            imageUrl: imageUrl || null,
-            sourceImages,
-            generateType: "EditImage",
-            status: previewUrl ? "DONE" : "WAIT",
-            creditsUsed: CREDITS_IMAGE_EDIT,
-          });
-          if (previewUrl) {
-            await updateJobResult(jobId, { previewImageUrl: previewUrl });
-          }
-        }
-      } catch (jobErr: any) {
-        logger.warn({ err: jobErr, jobId }, "Failed to create edit job record (non-critical)");
-      }
-    }
-    res.json(data);
+    await runProviderImageJob(res, userId, "edit", prompt, options, {
+      chatId: typeof body.chatId === "string" ? body.chatId : null,
+      workspaceId: typeof body.workspaceId === "string" ? body.workspaceId : null,
+      parentJobId: typeof body.parentJobId === "string" ? body.parentJobId : null,
+      parentJobIds: parseStringArray(body.parentJobIds),
+      sourceImages: sourceImagesList.length > 0 ? sourceImagesList : imageUrl ? [imageUrl] : null,
+      imageUrl: imageUrl || null,
+    }, resolvedImage);
   } catch (err: any) {
     logger.error({ err: err.message }, "edit-image failed");
-    res.status(500).json({ error: gatewayErrorToUserMessage(err) });
-  }
-});
-
-// ============================================
-// Combined edit (2 images) – 4 credits
-// ============================================
-threeDRouter.post("/combined-edit", requireAuth, upload.fields([{ name: "image_1", maxCount: 1 }, { name: "image_2", maxCount: 1 }]), async (req, res) => {
-  try {
-    const userId = req.userId!;
-    await syncUserToDatabase(userId);
-    const featureErr = await requireGpuFeature("combined_edit");
-    if (featureErr) {
-      return res.status(403).json({ error: featureErr, code: "FEATURE_UNAVAILABLE" });
-    }
-    const { deductCredit } = await import("../services/credits.js");
-    const deductResult = await deductCredit(userId, CREDITS_COMBINED, true);
-    if (!deductResult.ok) {
-      return res.status(402).json({ error: deductResult.error });
-    }
-    const prompt = (req.body as any)?.prompt ?? "";
-    const chatId = ((req.body as any)?.chatId as string | undefined) ?? null;
-    const workspaceId = ((req.body as any)?.workspaceId as string | undefined) ?? null;
-    const parentJobId = ((req.body as any)?.parentJobId as string | undefined) ?? null;
-    const parentJobIdsRaw = ((req.body as any)?.parentJobIds as string | undefined) ?? null;
-    const sourceImagesRaw = ((req.body as any)?.sourceImages as string | undefined) ?? null;
-    let parentJobIds: string[] = [];
-    let sourceImages: string[] | null = null;
-    if (parentJobIdsRaw) {
-      try {
-        const parsed = JSON.parse(parentJobIdsRaw);
-        if (Array.isArray(parsed)) parentJobIds = parsed.filter((x) => typeof x === "string");
-      } catch { /* ignore */ }
-    }
-    if (sourceImagesRaw) {
-      try {
-        const parsed = JSON.parse(sourceImagesRaw);
-        if (Array.isArray(parsed)) sourceImages = parsed.filter((x) => typeof x === "string");
-      } catch { /* ignore */ }
-    }
-    const files = req.files as { image_1?: Express.Multer.File[]; image_2?: Express.Multer.File[] };
-    const file1 = files?.image_1?.[0];
-    const file2 = files?.image_2?.[0];
-    if (!prompt.trim()) {
-      return res.status(400).json({ error: "prompt is required" });
-    }
-    if (!file1 || !file2) {
-      return res.status(400).json({ error: "Both image_1 and image_2 files are required" });
-    }
-    const form = new FormData();
-    form.append("prompt", prompt);
-    form.append("image_1", multerFileToBlob(file1), file1.originalname || "image1.png");
-    form.append("image_2", multerFileToBlob(file2), file2.originalname || "image2.png");
-    const { response, baseUrl } = await fetchGateway("/combined-edit", {
-      method: "POST",
-      body: form as any,
-    });
-    if (!response.ok) {
-      const errText = await response.text();
-      let errJson: any;
-      try { errJson = JSON.parse(errText); } catch { errJson = { error: errText }; }
-      return res.status(response.status).json(errJson);
-    }
-    const data = await response.json();
-    const jobId = data.combined_id ?? data.job_id;
-    const previewUrl = resolveGatewayImageUrl(data.image_url ?? data.result?.image_url, baseUrl);
-    if (previewUrl) {
-      data.image_url = previewUrl;
-    }
-    if (jobId && userId) {
-      try {
-        const existing = await getJob(jobId);
-        if (!existing) {
-          await createJob({
-            id: jobId,
-            userId,
-            chatId,
-            workspaceId,
-            parentJobId: parentJobId || (parentJobIds[0] ?? null),
-            parentJobIds: parentJobIds.length > 0 ? parentJobIds : (parentJobId ? [parentJobId] : []),
-            prompt: prompt.trim() || null,
-            sourceImages,
-            generateType: "Combined",
-            status: previewUrl ? "DONE" : "WAIT",
-            creditsUsed: CREDITS_COMBINED,
-          });
-          if (previewUrl) {
-            await updateJobResult(jobId, { previewImageUrl: previewUrl });
-          }
-        }
-      } catch (jobErr: any) {
-        logger.warn({ err: jobErr, jobId }, "Failed to create combined-edit job record (non-critical)");
-      }
-    }
-    res.json(data);
-  } catch (err: any) {
-    logger.error({ err: err.message }, "combined-edit failed");
-    res.status(500).json({ error: gatewayErrorToUserMessage(err) });
+    if (!res.headersSent) res.status(500).json({ error: err.message || "Image edit failed" });
   }
 });
 
@@ -1154,7 +1191,13 @@ threeDRouter.get("/status/:jobId", requireAuth, async (req, res) => {
 
     // If job exists and is completed, return it immediately (no need to check external API)
     // Also return immediately for preview-only jobs (they don't exist in Python API)
-    if (job && (job.status === "DONE" || job.status === "FAIL" || (job.previewImageUrl && !job.resultGlbUrl))) {
+    if (
+      job &&
+      (job.status === "DONE" ||
+        job.status === "FAIL" ||
+        PROVIDER_IMAGE_TYPES.includes(job.generateType as GenerateType) ||
+        (job.previewImageUrl && !job.resultGlbUrl))
+    ) {
       // Check ownership
       if (denyIfNotJobOwner(job, userId, res)) return;
       
@@ -1179,7 +1222,7 @@ threeDRouter.get("/status/:jobId", requireAuth, async (req, res) => {
       
       const { response } = await fetchGateway(`/status/${jobId}`, {
         signal: controller.signal,
-      }, { job: job ?? undefined });
+      });
       
       clearTimeout(timeoutId);
       if (response.ok) {
@@ -1250,14 +1293,12 @@ threeDRouter.get("/status/:jobId", requireAuth, async (req, res) => {
     // Get or create job in database
     if (!job) {
       // Create job if it doesn't exist (for legacy support)
-      const legacyMode = String(apiJob?.result?.mode || apiJob?.mode || "").toLowerCase();
-      const inferredGenerateType: GenerateType = legacyMode.includes("text-to-3d") ? "TextTo3D" : "ImageTo3D";
       await createJob({
         id: jobId,
         userId: userId || null,
         prompt: apiJob.result?.prompt || null,
         imageUrl: null,
-        generateType: inferredGenerateType,
+        generateType: "ImageTo3D",
       });
       job = await getJob(jobId);
     }
@@ -1351,7 +1392,7 @@ threeDRouter.post("/cancel/:jobId", requireAuth, async (req, res) => {
     }
 
     const status = String(job.status || "").toUpperCase();
-    if (status === "DONE") {
+    if (status === "DONE" || PROVIDER_IMAGE_TYPES.includes(job.generateType as GenerateType)) {
       return res.status(400).json({ error: "Job already completed" });
     }
     if (status === "FAIL" && String(job.errorMessage || "").toLowerCase().includes("cancel")) {
@@ -1367,7 +1408,7 @@ threeDRouter.post("/cancel/:jobId", requireAuth, async (req, res) => {
     // Best-effort notify GPU so workers skip remaining stages
     let gatewayMessage = "Job cancelled";
     try {
-      const { response } = await fetchGateway(`/cancel/${jobId}`, { method: "POST" }, { job });
+      const { response } = await fetchGateway(`/cancel/${jobId}`, { method: "POST" });
       const data = await response.json().catch(() => ({} as any));
       if (response.ok) {
         gatewayMessage = data.message || gatewayMessage;
@@ -1412,6 +1453,13 @@ threeDRouter.get("/result/:jobId", requireAuth, async (req, res) => {
     // Check ownership
     if (denyIfNotJobOwner(job, userId, res)) return;
 
+    if (PROVIDER_IMAGE_TYPES.includes(job.generateType as GenerateType)) {
+      if (job.previewImageUrl) {
+        job.previewImageUrl = normalizePreviewUrl(jobId, job.previewImageUrl);
+      }
+      return res.json({ job });
+    }
+
     // Fetch from API for latest result
     try {
       const controller = new AbortController();
@@ -1419,7 +1467,7 @@ threeDRouter.get("/result/:jobId", requireAuth, async (req, res) => {
       
       const { response } = await fetchGateway(`/status/${jobId}`, {
         signal: controller.signal,
-      }, { job });
+      });
       clearTimeout(timeoutId);
       
       if (response.ok) {
@@ -1526,8 +1574,7 @@ threeDRouter.get("/queue/info", async (_req, res) => {
 
 // ============================================
 // Health check
-// Probes hydrilla_runtime (unified :8000) or dual Flux/Trellis hosts.
-// Returns mode + features so clients can gate Edit/Combine.
+// Image features come from provider keys (OpenAI / Gemini); image-to-3d from the GPU VM.
 // ============================================
 
 type GpuFeatures = {
@@ -1535,216 +1582,62 @@ type GpuFeatures = {
   text_to_3d: boolean;
   image_to_3d: boolean;
   edit_image: boolean;
-  combined_edit: boolean;
 };
 
-const LOW_FEATURES: GpuFeatures = {
-  text_to_image: true,
-  text_to_3d: true,
-  image_to_3d: true,
-  edit_image: false,
-  combined_edit: false,
-};
-
-const HIGH_FEATURES: GpuFeatures = {
-  text_to_image: true,
-  text_to_3d: true,
-  image_to_3d: true,
-  edit_image: true,
-  combined_edit: true,
-};
-
-let _cachedGpuCapabilities: {
-  mode: string;
-  features: GpuFeatures;
-  fetchedAt: number;
-} | null = null;
-
-const CAPABILITIES_TTL_MS = 30_000;
-
-function defaultsFromMode(mode: string | undefined): GpuFeatures {
-  return mode === "high" ? { ...HIGH_FEATURES } : { ...LOW_FEATURES };
-}
-
-function parseFeatures(body: any): GpuFeatures {
-  const base = defaultsFromMode(body?.mode);
-  const f = body?.features;
-  if (!f || typeof f !== "object") return base;
-  return {
-    text_to_image: f.text_to_image ?? base.text_to_image,
-    text_to_3d: f.text_to_3d ?? base.text_to_3d,
-    image_to_3d: f.image_to_3d ?? base.image_to_3d,
-    edit_image: f.edit_image ?? base.edit_image,
-    combined_edit: f.combined_edit ?? base.combined_edit,
-  };
-}
-
-function isImageReady(body: any): boolean {
+function isGpuPipelineReady(body: any): boolean {
   if (!body) return false;
+  if (body.features && typeof body.features === "object" && body.features.image_to_3d === false) {
+    return false;
+  }
   return !!(
-    body.image_model_loaded === true ||
-    body.z_image_turbo_loaded === true ||
-    body.flux_ok === true ||
+    body.pipeline_loaded === true ||
     body.model_loaded === true ||
-    body.flux?.model_loaded === true
-  );
-}
-
-function isTrellisReady(body: any): boolean {
-  if (!body) return false;
-  return !!(
     body.trellis_loaded === true ||
-    body.trellis2_pipeline_loaded === true ||
-    body.model_loaded === true ||
-    body.trellis?.model_loaded === true
+    body.trellis2_pipeline_loaded === true
   );
 }
 
-async function probeGpuCapabilities(): Promise<{
-  mode: string;
-  features: GpuFeatures;
-  image: { reachable: boolean; ready: boolean; raw?: any };
-  trellis: { reachable: boolean; ready: boolean; raw?: any };
-  status: "ok" | "degraded" | "down";
-}> {
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), 5000);
-  const init = { signal: controller.signal };
-  const sameHost = FLUX_GATEWAY === TRELLIS_GATEWAY;
-
-  let fluxBody: any = null;
-  let trellisBody: any = null;
-
+async function probeGpuVm(): Promise<{ reachable: boolean; ready: boolean; raw: any }> {
   try {
-    if (sameHost) {
-      const res = await fetch(`${FLUX_GATEWAY}/health`, init);
-      if (res.ok) {
-        try {
-          fluxBody = await res.json();
-          trellisBody = fluxBody;
-        } catch {
-          fluxBody = null;
-        }
-      }
-    } else {
-      const [fluxRes, trellisRes] = await Promise.allSettled([
-        fetch(`${FLUX_GATEWAY}/health`, init),
-        fetch(`${TRELLIS_GATEWAY}/health`, init),
-      ]);
-      if (fluxRes.status === "fulfilled" && fluxRes.value.ok) {
-        try {
-          fluxBody = await fluxRes.value.json();
-        } catch {
-          fluxBody = null;
-        }
-      }
-      if (trellisRes.status === "fulfilled" && trellisRes.value.ok) {
-        try {
-          trellisBody = await trellisRes.value.json();
-        } catch {
-          trellisBody = null;
-        }
-      }
-    }
-  } finally {
-    clearTimeout(timeoutId);
-  }
-
-  const primaryBody = trellisBody || fluxBody;
-  const mode = (primaryBody?.mode as string) || "low";
-  const features = parseFeatures(primaryBody || { mode });
-
-  _cachedGpuCapabilities = {
-    mode,
-    features,
-    fetchedAt: Date.now(),
-  };
-
-  const imageReady = isImageReady(fluxBody);
-  const trellisReady = isTrellisReady(trellisBody);
-  const imageReachable = !!fluxBody;
-  const trellisReachable = !!trellisBody;
-
-  let status: "ok" | "degraded" | "down" = "down";
-  if (imageReachable || trellisReachable) {
-    status = imageReady && trellisReady ? "ok" : imageReady || trellisReady ? "degraded" : "down";
-  }
-
-  return {
-    mode,
-    features,
-    image: { reachable: imageReachable, ready: imageReady, raw: fluxBody },
-    trellis: { reachable: trellisReachable, ready: trellisReady, raw: trellisBody },
-    status,
-  };
-}
-
-/** Feature gate before charging credits. Returns error message or null if allowed. */
-async function requireGpuFeature(
-  feature: "edit_image" | "combined_edit"
-): Promise<string | null> {
-  try {
-    if (
-      _cachedGpuCapabilities &&
-      Date.now() - _cachedGpuCapabilities.fetchedAt < CAPABILITIES_TTL_MS
-    ) {
-      if (_cachedGpuCapabilities.features[feature]) return null;
-      return feature === "edit_image"
-        ? "Edit image requires high-GPU mode (Flux). This GPU tier does not support it."
-        : "Combine requires high-GPU mode (Flux). This GPU tier does not support it.";
-    }
-    const caps = await probeGpuCapabilities();
-    if (caps.features[feature]) return null;
-    return feature === "edit_image"
-      ? "Edit image requires high-GPU mode (Flux). This GPU tier does not support it."
-      : "Combine requires high-GPU mode (Flux). This GPU tier does not support it.";
+    const res = await fetch(`${GPU_GATEWAY}/health`, withInternalSecretHeaders({ signal: AbortSignal.timeout(5000) }));
+    if (!res.ok) return { reachable: false, ready: false, raw: null };
+    const raw = await res.json().catch(() => null);
+    return { reachable: !!raw, ready: isGpuPipelineReady(raw), raw };
   } catch {
-    return "GPU capability check failed. Please try again.";
+    return { reachable: false, ready: false, raw: null };
   }
 }
 
 threeDRouter.get("/health", async (_req, res) => {
-  const offlineResponse = {
-    status: "down" as const,
-    mode: "low",
-    features: { ...LOW_FEATURES },
-    gateway: "unreachable",
-    image: { reachable: false, ready: false },
-    trellis: { reachable: false, ready: false },
-    flux: { reachable: false, model_loaded: false },
-    queues: { "3d": 0, preview: 0, edit: 0, estimated: 0 },
+  const [providers, gpu] = await Promise.all([imageProviderAvailability(), probeGpuVm()]);
+  const imageAvailable = providers.openai || providers.gemini;
+  const features: GpuFeatures = {
+    text_to_image: imageAvailable,
+    edit_image: imageAvailable,
+    image_to_3d: gpu.ready,
+    text_to_3d: imageAvailable && gpu.ready,
   };
-  try {
-    const caps = await probeGpuCapabilities();
-    if (!caps.image.reachable && !caps.trellis.reachable) {
-      return res.status(200).json({ ...offlineResponse, error: "GPU API unreachable" });
-    }
+  const status: "ok" | "degraded" | "down" =
+    imageAvailable && gpu.ready ? "ok" : imageAvailable || gpu.ready ? "degraded" : "down";
 
-    return res.status(200).json({
-      status: caps.status,
-      mode: caps.mode,
-      features: caps.features,
-      image: { reachable: caps.image.reachable, ready: caps.image.ready },
-      trellis: { reachable: caps.trellis.reachable, ready: caps.trellis.ready },
-      // Back-compat aliases
-      flux: {
-        reachable: caps.image.reachable,
-        model_loaded: caps.image.ready,
-        raw: caps.image.raw,
-      },
-      queues: {
-        preview: caps.image.raw?.queues?.preview_queue_length ?? 0,
-        "3d": caps.trellis.raw?.queues?.queue_length ?? 0,
-      },
-    });
-  } catch (err: any) {
-    const isAbort = err?.name === "AbortError";
-    logger.warn({ err: err?.message, isAbort }, "Health check failed");
-    return res.status(200).json({
-      ...offlineResponse,
-      error: isAbort ? "Gateway timed out" : err?.message || "Gateway unreachable",
-    });
-  }
+  return res.status(200).json({
+    status,
+    mode: "cloud",
+    features,
+    providers,
+    gpu: {
+      reachable: gpu.reachable,
+      ready: gpu.ready,
+      status: gpu.raw?.status ?? (gpu.reachable ? "unknown" : "unreachable"),
+      model: gpu.raw?.model ?? null,
+    },
+    image: { reachable: imageAvailable, ready: imageAvailable },
+    trellis: { reachable: gpu.reachable, ready: gpu.ready },
+    ...(gpu.reachable ? {} : { gateway: "unreachable" }),
+    queues: {
+      "3d": gpu.raw?.queue_length ?? gpu.raw?.queues?.queue_length ?? 0,
+    },
+  });
 });
 
 // ============================================
@@ -1848,7 +1741,7 @@ threeDRouter.get("/glb/:jobId", requireAuth, async (req, res) => {
 });
 
 // ============================================
-// Proxy image from S3 (to avoid CORS issues when fetching for combined edits)
+// Proxy image from S3 (to avoid CORS issues when the browser fetches image bytes)
 // ============================================
 // No requireAuth: <img> tags cannot send Bearer tokens. Access is limited by
 // isAllowedImageProxyUrl (Hydrilla S3 / GPU hosts only) — objects are already public.
@@ -2200,7 +2093,7 @@ threeDRouter.post("/register-job", requireAuth, async (req, res) => {
       previewImageUrl?: string;
       previewJobId?: string;
       parentJobId?: string;
-      parentJobIds?: string[];   // Multi-parent IDs (e.g. 2 images for combined edit)
+      parentJobIds?: string[];   // Multi-parent lineage IDs
       chatId?: string;
       workspaceId?: string;
       generateType?: string;
@@ -2299,7 +2192,6 @@ threeDRouter.post("/register-job", requireAuth, async (req, res) => {
       "TextTo3D",
       "ImageTo3D",
       "EditImage",
-      "Combined",
     ];
     const finalGenerateType: GenerateType = (reqGenerateType && validGenerateTypes.includes(reqGenerateType as GenerateType))
       ? (reqGenerateType as GenerateType)
@@ -2579,14 +2471,12 @@ threeDRouter.post("/webhook/job-update", async (req, res) => {
 
     let job = await getJob(job_id);
     if (!job) {
-      const webhookMode = String(result?.mode || "").toLowerCase();
-      const inferredGenerateType: GenerateType = webhookMode.includes("text-to-3d") ? "TextTo3D" : "ImageTo3D";
       await createJob({
         id: job_id,
         userId: user_id || null,
         prompt: result?.prompt || null,
         imageUrl: null,
-        generateType: inferredGenerateType,
+        generateType: "ImageTo3D",
       });
       job = await getJob(job_id);
     }

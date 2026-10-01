@@ -9,6 +9,12 @@ import {
   setUserApiKeyStatus,
   upsertUserModelPrefs,
 } from "../repository/userApiKeys.js";
+import {
+  generateDeveloperApiKey,
+  getDeveloperKeyDetails,
+  listDeveloperKeysForUser,
+  revokeDeveloperApiKey,
+} from "../repository/developerApiKeys.js";
 import { resolveWaterApiKey } from "../repository/platformApiKeys.js";
 import { lookLikeKeyError, providerLabel } from "../lib/userApiKeysCrypto.js";
 import {
@@ -265,3 +271,77 @@ userRouter.patch("/model-prefs", requireAuth, async (req, res) => {
     res.status(500).json({ error: "Failed to save preferences" });
   }
 });
+
+// ============================================================================
+// Developer API Keys (hyd_live_...) for public API usage
+// ============================================================================
+userRouter.get("/developer-keys", requireAuth, async (req, res) => {
+  try {
+    const userId = req.userId!;
+    await syncUserToDatabase(userId);
+    const keys = await listDeveloperKeysForUser(userId);
+    res.json({ keys });
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : "Failed to list developer keys";
+    logger.error({ err }, "GET /api/user/developer-keys failed");
+    res.status(500).json({ error: message });
+  }
+});
+
+userRouter.get("/developer-keys/:id", requireAuth, async (req, res) => {
+  try {
+    const userId = req.userId!;
+    const keyId = req.params.id;
+    if (!keyId) {
+      res.status(400).json({ error: "Key ID required" });
+      return;
+    }
+    await syncUserToDatabase(userId);
+    const details = await getDeveloperKeyDetails(userId, keyId);
+    if (!details) {
+      res.status(404).json({ error: "Developer API key not found" });
+      return;
+    }
+    res.json({ details });
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : "Failed to fetch developer key details";
+    logger.error({ err }, "GET /api/user/developer-keys/:id failed");
+    res.status(500).json({ error: message });
+  }
+});
+
+userRouter.post("/developer-keys", requireAuth, async (req, res) => {
+  try {
+    const userId = req.userId!;
+    await syncUserToDatabase(userId);
+    const name = typeof req.body?.name === "string" ? req.body.name.trim() : "Default API Key";
+    const result = await generateDeveloperApiKey(userId, name);
+    res.status(201).json(result);
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : "Failed to generate developer key";
+    logger.error({ err }, "POST /api/user/developer-keys failed");
+    res.status(500).json({ error: message });
+  }
+});
+
+userRouter.delete("/developer-keys/:id", requireAuth, async (req, res) => {
+  try {
+    const userId = req.userId!;
+    const keyId = req.params.id;
+    if (!keyId) {
+      res.status(400).json({ error: "Key ID required" });
+      return;
+    }
+    const success = await revokeDeveloperApiKey(userId, keyId);
+    if (!success) {
+      res.status(404).json({ error: "Key not found or already revoked" });
+      return;
+    }
+    res.json({ ok: true });
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : "Failed to revoke developer key";
+    logger.error({ err }, "DELETE /api/user/developer-keys/:id failed");
+    res.status(500).json({ error: message });
+  }
+});
+

@@ -7,6 +7,7 @@ import { adminRouter } from "../src/routes/admin.js";
 import { blogRouter } from "../src/routes/blog.js";
 import { codeSculptRouter } from "../src/routes/codeSculpt.js";
 import { createToolsRouter } from "../src/routes/createTools.js";
+import { developerV1Router } from "../src/routes/v1/developerApi.js";
 import { logger } from "../src/logger.js";
 import { initDb } from "../src/db.js";
 import { config as appConfig } from "../src/config.js";
@@ -92,6 +93,8 @@ app.use("/api/blog", initDbMiddleware, blogRouter);
 app.use("/api/water", initDbMiddleware, codeSculptRouter);
 app.use("/api/code-sculpt", initDbMiddleware, codeSculptRouter);
 app.use("/api/create/tools", initDbMiddleware, createToolsRouter);
+app.use("/v1", initDbMiddleware, developerV1Router);
+app.use("/api/v1", initDbMiddleware, developerV1Router);
 
 // Error handler
 app.use((err: any, _req: any, res: any, _next: any) => {

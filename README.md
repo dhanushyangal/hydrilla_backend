@@ -119,8 +119,13 @@ SUPABASE_SERVICE_ROLE_KEY=your-service-role-key
 NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY=pk_test_...
 CLERK_SECRET_KEY=sk_test_...
 
-# Python API Configuration
-HUNYUAN_API_URL=https://api.hydrilla.co
+# Image generation (OpenAI / Gemini). Falls back to admin platform keys when unset.
+OPENAI_API_KEY=sk-...
+GEMINI_API_KEY=...
+
+# GPU VM (BlueFox3D image-to-3d)
+HYDRILLA_GPU_API_URL=https://api.hydrilla.co
+HYDRILLA_INTERNAL_API_SECRET=must-match-the-vm
 
 # AWS S3 Configuration
 AWS_ACCESS_KEY_ID=your-access-key
@@ -151,19 +156,53 @@ All endpoints are prefixed with `/api/3d`
 
 ### Authentication Required Endpoints
 
-#### `POST /api/3d/generate`
-Create a new 3D generation job.
+See [`.env.example`](./.env.example) for the full list, including model overrides.
+
+#### `POST /api/3d/text-to-image`
+Generate an image with OpenAI or Gemini. Synchronous: the response contains the stored S3 image.
 
 **Request Body:**
 ```json
 {
-  "prompt": "A red sports car"  // For text-to-3D
+  "prompt": "A red sports car, studio lighting",
+  "provider": "openai",   // "openai" (default) | "gemini"
+  "quality": "low",       // "low" (default, 2 credits) | "high" (5 credits)
+  "aspect": "1:1",        // "1:1" (default) | "3:2" | "2:3"
+  "chatId": "...", "workspaceId": "...", "parentJobId": "..."
 }
 ```
-or
+
+**Response:**
 ```json
 {
-  "imageUrl": "https://example.com/image.jpg"  // For image-to-3D
+  "job_id": "uuid", "preview_id": "uuid", "status": "completed",
+  "image_url": "https://<bucket>.s3.<region>.amazonaws.com/preview/<id>/preview_image.png",
+  "provider": "openai", "quality": "low", "aspect": "1:1",
+  "model": "gpt-image-2.5-flare", "credits_used": 2
+}
+```
+
+#### `POST /api/3d/edit-image`
+Edit an image with a prompt (multipart). Send either `image` (file) or `image_url`, plus `prompt`,
+`provider`, `quality` (low = 3 credits, high = 6 credits). The output keeps the input's framing; `aspect` is ignored.
+Stored at `edit/<id>/edited.png`; response uses `edit_id` instead of `preview_id`.
+
+| Quality | OpenAI | Gemini |
+|---|---|---|
+| low | `gpt-image-2.5-flare`, quality `medium`, ~1K | `gemini-3.1-flash-image`, `1K` |
+| high | `gpt-image-2.5-sunburst`, quality `high`, ~2K | `gemini-3-pro-image`, `2K` |
+
+Credits are refunded if the provider fails. Moderation blocks return `422` with `code: "IMAGE_REQUEST_BLOCKED"`
+and user-facing message `"This image request couldn't be generated. Try changing the prompt."`;
+a missing key returns `503` with `code: "provider_not_configured"`.
+
+#### `POST /api/3d/generate`
+Create an image-to-3D job on the GPU VM (10 credits). Text-to-3D is text-to-image followed by this call.
+
+**Request Body:**
+```json
+{
+  "imageUrl": "https://example.com/image.jpg"
 }
 ```
 
@@ -358,6 +397,19 @@ Check if server is running.
 }
 ```
 
+#### `GET /api/3d/health`
+Feature availability. `text_to_image` / `edit_image` are true when an OpenAI or Gemini key is configured;
+`image_to_3d` is true when the GPU VM reports its pipeline loaded.
+
+```json
+{
+  "status": "ok",
+  "features": { "text_to_image": true, "edit_image": true, "image_to_3d": true, "text_to_3d": true },
+  "providers": { "openai": true, "gemini": true },
+  "gpu": { "reachable": true, "ready": true, "status": "ok", "model": "BlueFox3D" }
+}
+```
+
 ## Job Status Mapping
 
 | Backend Status | Python API Status | Description |
@@ -453,11 +505,16 @@ If images are not showing, ensure:
 2. Image URLs in the database are being normalized correctly
 3. Direct S3 URLs are being used instead of presigned URLs
 
-### Python API Connection
+### GPU VM Connection
 
-- Verify `HUNYUAN_API_URL` is correct
-- Check Python API is running and accessible
-- Verify CORS is configured on Python API
+- Verify `HYDRILLA_GPU_API_URL` is correct (`curl $HYDRILLA_GPU_API_URL/health`)
+- Verify `HYDRILLA_INTERNAL_API_SECRET` matches the VM
+- Check the `hydrilla-runtime` systemd service is running on the VM
+
+### Image Generation
+
+- `GET /api/3d/health` shows which providers have keys (`providers.openai` / `providers.gemini`)
+- `npm run verify:images` checks request payloads against the provider docs (no network calls)
 
 ## Related Documentation
 

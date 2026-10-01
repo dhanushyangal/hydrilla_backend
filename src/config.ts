@@ -52,15 +52,17 @@ export const config = {
     publishableKey: process.env.NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY || "",
     secretKey: process.env.CLERK_SECRET_KEY || "",
   },
-  hunyuanApi: {
-    /** Unified GPU gateway (image + 3D on same host) */
-    url: gatewayUrl("HUNYUAN_API_URL"),
+  /** GPU VM (hydrilla_runtime, BlueFox3D image-to-3d). Images come from OpenAI/Gemini, not the VM. */
+  gpuGateway: {
+    url: gatewayUrl("HYDRILLA_GPU_API_URL", "TRELLIS_GATEWAY_URL", "TRELLIS_API_URL", "HUNYUAN_API_URL"),
   },
-  fluxGateway: {
-    url: gatewayUrl("FLUX_GATEWAY_URL", "FLUX_API_URL", "HUNYUAN_API_URL"),
-  },
-  trellisGateway: {
-    url: gatewayUrl("TRELLIS_GATEWAY_URL", "TRELLIS_API_URL", "HUNYUAN_API_URL"),
+  /** GCP Compute instance behind the GPU gateway (admin status / start / stop). Key is optional. */
+  gcpGpuInstance: {
+    projectId: process.env.GCP_PROJECT_ID?.trim() || "hydrilla-486606",
+    zone: process.env.GCP_GPU_ZONE?.trim() || "asia-south1-c",
+    instance: process.env.GCP_GPU_INSTANCE?.trim() || "hydrilla",
+    /** Service account JSON (raw or base64) with compute.instances.get/start/stop. */
+    serviceAccountKey: process.env.GCP_SERVICE_ACCOUNT_KEY?.trim() || "",
   },
   /** Shared secret for Node ↔ GPU and internal job webhooks */
   internalApiSecret: process.env.HYDRILLA_INTERNAL_API_SECRET || "",
@@ -122,8 +124,18 @@ export const config = {
   } as Record<string, { productId: string; credits: number; label: string }>,
 };
 
-if (!config.hunyuanApi.url) {
-  console.warn("[config] HUNYUAN_API_URL is missing. API calls will fail until set.");
+const hasImageKey =
+  Boolean(process.env.IMAGE_OPENAI_API_KEY?.trim()) ||
+  Boolean(process.env.IMAGE_GEMINI_API_KEY?.trim()) ||
+  Boolean(process.env.IMAGE_GOOGLE_API_KEY?.trim()) ||
+  Boolean(process.env.OPENAI_API_KEY?.trim()) ||
+  Boolean(process.env.GEMINI_API_KEY?.trim()) ||
+  Boolean(process.env.GOOGLE_GENERATIVE_AI_API_KEY?.trim());
+
+if (!hasImageKey) {
+  console.warn(
+    "[config] IMAGE_OPENAI_API_KEY / IMAGE_GEMINI_API_KEY not set in .env. Image generation will use admin image keys if configured in the admin panel."
+  );
 }
 
 if (!config.clerk.secretKey) {

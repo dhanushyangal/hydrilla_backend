@@ -99,3 +99,20 @@ export async function deductCredit(
   logger.info({ userId, newUsed, total: row.credits_total, remaining: row.credits_total - newUsed }, "Credit deducted");
   return { ok: true, remaining: row.credits_total - newUsed };
 }
+
+/** Give back credits charged for an operation that failed upstream. Never drops credits_used below 0. */
+export async function refundCredit(userId: string, amount: number): Promise<void> {
+  if (amount <= 0) return;
+  const row = await getCreditsRow(userId);
+  if (!row) return;
+  const newUsed = Math.max(0, row.credits_used - amount);
+  const { error } = await supabase
+    .from("user_credits")
+    .update({ credits_used: newUsed, updated_at: new Date().toISOString() })
+    .eq("id", row.id);
+  if (error) {
+    logger.error({ error, userId, amount }, "Failed to refund credits");
+    return;
+  }
+  logger.info({ userId, amount, newUsed }, "Credits refunded");
+}

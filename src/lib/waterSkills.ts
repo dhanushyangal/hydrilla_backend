@@ -42,11 +42,28 @@ export const TIER_PASS_UNLOCK: Record<QualityTier, BuildPassId[]> = {
 
 export const DEFAULT_QUALITY_TIER: QualityTier = "standard";
 
+export const WATER_SKILL_IDS = [
+  "object-studio",
+  "character",
+  "animation",
+  "game",
+] as const;
+
 const TIER_IDS = new Set(["fast", "standard", "studio"] as QualityTier[]);
+const SKILL_IDS = new Set(WATER_SKILL_IDS as readonly string[]);
 
 export function parseQualityTier(value?: string | null): QualityTier {
-  if (value && TIER_IDS.has(value as QualityTier)) return value as QualityTier;
+  if (value && TIER_IDS.has(value as QualityTier)) {
+    return value as QualityTier;
+  }
   return DEFAULT_QUALITY_TIER;
+}
+
+export function parseWaterSkillId(value?: string | null): WaterSkillId | null {
+  if (value && SKILL_IDS.has(value)) {
+    return value as WaterSkillId;
+  }
+  return null;
 }
 
 export function passesForTier(tier: QualityTier): BuildPassId[] {

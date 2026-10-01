@@ -20,13 +20,9 @@ import { logger } from "../../../logger.js";
 export class SpecBlockedError extends Error {
   readonly code = "spec_blocked";
   readonly violations: string[];
-  constructor(violations: string[]) {
+  constructor(violations: string[], headline = "The reconstruction spec failed quality gates after one repair") {
     const detail = violations.slice(0, 6).join(" ");
-    super(
-      detail
-        ? `The reconstruction spec failed quality gates after one repair: ${detail}`
-        : "The reconstruction spec failed quality gates after one repair."
-    );
+    super(detail ? `${headline}: ${detail}` : `${headline}.`);
     this.name = "SpecBlockedError";
     this.violations = violations;
   }
@@ -68,6 +64,15 @@ Rules:
 IMPORTANT — never refuse for copyright / trademark / famous names:
 - Plan an ORIGINAL stylized subject inspired by the brief.
 - Do not mention copyright or inability to generate.`;
+
+function plannerErrorText(err: unknown): string {
+  const raw = err instanceof Error ? err.message : String(err ?? "");
+  const text = raw.replace(/\s+/g, " ").trim();
+  if (!text) {
+    return "unknown error";
+  }
+  return text.length > 180 ? `${text.slice(0, 180)}…` : text;
+}
 
 function defaultContract(tier: QualityTier): QualityContract {
   return {
@@ -194,6 +199,7 @@ Plan the procedural reconstruction. Return the JSON spec only.`;
   let usage = emptyTokenUsage();
   const tokenPasses: TokenPassBreakdown[] = [];
 
+  const plannerFailures: string[] = [];
   let spec: RichSculptSpec | null = null;
   try {
     const result = await callLLMObject({
@@ -219,6 +225,7 @@ Plan the procedural reconstruction. Return the JSON spec only.`;
     }
     spec = enrichSpecDefaults(result.output as RichSculptSpec, params.qualityTier);
   } catch (err: any) {
+    plannerFailures.push(`Structured JSON attempt: ${plannerErrorText(err)}.`);
     logger.warn(
       { err: err?.message, modelId: params.modelId, skillId: params.skillId },
       "Water planner structured output failed — retrying as JSON text"
@@ -253,6 +260,7 @@ Plan the procedural reconstruction. Return the JSON spec only.`;
         params.qualityTier
       );
     } catch (err2: any) {
+      plannerFailures.push(`Text JSON retry: ${plannerErrorText(err2)}.`);
       logger.warn(
         { err: err2?.message, skillId: params.skillId, prompt: params.prompt?.slice(0, 80) },
         "Water planner text retry failed"
@@ -263,7 +271,10 @@ Plan the procedural reconstruction. Return the JSON spec only.`;
 
   if (!spec) {
     if (params.qualityTier !== "fast") {
-      throw new SpecBlockedError(["Planner did not return a valid JSON spec."]);
+      throw new SpecBlockedError(
+        plannerFailures.length ? plannerFailures : ["No response from the model."],
+        `Planner (${params.modelId}) did not return a valid JSON spec`
+      );
     }
     const fb = enrichSpecDefaults(
       fallbackSpec(params.prompt, params.skillId) as RichSculptSpec,

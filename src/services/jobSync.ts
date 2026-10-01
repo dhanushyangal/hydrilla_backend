@@ -107,6 +107,12 @@ export async function syncJobFromApi(jobId: string): Promise<boolean> {
     ) {
       return true;
     }
+
+    // Image jobs are produced by OpenAI/Gemini in-request and never exist on the GPU VM.
+    const generateType = String(dbJob.generateType);
+    if (generateType === "TextToImage" || generateType === "EditImage" || generateType === "Combined") {
+      return true;
+    }
     
     // Skip syncing preview-only jobs (jobs with preview but no 3D result)
     // These jobs don't exist in Python API, they're only in our database
@@ -115,18 +121,12 @@ export async function syncJobFromApi(jobId: string): Promise<boolean> {
       return true; // Return true since job is already in correct state
     }
     
-    // Fetch from API with timeout (generous when gateway is busy processing another job).
-    // Try primary gateway first, then alternative (same as threeD route).
+    // Fetch from the GPU VM with timeout (generous when it is busy processing another job).
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), 25000); // 25 second timeout
 
     const path = `/status/${jobId}`;
-    const isFluxJob =
-      dbJob.generateType === "TextToImage" ||
-      dbJob.generateType === "EditImage" ||
-      dbJob.generateType === "Combined";
-    const baseUrl = isFluxJob ? config.fluxGateway.url : config.trellisGateway.url;
-    const url = `${baseUrl}${path}`;
+    const url = `${config.gpuGateway.url}${path}`;
 
     let response: Response | null = null;
     let lastErr: unknown = null;

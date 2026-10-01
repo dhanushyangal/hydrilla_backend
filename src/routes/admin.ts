@@ -13,11 +13,18 @@ import { verifyProviderKey } from "../lib/llmProviders.js";
 import { publicConnectors, requireProviderParam } from "../providers/index.js";
 import { logger } from "../logger.js";
 import { adminBlogRouter } from "./adminBlog.js";
+import { adminGpuRouter } from "./adminGpu.js";
+import { adminUsageRouter } from "./adminUsage.js";
+import { adminImageKeysRouter } from "./adminImageKeys.js";
+import { listImagePlatformApiKeyMeta } from "../repository/imagePlatformApiKeys.js";
 
 export const adminRouter = Router();
 
 adminRouter.use(requireAuth, requireAdmin);
 adminRouter.use("/blog", adminBlogRouter);
+adminRouter.use("/gpu", adminGpuRouter);
+adminRouter.use("/usage", adminUsageRouter);
+adminRouter.use("/image-keys", adminImageKeysRouter);
 
 function publicKeyMeta(k: Awaited<ReturnType<typeof listPlatformApiKeyMeta>>[number]) {
   return { ...k, label: providerLabel(k.provider) };
@@ -30,15 +37,19 @@ async function listKeysPayload() {
 
 adminRouter.get("/overview", async (_req, res) => {
   try {
-    const [{ count, error }, payload] = await Promise.all([
+    const [{ count, error }, payload, imageKeys] = await Promise.all([
       supabase.from("users").select("id", { count: "exact", head: true }),
       listKeysPayload(),
+      listImagePlatformApiKeyMeta(),
     ]);
-    if (error) throw error;
+    if (error) {
+      throw error;
+    }
     res.json({
       userCount: count ?? 0,
       connectors: payload.connectors,
       keys: payload.keys,
+      imageKeys,
     });
   } catch (err: any) {
     logger.error({ err }, "GET /api/admin/overview failed");

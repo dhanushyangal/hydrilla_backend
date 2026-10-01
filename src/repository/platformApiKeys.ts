@@ -12,6 +12,7 @@ import { logger } from "../logger.js";
 export type PlatformApiKeyMeta = {
   provider: ApiKeyProvider;
   configured: boolean;
+  source?: "database" | "env" | "none";
   last4: string | null;
   status: ApiKeyStatus;
   lastError: string | null;
@@ -19,10 +20,57 @@ export type PlatformApiKeyMeta = {
   updatedAt: string | null;
 };
 
+export function envWaterKey(provider: ApiKeyProvider): string | null {
+  const names = (() => {
+    switch (provider) {
+      case "openai":
+        return ["WATER_OPENAI_API_KEY", "OPENAI_API_KEY"];
+      case "google":
+        return [
+          "WATER_GOOGLE_API_KEY",
+          "WATER_GEMINI_API_KEY",
+          "GOOGLE_API_KEY",
+          "GEMINI_API_KEY",
+          "GOOGLE_GENERATIVE_AI_API_KEY",
+        ];
+      case "anthropic":
+        return ["WATER_ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY"];
+      case "openrouter":
+        return ["WATER_OPENROUTER_API_KEY", "OPENROUTER_API_KEY"];
+      case "cursor":
+        return ["WATER_CURSOR_API_KEY", "CURSOR_API_KEY"];
+      default:
+        return [];
+    }
+  })();
+
+  for (const name of names) {
+    const v = process.env[name]?.trim();
+    if (v) {
+      return v;
+    }
+  }
+  return null;
+}
+
 function emptyMeta(provider: ApiKeyProvider): PlatformApiKeyMeta {
+  const envVal = envWaterKey(provider);
+  if (envVal) {
+    return {
+      provider,
+      configured: true,
+      source: "env",
+      last4: envVal.slice(-4),
+      status: "unchecked",
+      lastError: null,
+      verifiedAt: null,
+      updatedAt: null,
+    };
+  }
   return {
     provider,
     configured: false,
+    source: "none",
     last4: null,
     status: "unchecked",
     lastError: null,
@@ -52,10 +100,13 @@ export async function listPlatformApiKeyMeta(): Promise<PlatformApiKeyMeta[]> {
 
   return API_KEY_PROVIDERS.map((provider) => {
     const row = byProvider.get(provider);
-    if (!row) return emptyMeta(provider);
+    if (!row) {
+      return emptyMeta(provider);
+    }
     return {
       provider,
       configured: true,
+      source: "database",
       last4: row.last4 ?? null,
       status: (row.status as ApiKeyStatus) || "unchecked",
       lastError: row.last_error ?? null,
@@ -144,12 +195,14 @@ export function isSharedKeyUsable(meta: { configured: boolean; status: ApiKeySta
 export async function resolveWaterApiKey(
   userId: string,
   provider: ApiKeyProvider
-): Promise<{ apiKey: string; source: "platform" | "user"; last4: string | null } | null> {
+): Promise<{ apiKey: string; source: "platform" | "user" | "env"; last4: string | null } | null> {
   const { getDecryptedUserApiKey, listUserApiKeyMeta } = await import("./userApiKeys.js");
   const userMeta = (await listUserApiKeyMeta(userId)).find((k) => k.provider === provider);
   if (isSharedKeyUsable(userMeta)) {
     const userKey = await getDecryptedUserApiKey(userId, provider);
-    if (userKey) return { apiKey: userKey, source: "user", last4: userMeta?.last4 ?? null };
+    if (userKey) {
+      return { apiKey: userKey, source: "user", last4: userMeta?.last4 ?? null };
+    }
   }
 
   const platformMeta = (await listPlatformApiKeyMeta()).find((k) => k.provider === provider);
@@ -158,6 +211,11 @@ export async function resolveWaterApiKey(
     if (platformKey) {
       return { apiKey: platformKey, source: "platform", last4: platformMeta?.last4 ?? null };
     }
+  }
+
+  const envKey = envWaterKey(provider);
+  if (envKey) {
+    return { apiKey: envKey, source: "env", last4: envKey.slice(-4) };
   }
 
   return null;

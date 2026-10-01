@@ -18,6 +18,9 @@ yarn-error.log*
 .env.local.production
 .env.local.test
 .env.local.staging
+*.key.json
+gcp-key.json
+service-account*.json
 
 # Build outputs
 dist/

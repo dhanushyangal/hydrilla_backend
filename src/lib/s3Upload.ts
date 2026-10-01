@@ -68,3 +68,27 @@ export async function uploadDataUrlToS3(dataUrl: string, key: string): Promise<s
     return null;
   }
 }
+
+/**
+ * Upload a raw buffer to S3 and return its public URL.
+ */
+export async function uploadBufferToS3(
+  buffer: Buffer,
+  key: string,
+  contentType: string
+): Promise<string> {
+  if (!s3Client || !config.s3.bucket) {
+    throw new Error("S3 is not configured");
+  }
+  const acl = process.env.S3_PUT_ACL?.trim();
+  const putInput = {
+    Bucket: config.s3.bucket,
+    Key: key,
+    Body: buffer,
+    ContentType: contentType,
+    ...(acl ? { ACL: acl as any } : {}),
+  };
+  await s3Client.send(new PutObjectCommand(putInput));
+  return publicUrlForS3Key(key);
+}
+

@@ -157,9 +157,27 @@ NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY=pk_test_...
 CLERK_SECRET_KEY=sk_test_...
 ```
 
-#### Python API Configuration
+#### Image Generation (OpenAI / Gemini)
 ```env
-HUNYUAN_API_URL=https://api.hydrilla.co
+OPENAI_API_KEY=sk-...
+GEMINI_API_KEY=...          # or GOOGLE_GENERATIVE_AI_API_KEY
+```
+Env keys win; when unset the backend uses the admin platform keys (`openai` / `google`).
+Text-to-image and edit run in-request against the provider and store the result in S3
+(`preview/<id>/preview_image.png`, `edit/<id>/edited.png`). Quality `low` / `high` picks the
+model and resolution; see the README for the mapping and credit costs.
+OpenAI requests send `moderation: "low"` so game-asset prompts (weapons, monsters, combat) are not
+over-blocked; set `OPENAI_IMAGE_MODERATION=auto` for OpenAI's stricter default. Blocks return
+`422 IMAGE_REQUEST_BLOCKED` with a friendly Hydrilla message, while server logs include provider categories, stage, and raw detail.
+The Gemini key may be an AI Studio key or a Vertex AI express-mode key: the Gemini API is tried
+first and keys it blocks fall back to Vertex (`GEMINI_API_BACKEND=developer|vertex` forces one).
+A Vertex-only `google` platform key shows as invalid in the admin panel because Water's Gemini
+chat models need an AI Studio key; image generation still uses it.
+
+#### GPU VM (image-to-3d)
+```env
+HYDRILLA_GPU_API_URL=https://api.hydrilla.co
+HYDRILLA_INTERNAL_API_SECRET=must-match-the-vm
 ```
 
 #### AWS S3 Configuration
@@ -683,12 +701,17 @@ npm run build
 - **Verify bucket name**: Check `S3_BUCKET` matches actual bucket
 - **Check region**: Ensure `S3_REGION` matches bucket region
 
-### Python API Connection
+### GPU VM Connection
 
-- **Verify API URL**: Check `HUNYUAN_API_URL` is correct
-- **Check Python API is running**: Test with `curl https://api.hydrilla.co/health`
-- **Verify CORS**: Ensure Python API allows backend origin
-- **Check network**: Verify EC2 security group allows connections
+- **Verify API URL**: Check `HYDRILLA_GPU_API_URL` is correct
+- **Check the VM is running**: Test with `curl https://api.hydrilla.co/health` (`pipeline_loaded: true`)
+- **Verify the shared secret**: `HYDRILLA_INTERNAL_API_SECRET` must match the VM
+- **Check network**: Verify the GCP firewall allows HTTPS to the VM
+
+### Image Generation
+
+- **Check providers**: `GET /api/3d/health` → `providers.openai` / `providers.gemini`
+- **Payload check**: `npm run verify:images` validates request bodies against the provider docs
 
 ### Payment Issues
 

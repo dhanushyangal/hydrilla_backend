@@ -252,8 +252,25 @@ paymentsRouter.get("/credits", requireAuth, async (req: Request, res: Response) 
 // ============================================================================
 // GET USAGE BREAKDOWN BY JOB TYPE
 // GET /api/payments/usage
-// Returns credits used per category (3D, image gen, edit, combined) from jobs table.
+// Returns credits used per category (3D, image gen, edit) from jobs table.
 // ============================================================================
+type UsageCategory = "3d" | "image" | "edit";
+const THREE_D_GENERATE_TYPES = new Set(["ImageTo3D", "TextTo3D", "Water", "CodeSculpt"]);
+
+function usageCategory(generateType: string, hasGlb: boolean): UsageCategory {
+  // Legacy "Combined" rows (removed combine feature) are billed as edits.
+  if (generateType === "EditImage" || generateType === "Combined") return "edit";
+  if (generateType === "TextToImage") return "image";
+  if (hasGlb || THREE_D_GENERATE_TYPES.has(generateType)) return "3d";
+  return "image";
+}
+
+const USAGE_HISTORY_LABELS: Record<UsageCategory, string> = {
+  "3d": "3D model",
+  image: "Image generation",
+  edit: "Edit image",
+};
+
 paymentsRouter.get("/usage", requireAuth, async (req: Request, res: Response) => {
   try {
     const userId = (req as any).userId;
@@ -274,7 +291,6 @@ paymentsRouter.get("/usage", requireAuth, async (req: Request, res: Response) =>
       "3d": { type: "3d", label: "3D model generation", credits: 0, count: 0 },
       image: { type: "image", label: "Image generation", credits: 0, count: 0 },
       edit: { type: "edit", label: "Edit image", credits: 0, count: 0 },
-      combined: { type: "combined", label: "Combine images", credits: 0, count: 0 },
     };
 
     for (const j of jobs || []) {
@@ -282,19 +298,9 @@ paymentsRouter.get("/usage", requireAuth, async (req: Request, res: Response) =>
       const gen = (j.generate_type || "Normal") as string;
       const hasGlb = !!(j.result_glb_url && String(j.result_glb_url).trim());
 
-      if (gen === "EditImage") {
-        map.edit.credits += credits;
-        map.edit.count += 1;
-      } else if (gen === "Combined") {
-        map.combined.credits += credits;
-        map.combined.count += 1;
-      } else if (gen === "Normal" && hasGlb) {
-        map["3d"].credits += credits;
-        map["3d"].count += 1;
-      } else {
-        map.image.credits += credits;
-        map.image.count += 1;
-      }
+      const bucket = map[usageCategory(gen, hasGlb)];
+      bucket.credits += credits;
+      bucket.count += 1;
     }
 
     const breakdown = Object.values(map)
@@ -333,10 +339,7 @@ paymentsRouter.get("/usage/history", requireAuth, async (req: Request, res: Resp
     const rows = (jobs || []).map((j) => {
       const gen = (j.generate_type || "Normal") as string;
       const hasGlb = !!(j.result_glb_url && String(j.result_glb_url).trim());
-      let label = "Image generation";
-      if (gen === "EditImage") label = "Edit image";
-      else if (gen === "Combined") label = "Combine images";
-      else if (gen === "Normal" && hasGlb) label = "3D model";
+      const label = USAGE_HISTORY_LABELS[usageCategory(gen, hasGlb)];
       return {
         id: j.id,
         date: j.created_at,

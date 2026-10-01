@@ -115,11 +115,12 @@ codeSculptRouter.post("/generate", requireAuth, async (req, res) => {
       }
     }
 
-    // Pack is bound from the brief. Quality is the user's Fast / Standard / Studio pick.
+    // Pack is bound from the brief (or explicit user selection). Quality is the user's Fast / Standard / Studio pick.
     const routed = planWaterCreate({
       prompt,
       imageUrl,
       qualityTier: req.body?.qualityTier,
+      skillId: req.body?.skillId,
     });
     if (!routed.ok) {
       return res.status(400).json({ error: "intake_failed", message: routed.message });
