@@ -18,7 +18,7 @@ import pinoHttp from "pino-http";
 // billed as Active CPU. Must equal FUNCTION_MAX_DURATION_S in src/lib/water/runtimeLimits.ts
 // (Vercel reads this export statically, so it stays a literal).
 export const config = {
-  maxDuration: 800,
+  maxDuration: 60,
 };
 
 // Initialize database connection

@@ -192,7 +192,7 @@ async function runAllQaFlows(): Promise<void> {
   {
     // Wall clock budget sanity
     assert("Harness budget is within Vercel function limit", HARNESS_WALL_BUDGET_MS < FUNCTION_MAX_DURATION_S * 1000);
-    assert("Function max duration is at least 800s", FUNCTION_MAX_DURATION_S >= 800);
+    assert("Function max duration is at least 60s", FUNCTION_MAX_DURATION_S >= 60);
     
     // Check stale run threshold vs max budget
     const budgetMinutes = HARNESS_WALL_BUDGET_MS / 60000;

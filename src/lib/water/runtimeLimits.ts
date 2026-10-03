@@ -25,10 +25,10 @@
  * backend's plain `tsc` build does not have yet.
  */
 
-export const FUNCTION_MAX_DURATION_S = 800;
+export const FUNCTION_MAX_DURATION_S = 60;
 
 /** Reserved after the harness returns: GLB checks, DB writes, thumbnail, response log. */
-const PERSIST_RESERVE_S = 40;
+const PERSIST_RESERVE_S = 10;
 
 export const HARNESS_WALL_BUDGET_MS = (FUNCTION_MAX_DURATION_S - PERSIST_RESERVE_S) * 1000;
 
