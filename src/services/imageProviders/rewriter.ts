@@ -40,7 +40,7 @@ reconstruction.
 - Keep important geometry visible from the chosen camera angle.
 - Do not crop limbs, wheels, extremities, handles, accessories, or other
   important geometry.
-- Prefer a stable three-quarter view when it helps reveal the object's form.
+- Frame the subject from a clear FRONT ANGLE or front three-quarter view facing forward directly toward the camera so that the resulting 3D model looks well-oriented, properly proportioned, and high quality.
 - Keep the camera at a natural distance and avoid extreme perspective
   distortion.
 - Do not add text, captions, watermarks, UI elements, borders, or labels
@@ -82,14 +82,15 @@ Return only the final image-generation prompt.`;
 export const HYDRILLA_3D_ASSET_MODE_SUFFIX = `[HYDRILLA 3D ASSET MODE]
 Generate this as a high-quality source image for image-to-3D reconstruction.
 Prioritize:
-1. Accurate subject identity and shape
-2. Complete visible silhouette
-3. Clear geometry
-4. Surface/material detail
-5. Clean separation from background (solid neutral light-gray background, no scenery, no floor clutter, subtle natural contact shadow only)
-6. Even diffuse lighting
-7. Minimal occlusion
-8. Minimal visual clutter
+1. Front camera angle (subject facing directly forward toward the camera so the resulting 3D model looks well-oriented and good)
+2. Accurate subject identity and shape
+3. Complete visible silhouette
+4. Clear geometry
+5. Surface/material detail
+6. Clean separation from background (solid neutral light-gray background, no scenery, no floor clutter, subtle natural contact shadow only)
+7. Even diffuse lighting
+8. Minimal occlusion
+9. Minimal visual clutter
 Do not optimize for cinematic storytelling at the expense of reconstructable geometry.`;
 
 /**

@@ -1,7 +1,7 @@
 import { supabase } from "../db.js";
 import { GenerateType, JobRecord, JobStatus } from "../types.js";
 import { logger } from "../logger.js";
-import { normalizeGlbUrl, normalizePreviewUrl } from "../utils/s3Urls.js";
+import { normalizeGlbUrl, normalizePreviewUrl, unwrapImageProxyUrl } from "../utils/s3Urls.js";
 
 export async function createJob(params: {
   id: string;
@@ -19,6 +19,7 @@ export async function createJob(params: {
   previewImageUrl?: string | null;
   llmProvider?: string | null;  // Image jobs: "openai" | "gemini"
   llmModel?: string | null;
+  source?: "web" | "api";
 }) {
   const {
     id,
@@ -36,6 +37,7 @@ export async function createJob(params: {
     previewImageUrl = null,
     llmProvider = null,
     llmModel = null,
+    source = "web",
   } = params;
 
   try {
@@ -44,7 +46,7 @@ export async function createJob(params: {
     // Denormalized first-parent for legacy compat (column kept for simple queries)
     const firstParentId = allParentIds.length > 0 ? allParentIds[0] : null;
 
-    const { error } = await supabase.from("jobs").insert({
+    const insertPayload: Record<string, any> = {
       id,
       user_id: userId,
       chat_id: chatId,
@@ -56,10 +58,19 @@ export async function createJob(params: {
       source_images: sourceImages && sourceImages.length > 0 ? JSON.stringify(sourceImages) : null,
       generate_type: generateType,
       credits_used: creditsUsed,
+      source,
       ...(previewImageUrl ? { preview_image_url: previewImageUrl } : {}),
       ...(llmProvider ? { llm_provider: llmProvider } : {}),
       ...(llmModel ? { llm_model: llmModel } : {}),
-    });
+    };
+
+    let { error } = await supabase.from("jobs").insert(insertPayload);
+    // Graceful fallback if migration 018 hasn't been executed in Supabase yet
+    if (error && /source.*schema cache|column.*source/i.test(error.message || "")) {
+      delete insertPayload.source;
+      const retryResult = await supabase.from("jobs").insert(insertPayload);
+      error = retryResult.error;
+    }
 
     if (error) throw error;
 
@@ -301,9 +312,9 @@ export async function deleteJob(jobId: string, userId: string): Promise<boolean>
 
 function mapRow(row: any): JobRecord {
   // Normalize URLs to remove expired signed URL parameters
-  let imageUrl = row.image_url;
-  let previewImageUrl = row.preview_image_url;
-  let resultGlbUrl = row.result_glb_url;
+  const rawImageUrl = unwrapImageProxyUrl(row.image_url) || row.image_url;
+  const rawPreviewImageUrl = unwrapImageProxyUrl(row.preview_image_url) || row.preview_image_url;
+  const resultGlbUrl = row.result_glb_url;
 
   const id = String(row.id || "");
   const waterLike =
@@ -317,30 +328,44 @@ function mapRow(row: any): JobRecord {
     Boolean(row.factory_code && String(row.factory_code).length > 0);
   
   // Normalize image URLs
-  if (imageUrl && imageUrl.includes('amazonaws.com')) {
-    imageUrl = imageUrl.split('?')[0]; // Strip query params
-  }
-  if (previewImageUrl) {
-    if (String(previewImageUrl).startsWith("data:") || String(previewImageUrl).startsWith("blob:")) {
-      // keep Code Sculpt thumbnails
-    } else {
-      previewImageUrl = normalizePreviewUrl(row.id, previewImageUrl);
+  const imageUrl = (rawImageUrl && rawImageUrl.includes("amazonaws.com"))
+    ? rawImageUrl.split("?")[0]
+    : rawImageUrl;
+
+  const resolvedPreviewUrl = (() => {
+    if (rawPreviewImageUrl) {
+      if (String(rawPreviewImageUrl).startsWith("data:") || String(rawPreviewImageUrl).startsWith("blob:")) {
+        return rawPreviewImageUrl;
+      }
+      return normalizePreviewUrl(row.id, rawPreviewImageUrl);
     }
-  }
-  // Water jobs never expose a mesh GLB proxy URL
-  if (waterLike) {
-    resultGlbUrl = null;
-  } else if (resultGlbUrl) {
-    resultGlbUrl = normalizeGlbUrl(row.id, resultGlbUrl);
-  }
+    if (imageUrl) {
+      return imageUrl;
+    }
+    return null;
+  })();
+
+  const finalGlbUrl = (() => {
+    if (waterLike) {
+      return null;
+    }
+    if (resultGlbUrl) {
+      return normalizeGlbUrl(row.id, resultGlbUrl);
+    }
+    return null;
+  })();
 
   // Parse source_images JSONB
-  let sourceImages: string[] | null = null;
-  if (row.source_images) {
+  const sourceImages = (() => {
+    if (!row.source_images) {
+      return null;
+    }
     try {
-      sourceImages = typeof row.source_images === "string" ? JSON.parse(row.source_images) : row.source_images;
-    } catch { sourceImages = null; }
-  }
+      return typeof row.source_images === "string" ? JSON.parse(row.source_images) : row.source_images;
+    } catch {
+      return null;
+    }
+  })();
   
   return {
     id: row.id,
@@ -355,8 +380,8 @@ function mapRow(row: any): JobRecord {
     sourceImages,
     generateType: row.generate_type ?? (waterLike ? ("Water" as GenerateType) : row.generate_type),
     enablePBR: true,
-    resultGlbUrl: resultGlbUrl,
-    previewImageUrl: previewImageUrl,
+    resultGlbUrl: finalGlbUrl,
+    previewImageUrl: resolvedPreviewUrl,
     errorCode: row.error_code,
     errorMessage: row.error_message,
     creditsUsed: row.credits_used != null ? row.credits_used : 0,
@@ -368,6 +393,7 @@ function mapRow(row: any): JobRecord {
     sculptPass: row.sculpt_pass ?? null,
     sculptSpec: row.sculpt_spec ?? null,
     durationMs: typeof row.duration_ms === "number" ? row.duration_ms : null,
+    source: row.source || "web",
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };

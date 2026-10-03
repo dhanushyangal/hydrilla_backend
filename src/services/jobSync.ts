@@ -16,6 +16,8 @@ let circuitBreakerState = {
 const CIRCUIT_BREAKER_THRESHOLD = 6; // Open after 6 failures so brief gateway busy doesn't trip
 const CIRCUIT_BREAKER_RESET_TIME = 60000; // Try again after 60 seconds
 const CIRCUIT_BREAKER_SUCCESS_RESET = 1; // Close circuit after 1 successful call
+const MAX_JOB_AGE_MS = 16 * 60 * 1000; // 16 minutes timeout cap (allows 12+ min generations when GPU OOM restart occurs)
+const HARD_ABORT_MAX_AGE_MS = 25 * 60 * 1000; // 25 minutes absolute hard cap even if gateway still reports pending
 
 /**
  * Check if API is available (circuit breaker closed)
@@ -121,6 +123,26 @@ export async function syncJobFromApi(jobId: string): Promise<boolean> {
       logger.debug({ jobId }, "Preview-only job, skipping API sync");
       return true; // Return true since job is already in correct state
     }
+
+    const jobAgeMs = Date.now() - new Date(dbJob.createdAt).getTime();
+    if ((dbJob.status === "WAIT" || dbJob.status === "RUN") && jobAgeMs >= HARD_ABORT_MAX_AGE_MS) {
+      const refundAmount = Boolean(dbJob.userId) && (dbJob.creditsUsed ?? 0) > 0 ? dbJob.creditsUsed : 0;
+      const timeoutMessage = "Generation timed out. Your credits have been automatically refunded.";
+      await updateJobStatus(jobId, {
+        status: "FAIL",
+        errorCode: "GENERATION_TIMEOUT",
+        errorMessage: timeoutMessage,
+        creditsUsed: refundAmount > 0 ? 0 : undefined,
+      });
+      if (refundAmount > 0 && dbJob.userId) {
+        await refundCredit(dbJob.userId, refundAmount);
+        logger.info(
+          { jobId, userId: dbJob.userId, amount: refundAmount, jobAgeMs },
+          "Refunded credits for job exceeding hard abort limit"
+        );
+      }
+      return true;
+    }
     
     // Fetch from the GPU VM with timeout (generous when it is busy processing another job).
     const controller = new AbortController();
@@ -156,13 +178,14 @@ export async function syncJobFromApi(jobId: string): Promise<boolean> {
             logger.debug({ jobId }, "Preview-only job not in API (expected)");
             return true;
           }
-          // Job is WAIT/RUN but not on API (e.g. GPU server restarted). Mark failed so we stop syncing it.
-          if (dbJob.status === "WAIT" || dbJob.status === "RUN") {
+          // Job is WAIT/RUN but not on API (e.g. GPU server restarted). Mark failed only after 90s or MAX_JOB_AGE_MS.
+          if ((dbJob.status === "WAIT" || dbJob.status === "RUN") && (jobAgeMs >= 90_000 || jobAgeMs >= MAX_JOB_AGE_MS)) {
             const shouldRefund = Boolean(dbJob.userId) && (dbJob.creditsUsed ?? 0) > 0;
+            const restartErrorMessage = "Job not found on GPU (server may have restarted). Your credits have been automatically refunded.";
             await updateJobStatus(jobId, {
               status: "FAIL",
               errorCode: null,
-              errorMessage: "Job not found on API (GPU server may have restarted).",
+              errorMessage: restartErrorMessage,
               creditsUsed: shouldRefund ? 0 : undefined,
             });
             if (shouldRefund && dbJob.userId) {
@@ -180,6 +203,20 @@ export async function syncJobFromApi(jobId: string): Promise<boolean> {
         if (response.status === 502 || response.status === 503 || response.status === 504) {
           recordApiFailure();
           logger.debug({ jobId, status: response.status }, "External API temporarily unavailable");
+          // If gateway is unavailable and job has exceeded MAX_JOB_AGE_MS, timeout and refund
+          if ((dbJob.status === "WAIT" || dbJob.status === "RUN") && jobAgeMs >= MAX_JOB_AGE_MS) {
+            const refundAmount = Boolean(dbJob.userId) && (dbJob.creditsUsed ?? 0) > 0 ? dbJob.creditsUsed : 0;
+            const timeoutMessage = "Generation timed out. Your credits have been automatically refunded.";
+            await updateJobStatus(jobId, {
+              status: "FAIL",
+              errorCode: "GENERATION_TIMEOUT",
+              errorMessage: timeoutMessage,
+              creditsUsed: refundAmount > 0 ? 0 : undefined,
+            });
+            if (refundAmount > 0 && dbJob.userId) {
+              await refundCredit(dbJob.userId, refundAmount);
+            }
+          }
           return false;
         }
         throw new Error(`API returned ${response.status}`);
@@ -194,11 +231,38 @@ export async function syncJobFromApi(jobId: string): Promise<boolean> {
         if (dbJob.previewImageUrl && !dbJob.resultGlbUrl && dbJob.status === "DONE") {
           return true;
         }
+        // If timed out and job is past MAX_JOB_AGE_MS, fail and refund
+        if ((dbJob.status === "WAIT" || dbJob.status === "RUN") && jobAgeMs >= MAX_JOB_AGE_MS) {
+          const refundAmount = Boolean(dbJob.userId) && (dbJob.creditsUsed ?? 0) > 0 ? dbJob.creditsUsed : 0;
+          const timeoutMessage = "Generation timed out. Your credits have been automatically refunded.";
+          await updateJobStatus(jobId, {
+            status: "FAIL",
+            errorCode: "GENERATION_TIMEOUT",
+            errorMessage: timeoutMessage,
+            creditsUsed: refundAmount > 0 ? 0 : undefined,
+          });
+          if (refundAmount > 0 && dbJob.userId) {
+            await refundCredit(dbJob.userId, refundAmount);
+          }
+        }
         return false;
       }
       // Record other network errors
       if (fetchErr.message?.includes("fetch") || fetchErr.message?.includes("network") || fetchErr.message?.includes("ECONNREFUSED")) {
         recordApiFailure();
+        if ((dbJob.status === "WAIT" || dbJob.status === "RUN") && jobAgeMs >= MAX_JOB_AGE_MS) {
+          const refundAmount = Boolean(dbJob.userId) && (dbJob.creditsUsed ?? 0) > 0 ? dbJob.creditsUsed : 0;
+          const timeoutMessage = "Generation timed out. Your credits have been automatically refunded.";
+          await updateJobStatus(jobId, {
+            status: "FAIL",
+            errorCode: "GENERATION_TIMEOUT",
+            errorMessage: timeoutMessage,
+            creditsUsed: refundAmount > 0 ? 0 : undefined,
+          });
+          if (refundAmount > 0 && dbJob.userId) {
+            await refundCredit(dbJob.userId, refundAmount);
+          }
+        }
       }
       throw fetchErr;
     }
@@ -217,10 +281,14 @@ export async function syncJobFromApi(jobId: string): Promise<boolean> {
         dbStatus === "FAIL" &&
         Boolean(dbJob.userId) &&
         (dbJob.creditsUsed ?? 0) > 0;
+      const rawError = apiJob.error || (dbStatus === "FAIL" ? "Generation failed" : null);
+      const formattedErrorMessage = dbStatus === "FAIL"
+        ? (rawError && rawError.includes("refunded") ? rawError : `${rawError || "Generation failed"}. Your credits have been automatically refunded.`)
+        : null;
       await updateJobStatus(jobId, {
         status: dbStatus,
         errorCode: null,
-        errorMessage: apiJob.error || null,
+        errorMessage: formattedErrorMessage,
         creditsUsed: shouldRefund ? 0 : undefined,
       });
       if (shouldRefund && dbJob.userId) {
@@ -309,14 +377,38 @@ export async function syncJobFromApi(jobId: string): Promise<boolean> {
  */
 export async function syncAllJobs(): Promise<{ synced: number; failed: number }> {
   try {
-    // Check circuit breaker - if API is offline, skip sync
+    // Check circuit breaker - if API is offline, still expire timed-out jobs
     if (!isApiAvailable()) {
       // Only log once per minute to avoid spam
       const shouldLog = !circuitBreakerState.lastFailureTime || 
                        (Date.now() - circuitBreakerState.lastFailureTime) > 60000;
       if (shouldLog) {
-        logger.debug("Skipping job sync: API is offline (circuit breaker open)");
+        logger.debug("Skipping API sync: API is offline (circuit breaker open). Checking for timed-out jobs.");
       }
+      const jobs = await getJobsToSync();
+      const now = Date.now();
+      await Promise.allSettled(
+        jobs.map(async (job) => {
+          const age = now - new Date(job.createdAt).getTime();
+          if (age >= MAX_JOB_AGE_MS && (job.status === "WAIT" || job.status === "RUN")) {
+            const refundAmount = Boolean(job.userId) && (job.creditsUsed ?? 0) > 0 ? job.creditsUsed : 0;
+            const timeoutMessage = "Generation timed out. Your credits have been automatically refunded.";
+            await updateJobStatus(job.id, {
+              status: "FAIL",
+              errorCode: "GENERATION_TIMEOUT",
+              errorMessage: timeoutMessage,
+              creditsUsed: refundAmount > 0 ? 0 : undefined,
+            });
+            if (refundAmount > 0 && job.userId) {
+              await refundCredit(job.userId, refundAmount);
+              logger.info(
+                { jobId: job.id, userId: job.userId, amount: refundAmount },
+                "Refunded credits for timed-out job while API offline"
+              );
+            }
+          }
+        })
+      );
       return { synced: 0, failed: 0 };
     }
 

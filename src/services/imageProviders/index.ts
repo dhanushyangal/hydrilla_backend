@@ -40,21 +40,36 @@ async function dispatchProviderCall(
     aspect: ImageAspect;
     prompt: string;
     inputImage?: InputImage | null;
+    inputImages?: InputImage[] | null;
   },
   signal: AbortSignal
 ): Promise<GeneratedImage> {
+  const images = (opts.inputImages && opts.inputImages.length > 0)
+    ? opts.inputImages
+    : (opts.inputImage ? [opts.inputImage] : []);
+
   if (opts.provider === "openai") {
-    if (opts.inputImage) {
-      return await openAIEdit(apiKey, opts.prompt, opts.quality, opts.inputImage, signal);
+    // OpenAI images/edits only accepts a single image file.
+    // If a composite 2x2 grid exists, use it so OpenAI sees all 4 angles in one image.
+    const compositeImage = images.find((img) => img.filename.toLowerCase().includes("composite"));
+    const targetImage = compositeImage || opts.inputImage || (images.length > 0 ? images[0] : null);
+    if (targetImage) {
+      return await openAIEdit(apiKey, opts.prompt, opts.quality, targetImage, signal);
     }
     return await openAIGenerate(apiKey, opts.prompt, opts.quality, opts.aspect, signal);
   }
+
+  // Gemini natively supports multi-image inputs as distinct content parts.
+  // Use the 4 individual angle images directly.
+  const individualImages = images.filter((img) => !img.filename.toLowerCase().includes("composite"));
+  const geminiImages = individualImages.length > 0 ? individualImages : images;
+
   return await geminiGenerate(
     apiKey,
     opts.prompt,
     opts.quality,
-    opts.inputImage ? null : opts.aspect,
-    opts.inputImage ?? null,
+    geminiImages.length > 0 ? null : opts.aspect,
+    geminiImages.length > 0 ? geminiImages : null,
     signal
   );
 }
@@ -67,10 +82,12 @@ async function executeWithRemediation(
     aspect: ImageAspect;
     prompt: string;
     inputImage?: InputImage | null;
+    inputImages?: InputImage[] | null;
   },
   signal: AbortSignal
 ): Promise<GeneratedImage> {
-  const initialPrompt = opts.inputImage
+  const hasImages = Boolean(opts.inputImage || (opts.inputImages && opts.inputImages.length > 0));
+  const initialPrompt = hasImages
     ? opts.prompt
     : await optimizePromptFor3D(opts.prompt, opts.provider);
 
@@ -103,6 +120,7 @@ export async function generateImage(opts: {
   aspect: ImageAspect;
   prompt: string;
   inputImage?: InputImage | null;
+  inputImages?: InputImage[] | null;
 }): Promise<GeneratedImage> {
   const apiKey = await resolveImageApiKey(opts.provider);
   if (!apiKey) {

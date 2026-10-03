@@ -1,55 +1,65 @@
-import { Router } from "express";
+import { Router, type Request, type Response } from "express";
 import { logger } from "../logger.js";
-import { recentUsage, usageByModel, usageByUser } from "../repository/imageUsage.js";
+import {
+  getUnifiedUsageReport,
+  type UsageSourceFilter,
+  type UsageTypeFilter,
+} from "../repository/imageUsage.js";
 
 export const adminUsageRouter = Router();
 
-const RANGE_DAYS: Record<string, number | null> = { "1d": 1, "7d": 7, "30d": 30, "90d": 90, all: null };
+const RANGE_DAYS: Record<string, number | null> = {
+  "1d": 1,
+  "7d": 7,
+  "30d": 30,
+  "90d": 90,
+  all: null,
+};
 
 function sinceFor(range: string): string | null {
   const days = RANGE_DAYS[range] ?? RANGE_DAYS["30d"];
-  return days === null ? null : new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
+  if (days === null) {
+    return null;
+  }
+  return new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
 }
 
-function roundUsd(v: number): number {
-  return Math.round(v * 1_000_000) / 1_000_000;
+function parseSource(val: unknown): UsageSourceFilter {
+  if (val === "web" || val === "api") {
+    return val;
+  }
+  return "all";
 }
 
-adminUsageRouter.get("/", async (req, res) => {
-  const range =
-    typeof req.query.range === "string" && Object.prototype.hasOwnProperty.call(RANGE_DAYS, req.query.range) ? req.query.range : "30d";
+function parseType(val: unknown): UsageTypeFilter {
+  if (val === "3d" || val === "image") {
+    return val;
+  }
+  return "all";
+}
+
+adminUsageRouter.get("/", async (req: Request, res: Response) => {
+  const rawRange = typeof req.query.range === "string" ? req.query.range : "30d";
+  const range = Object.prototype.hasOwnProperty.call(RANGE_DAYS, rawRange) ? rawRange : "30d";
+  const source = parseSource(req.query.source);
+  const type = parseType(req.query.type);
   const userId = typeof req.query.userId === "string" && req.query.userId.trim() ? req.query.userId.trim() : null;
   const since = sinceFor(range);
+
   try {
-    const [users, models, recent] = await Promise.all([
-      usageByUser(since),
-      usageByModel(since),
-      recentUsage(since, userId, 50),
-    ]);
-    res.json({
+    const report = await getUnifiedUsageReport({
       range,
+      source,
+      type,
       since,
-      totals: {
-        costUsd: roundUsd(users.reduce((sum, u) => sum + u.costUsd, 0)),
-        totalTokens: users.reduce((sum, u) => sum + u.totalTokens, 0),
-        inputTokens: users.reduce((sum, u) => sum + u.inputTokens, 0),
-        outputTokens: users.reduce((sum, u) => sum + u.outputTokens, 0),
-        generations: users.reduce((sum, u) => sum + u.generations, 0),
-        failed: users.reduce((sum, u) => sum + u.failed, 0),
-        creditsCharged: users.reduce((sum, u) => sum + u.creditsCharged, 0),
-        activeUsers: users.length,
-      },
-      users,
-      models,
-      recent,
+      userId,
     });
-  } catch (err: any) {
-    logger.error({ err: err?.message ?? err }, "GET /api/admin/usage failed");
-    const missingTable = /image_generation_usage|admin_image_usage/i.test(String(err?.message || ""));
+    res.json(report);
+  } catch (err: unknown) {
+    const errMessage = err instanceof Error ? err.message : String(err);
+    logger.error({ err: errMessage }, "GET /api/admin/usage failed");
     res.status(500).json({
-      error: missingTable
-        ? "Usage tables are missing. Run backend/sql/013_image_generation_usage.sql in Supabase."
-        : "Failed to load usage",
+      error: "Failed to load usage report",
     });
   }
 });

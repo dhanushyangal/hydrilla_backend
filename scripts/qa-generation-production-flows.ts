@@ -88,8 +88,8 @@ async function runAllQaFlows(): Promise<void> {
     // Cloud T2I options verification
     const lowCost = IMAGE_CREDITS["text-to-image"]["low"];
     const highCost = IMAGE_CREDITS["text-to-image"]["high"];
-    assert("Cloud T2I Low charges 2 credits", lowCost === 2);
-    assert("Cloud T2I High charges 5 credits", highCost === 5);
+    assert("Cloud T2I Low charges 15 credits", lowCost === 15);
+    assert("Cloud T2I High charges 20 credits", highCost === 20);
 
     // OpenAI image size mapping
     const lowSize = OPENAI_SIZES["low"]["1:1"];
@@ -300,15 +300,17 @@ async function runAllQaFlows(): Promise<void> {
     const t2iHigh = IMAGE_CREDITS["text-to-image"]["high"];
     const editLow = IMAGE_CREDITS["edit"]["low"];
     const editHigh = IMAGE_CREDITS["edit"]["high"];
-    const imageTo3D = 10;
+    const imageTo3DStandard = 30;
+    const imageTo3DUltra = 40;
 
-    assert("T2I Low cost is 2", t2iLow === 2);
-    assert("T2I High cost is 5", t2iHigh === 5);
-    assert("Edit Low cost is 3", editLow === 3);
-    assert("Edit High cost is 6", editHigh === 6);
-    assert("ImageTo3D cost is 10", imageTo3D === 10);
-    assert("TextTo3D Low total cost is 12", t2iLow + imageTo3D === 12);
-    assert("TextTo3D High total cost is 15", t2iHigh + imageTo3D === 15);
+    assert("T2I Low cost is 15", t2iLow === 15);
+    assert("T2I High cost is 20", t2iHigh === 20);
+    assert("Edit Low cost is 15", editLow === 15);
+    assert("Edit High cost is 20", editHigh === 20);
+    assert("ImageTo3D Standard cost is 30", imageTo3DStandard === 30);
+    assert("ImageTo3D Ultra cost is 40", imageTo3DUltra === 40);
+    assert("TextTo3D Standard total cost is 45", t2iLow + imageTo3DStandard === 45);
+    assert("TextTo3D Ultra total cost is 60", t2iHigh + imageTo3DUltra === 60);
 
     // Credit limit boundary check
     const checkLimit = (total: number, used: number, required: number): boolean => {
@@ -316,9 +318,9 @@ async function runAllQaFlows(): Promise<void> {
       return remaining >= required;
     };
 
-    assert("User with 9 credits cannot afford 10-credit 3D generation", !checkLimit(200, 191, 10));
-    assert("User with 10 credits can afford 10-credit 3D generation", checkLimit(200, 190, 10));
-    assert("User with 0 total credits is blocked", !checkLimit(0, 0, 2));
+    assert("User with 29 credits cannot afford 30-credit 3D generation", !checkLimit(200, 171, 30));
+    assert("User with 30 credits can afford 30-credit 3D generation", checkLimit(200, 170, 30));
+    assert("User with 0 total credits is blocked", !checkLimit(0, 0, 15));
   }
 
   // ─────────────────────────────────────────────────────────────────────────

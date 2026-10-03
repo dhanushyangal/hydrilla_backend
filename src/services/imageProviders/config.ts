@@ -12,8 +12,8 @@ export const DEFAULT_IMAGE_QUALITY: ImageQuality = "low";
 export const DEFAULT_IMAGE_ASPECT: ImageAspect = "1:1";
 
 export const IMAGE_CREDITS: Record<ImageOperation, Record<ImageQuality, number>> = {
-  "text-to-image": { low: 2, high: 5 },
-  edit: { low: 3, high: 6 },
+  "text-to-image": { low: 15, high: 20 },
+  edit: { low: 15, high: 20 },
 };
 
 function envModel(name: string, fallback: string): string {

@@ -11,8 +11,8 @@ import { supabase } from "../db.js";
 import { createJob, getJob, listJobsForUser, updateJobResult, updateJobStatus, deleteJob, getJobForUser, getJobLineage, upsertJobParents, getJobParentIds } from "../repository/jobs.js";
 import { createChat, getChatForUser, listChatsForUser, updateChatName, updateChatUpdatedAt, deleteChat, getOrCreateActiveChat } from "../repository/chats.js";
 import { createWorkspace, getWorkspace, getWorkspaceForUser, listWorkspacesForUser, listJobsForWorkspace, updateWorkspaceName, updateWorkspaceUpdatedAt, deleteWorkspace } from "../repository/workspaces.js";
-import { requireAuth, syncUserToDatabase } from "../middleware/auth.js";
-import { normalizeGlbUrl, normalizePreviewUrl } from "../utils/s3Urls.js";
+import { optionalAuth, requireAuth, syncUserToDatabase } from "../middleware/auth.js";
+import { normalizeGlbUrl, normalizePreviewUrl, unwrapImageProxyUrl } from "../utils/s3Urls.js";
 import { isWaterEngine, isWaterJobId, isWaterJobRow } from "../lib/engines.js";
 import {
   generateImage,
@@ -35,6 +35,7 @@ import {
   type UsageCall,
 } from "../services/imageProviders/index.js";
 import { recordImageUsage, type ImageUsageRecord } from "../repository/imageUsage.js";
+import { MULTI_VIEW_3D_SYSTEM_PROMPT, buildMultiView3DEditPrompt } from "../services/imageProviders/editPrompts.js";
 import { runDeduplicated3DSubmission } from "../services/inFlight3d.js";
 import { JobStatus, JobRecord, ChatRecord, WorkspaceRecord, GenerateType } from "../types.js";
 
@@ -184,23 +185,26 @@ if (isVercel) {
 const upload = multer({
   storage,
   limits: {
-    fileSize: 10 * 1024 * 1024,
+    fileSize: 100 * 1024 * 1024,
   },
   fileFilter: (_req: any, file: any, cb: any) => {
-    // Accept any image/* mimetype, or generic/empty mimetypes when filename has an image extension.
-    // Browsers / S3 sometimes report "application/octet-stream" or empty type for canvas blobs and
-    // S3 objects uploaded without ContentType — those are still valid images.
-    const allowedExt = [".jpg", ".jpeg", ".png", ".webp", ".gif"];
+    // Accept any image/* mimetype, 3D model formats (.glb, .gltf, .obj), or generic/empty mimetypes.
+    const allowedExt = [".jpg", ".jpeg", ".png", ".webp", ".gif", ".glb", ".gltf", ".obj"];
     const mimetype = (file.mimetype || "").toLowerCase();
     const originalName = (file.originalname || "").toLowerCase();
     const ext = path.extname(originalName);
     const isImageMime = mimetype.startsWith("image/");
+    const is3dMime =
+      mimetype.startsWith("model/") ||
+      mimetype === "application/octet-stream" ||
+      mimetype === "binary/octet-stream" ||
+      mimetype === "application/json";
     const isGenericMime = mimetype === "" || mimetype === "application/octet-stream" || mimetype === "binary/octet-stream";
-    const hasImageExt = allowedExt.includes(ext);
-    if (isImageMime || (isGenericMime && hasImageExt)) {
+    const hasAllowedExt = allowedExt.includes(ext);
+    if (isImageMime || (is3dMime && hasAllowedExt) || (isGenericMime && hasAllowedExt)) {
       cb(null, true);
     } else {
-      cb(new Error(`Invalid file type. Only images are allowed. (received mimetype="${file.mimetype}", filename="${file.originalname}")`));
+      cb(new Error(`Invalid file type. Only images and 3D models (.glb, .gltf, .obj) are allowed. (received mimetype="${file.mimetype}", filename="${file.originalname}")`));
     }
   },
 });
@@ -219,6 +223,18 @@ function readMulterFile(file: Express.Multer.File): Buffer {
   if (file.path) return fs.readFileSync(file.path);
   throw new Error("Uploaded file has neither buffer nor path");
 }
+
+const uploadFlexible = (req: any, res: any, next: any) => {
+  upload.any()(req, res, (err: any) => {
+    if (err) {
+      return next(err);
+    }
+    if (req.files && Array.isArray(req.files) && req.files.length > 0) {
+      req.file = req.files[0];
+    }
+    next();
+  });
+};
 
 /** GPU VM gateway (no trailing slash) — BlueFox3D image-to-3d on api.hydrilla.co */
 const GPU_GATEWAY = config.gpuGateway.url;
@@ -245,7 +261,11 @@ async function fetchGateway(
   init: RequestInit = {}
 ): Promise<{ response: Response; baseUrl: string }> {
   const pathStr = path.startsWith("/") ? path : `/${path}`;
-  const response = await fetch(`${GPU_GATEWAY}${pathStr}`, withInternalSecretHeaders(init));
+  const signal = init.signal || AbortSignal.timeout(10000);
+  const response = await fetch(`${GPU_GATEWAY}${pathStr}`, {
+    ...withInternalSecretHeaders(init),
+    signal,
+  });
   return { response, baseUrl: GPU_GATEWAY };
 }
 
@@ -324,6 +344,8 @@ function contentTypeForImageKey(key: string, fallback?: string): string {
   if (ext === ".png") return "image/png";
   if (ext === ".webp") return "image/webp";
   if (ext === ".gif") return "image/gif";
+  if (ext === ".glb") return "model/gltf-binary";
+  if (ext === ".gltf") return "model/gltf+json";
   return fallback && fallback !== "binary/octet-stream" && fallback !== "application/octet-stream"
     ? fallback
     : "image/png";
@@ -351,6 +373,8 @@ function imageKeyCandidates(key: string): string[] {
     `text/${jobId}/generated_image.png`,
     `edit/${jobId}/edited.png`,
     `combined/${jobId}/combined.png`,
+    `image/${jobId}/mesh.glb`,
+    `text/${jobId}/mesh.glb`,
   ]);
 }
 
@@ -570,8 +594,8 @@ class GpuSubmitHttpError extends Error {
   }
 }
 
-/** The VM restarts itself every few generations; ~30s covers process exit + uvicorn start. */
-const GPU_SUBMIT_RETRY_DELAYS_MS = [2000, 3000, 5000, 5000, 5000, 5000, 5000];
+/** The VM restarts itself periodically; short retries handle transient restarting. */
+const GPU_SUBMIT_RETRY_DELAYS_MS = [1500, 2500];
 
 function isTransientGpuSubmitError(err: unknown): boolean {
   if (err instanceof GpuSubmitHttpError) {
@@ -581,7 +605,7 @@ function isTransientGpuSubmitError(err: unknown): boolean {
     return err.status === 502 || err.status === 503 || err.status === 504;
   }
   const msg = err && typeof (err as any).message === "string" ? (err as any).message : "";
-  return /fetch failed|ECONNREFUSED|ECONNRESET|socket hang up|other side closed|network/i.test(msg);
+  return /fetch failed|ECONNREFUSED|ECONNRESET|socket hang up|other side closed|network|AbortError/i.test(msg);
 }
 
 async function submitWithGpuRestartRetry<T>(submit: () => Promise<T>, attempt = 0): Promise<T> {
@@ -604,13 +628,16 @@ async function submitWithGpuRestartRetry<T>(submit: () => Promise<T>, attempt = 
 /** Map gateway/network errors to a user-facing message when the GPU API is unreachable. */
 function gatewayErrorToUserMessage(err: unknown): string {
   const msg = err && typeof (err as any).message === "string" ? (err as any).message : "";
-  if (/fetch failed|timeout|ECONNREFUSED|ECONNRESET|network|Gateway request failed|Gateway returned 5/i.test(msg))
-    return "GPU is unavailable";
-  return msg || "GPU is unavailable";
+  if (/fetch failed|timeout|ECONNREFUSED|ECONNRESET|network|Gateway request failed|Gateway returned 5|AbortError/i.test(msg)) {
+    return "GPU is currently offline or restarting. Please try again in a moment.";
+  }
+  return msg || "GPU is currently offline or restarting. Please try again in a moment.";
 }
 
-// Credits for image-to-3d. Image credits depend on the tier (IMAGE_CREDITS in services/imageProviders).
-const CREDITS_IMAGE_TO_3D = 10;
+// Credits for 3D generation. Standard image-to-3d is 30 credits; high / ultra1k is 40 credits; full text-to-3d / chained edit is 65 credits.
+const CREDITS_IMAGE_TO_3D = 30;
+const CREDITS_IMAGE_TO_3D_HIGH = 40;
+const CREDITS_TEXT_TO_3D = 65;
 
 // Initialize S3 client (Vercel/serverless has no writable disk — uploads must use S3 with valid AWS creds)
 let s3Client: S3Client | null = null;
@@ -708,6 +735,7 @@ threeDRouter.post("/generate", requireAuth, async (req, res) => {
       workspaceId?: string;
       parentJobId?: string;
       parentJobIds?: string[];
+      resolution?: string | number;
     };
     const userId = req.userId!;
 
@@ -749,8 +777,11 @@ threeDRouter.post("/generate", requireAuth, async (req, res) => {
         });
       }
 
+      const isHighResolution = body.resolution === "ultra1k" || body.resolution === "high" || body.resolution === 1536 || body.resolution === "1536";
+      const creditsToCharge = isHighResolution ? CREDITS_IMAGE_TO_3D_HIGH : CREDITS_IMAGE_TO_3D;
+
       const { jobId } = await runDeduplicated3DSubmission(userId, imageUrl, async () => {
-        const deductResult = await deductCredit(userId, CREDITS_IMAGE_TO_3D, true);
+        const deductResult = await deductCredit(userId, creditsToCharge, true);
         if (!deductResult.ok) {
           const creditErr = new Error(deductResult.error);
           (creditErr as any).status = 402;
@@ -799,14 +830,15 @@ threeDRouter.post("/generate", requireAuth, async (req, res) => {
             return await submitWithGpuRestartRetry(submitToGpu);
           } catch (submitErr) {
             const { refundCredit } = await import("../services/credits.js");
-            await refundCredit(userId, CREDITS_IMAGE_TO_3D);
+            await refundCredit(userId, creditsToCharge);
             throw submitErr;
           }
         })();
 
         // Create job in database with user_id and credits_used
-        const sourceImages = body.imageUrl && (body.imageUrl.startsWith("http://") || body.imageUrl.startsWith("https://"))
-          ? [body.imageUrl]
+        const canonicalImageUrl = unwrapImageProxyUrl(body.imageUrl) || body.imageUrl || null;
+        const sourceImages = canonicalImageUrl && (canonicalImageUrl.startsWith("http://") || canonicalImageUrl.startsWith("https://"))
+          ? [canonicalImageUrl]
           : null;
         const detectedGenerateType: GenerateType = "ImageTo3D";
         const finalParentJobId = body.parentJobId || (body.parentJobIds && body.parentJobIds.length > 0 ? body.parentJobIds[0] : null);
@@ -822,10 +854,11 @@ threeDRouter.post("/generate", requireAuth, async (req, res) => {
           parentJobId: finalParentJobId,
           parentJobIds: finalParentJobIds,
           prompt: body.prompt || null,
-          imageUrl: body.imageUrl || null,
+          imageUrl: canonicalImageUrl,
           sourceImages,
           generateType: detectedGenerateType,
-          creditsUsed: CREDITS_IMAGE_TO_3D,
+          creditsUsed: creditsToCharge,
+          previewImageUrl: canonicalImageUrl,
         });
 
         return { jobId: createdJobId };
@@ -846,7 +879,12 @@ threeDRouter.post("/generate", requireAuth, async (req, res) => {
     if (err?.status === 402) {
       return res.status(402).json({ error: err.message });
     }
-    res.status(400).json({ error: err.message || "Failed to submit job" });
+    const userMsg = gatewayErrorToUserMessage(err);
+    const statusCode = err?.status && err.status >= 400 && err.status < 500 ? err.status : 503;
+    return res.status(statusCode).json({
+      error: userMsg,
+      creditsRefunded: true,
+    });
   }
 });
 
@@ -863,6 +901,7 @@ type ImageJobContext = {
   parentJobIds: string[];
   sourceImages: string[] | null;
   imageUrl: string | null;
+  userPrompt?: string | null;
 };
 
 function parseStringArray(raw: unknown): string[] {
@@ -936,7 +975,8 @@ async function runProviderImageJob(
   prompt: string,
   options: ImageOptions,
   ctx: ImageJobContext,
-  inputImage: InputImage | null
+  inputImage: InputImage | null,
+  inputImages?: InputImage[] | null
 ) {
   const executeGeneration = async () => {
     const credits = IMAGE_CREDITS[op][options.quality];
@@ -948,9 +988,9 @@ async function runProviderImageJob(
 
     const jobId = randomUUID();
     const usageCalls: UsageCall[] = [];
-    const usageBase = { userId, operation: op, provider: options.provider, quality: options.quality };
+    const usageBase = { userId, operation: op, provider: options.provider, quality: options.quality, source: "web" as const };
     const outcome = await runWithUsage(usageCalls, async () => {
-      const generated = await generateImage({ ...options, prompt, inputImage });
+      const generated = await generateImage({ ...options, prompt, inputImage, inputImages });
       const key = op === "edit" ? `edit/${jobId}/edited.png` : `preview/${jobId}/preview_image.png`;
       return { image: generated, imageUrl: await storeGeneratedImage(key, generated) };
     }).then(
@@ -1035,7 +1075,7 @@ async function runProviderImageJob(
         workspaceId: ctx.workspaceId,
         parentJobId: ctx.parentJobId || (ctx.parentJobIds[0] ?? null),
         parentJobIds: ctx.parentJobIds.length > 0 ? ctx.parentJobIds : ctx.parentJobId ? [ctx.parentJobId] : [],
-        prompt: prompt.trim() || null,
+        prompt: (ctx.userPrompt ?? prompt).trim() || null,
         imageUrl: ctx.imageUrl,
         sourceImages: ctx.sourceImages,
         generateType: op === "edit" ? "EditImage" : "TextToImage",
@@ -1057,7 +1097,7 @@ async function runProviderImageJob(
         ...(op === "edit" ? { edit_id: jobId } : { preview_id: jobId }),
         status: "completed",
         image_url: imageUrl,
-        prompt,
+        prompt: ctx.userPrompt ?? prompt,
         provider: options.provider,
         quality: options.quality,
         ...(op === "edit" ? {} : { aspect: options.aspect }),
@@ -1116,7 +1156,7 @@ threeDRouter.post("/text-to-image", requireAuth, async (req, res) => {
 // ============================================
 // Edit image (OpenAI / Gemini) — credits by tier
 // ============================================
-threeDRouter.post("/edit-image", requireAuth, upload.single("image"), async (req, res) => {
+threeDRouter.post("/edit-image", requireAuth, uploadFlexible, async (req, res) => {
   try {
     const userId = req.userId!;
     await syncUserToDatabase(userId);
@@ -1127,60 +1167,101 @@ threeDRouter.post("/edit-image", requireAuth, upload.single("image"), async (req
     }
     const prompt = promptValidation.prompt;
     const imageUrl = typeof body.image_url === "string" && body.image_url.trim() ? body.image_url.trim() : undefined;
-    const file = req.file;
-    if (!file && !imageUrl) {
-      return res.status(400).json({ error: "Either image file or image_url is required" });
+    const files: Express.Multer.File[] = Array.isArray(req.files)
+      ? (req.files as Express.Multer.File[])
+      : (req.file ? [req.file] : []);
+
+    const modelFiles = files.filter((f) => {
+      const ext = path.extname(f.originalname || "").toLowerCase();
+      return [".glb", ".gltf", ".obj"].includes(ext) || (f.mimetype || "").startsWith("model/");
+    });
+    if (modelFiles.length > 0) {
+      return res.status(400).json({
+        error: "3D model editing requires rendered preview snapshots of the model. Please use the rendered preview in Edit Studio to apply modifications.",
+      });
     }
+
     const options = parseImageOptions(body, res);
-    if (!options) return;
+    if (!options) {
+      return;
+    }
     const sourceImagesList = parseStringArray(body.sourceImages);
 
-    let resolvedImage: { buffer: Buffer; contentType: string; filename: string } | null = null;
-    if (file) {
+    const resolvedFiles: InputImage[] = files.map((file) => {
       const filename = file.originalname || "image.png";
-      resolvedImage = {
+      return {
         buffer: readMulterFile(file),
         contentType: contentTypeForImageKey(filename, file.mimetype),
         filename,
       };
-    } else if (imageUrl) {
-      resolvedImage = await loadImageBytesFor3dSubmission(imageUrl);
-      if (!resolvedImage && isImageUrlUnreachableByRemoteWorker(imageUrl)) {
-        try {
-          resolvedImage = await loadImageBytesForLocalBackendUrl(imageUrl);
-        } catch (e: any) {
-          return res.status(400).json({ error: e?.message || "Could not load image for edit" });
-        }
-      }
-      if (
-        !resolvedImage &&
-        (extractOwnedS3KeyFromUrl(imageUrl) || isGatewayOutputImageUrl(imageUrl))
-      ) {
-        return res.status(400).json({
-          error:
-            "Could not load the source image for editing. Try re-selecting the image from your library.",
-        });
-      }
-    }
-    if (!resolvedImage) {
-      return res.status(400).json({ error: "Could not load the source image for editing." });
-    }
-    resolvedImage = {
-      ...resolvedImage,
-      contentType: contentTypeForImageKey(resolvedImage.filename, resolvedImage.contentType),
-    };
+    });
 
-    await runProviderImageJob(res, userId, "edit", prompt, options, {
-      chatId: typeof body.chatId === "string" ? body.chatId : null,
-      workspaceId: typeof body.workspaceId === "string" ? body.workspaceId : null,
-      parentJobId: typeof body.parentJobId === "string" ? body.parentJobId : null,
-      parentJobIds: parseStringArray(body.parentJobIds),
-      sourceImages: sourceImagesList.length > 0 ? sourceImagesList : imageUrl ? [imageUrl] : null,
-      imageUrl: imageUrl || null,
-    }, resolvedImage);
+    const targetUrls = resolvedFiles.length === 0
+      ? (sourceImagesList.length > 0 ? sourceImagesList : (imageUrl ? [imageUrl] : []))
+      : [];
+
+    const loadedUrlImages = await Promise.all(
+      targetUrls.map(async (url) => {
+        const loaded = await loadImageBytesFor3dSubmission(url);
+        if (loaded) {
+          return {
+            ...loaded,
+            contentType: contentTypeForImageKey(loaded.filename, loaded.contentType),
+          };
+        }
+        if (isImageUrlUnreachableByRemoteWorker(url)) {
+          try {
+            const local = await loadImageBytesForLocalBackendUrl(url);
+            if (local) {
+              return {
+                ...local,
+                contentType: contentTypeForImageKey(local.filename, local.contentType),
+              };
+            }
+          } catch {
+            return null;
+          }
+        }
+        return null;
+      })
+    );
+
+    const validLoadedImages = loadedUrlImages.filter((img): img is InputImage => img !== null);
+    const allImages: InputImage[] = resolvedFiles.length > 0 ? resolvedFiles : validLoadedImages;
+
+    if (allImages.length === 0) {
+      return res.status(400).json({ error: "Could not load the source image(s) for editing." });
+    }
+
+    const userPrompt = prompt.trim();
+    const isMultiView = allImages.length >= 2;
+    const effectivePrompt = isMultiView
+      ? `${MULTI_VIEW_3D_SYSTEM_PROMPT}\n\n${buildMultiView3DEditPrompt(prompt, typeof body.additionalPrompt === "string" ? body.additionalPrompt : null)}`
+      : prompt;
+
+    await runProviderImageJob(
+      res,
+      userId,
+      "edit",
+      effectivePrompt,
+      options,
+      {
+        chatId: typeof body.chatId === "string" ? body.chatId : null,
+        workspaceId: typeof body.workspaceId === "string" ? body.workspaceId : null,
+        parentJobId: typeof body.parentJobId === "string" ? body.parentJobId : null,
+        parentJobIds: parseStringArray(body.parentJobIds),
+        sourceImages: sourceImagesList.length > 0 ? sourceImagesList : (imageUrl ? [imageUrl] : null),
+        imageUrl: imageUrl || null,
+        userPrompt,
+      },
+      allImages[0] ?? null,
+      allImages.length > 0 ? allImages : null
+    );
   } catch (err: any) {
     logger.error({ err: err.message }, "edit-image failed");
-    if (!res.headersSent) res.status(500).json({ error: err.message || "Image edit failed" });
+    if (!res.headersSent) {
+      res.status(500).json({ error: err.message || "Image edit failed" });
+    }
   }
 });
 
@@ -1190,6 +1271,10 @@ threeDRouter.post("/edit-image", requireAuth, upload.single("image"), async (req
 threeDRouter.get("/status/:jobId", requireAuth, async (req, res) => {
   const { jobId } = req.params;
   const userId = req.userId;
+
+  if (jobId.startsWith("pending-")) {
+    return res.status(404).json({ error: "Job pending submission" });
+  }
 
   try {
     // First, try to get job from database
@@ -1214,7 +1299,18 @@ threeDRouter.get("/status/:jobId", requireAuth, async (req, res) => {
         (job.previewImageUrl && !job.resultGlbUrl))
     ) {
       // Check ownership
-      if (denyIfNotJobOwner(job, userId, res)) return;
+      if (denyIfNotJobOwner(job, userId, res)) {
+        return;
+      }
+
+      // Safety check: if job failed and still has credits_used > 0, refund now
+      if (job.status === "FAIL" && job.userId && (job.creditsUsed ?? 0) > 0) {
+        const refundAmount = job.creditsUsed;
+        const { refundCredit } = await import("../services/credits.js");
+        await refundCredit(job.userId, refundAmount);
+        await updateJobStatus(jobId, { status: "FAIL", creditsUsed: 0 });
+        job.creditsUsed = 0;
+      }
       
       // Normalize URLs to ensure they're direct S3 URLs (not expired signed URLs)
       if (job.resultGlbUrl) {
@@ -1224,8 +1320,12 @@ threeDRouter.get("/status/:jobId", requireAuth, async (req, res) => {
         job.previewImageUrl = normalizePreviewUrl(jobId, job.previewImageUrl);
       }
       
-      return res.json({ job });
+      return res.json({ job, creditsRefunded: job.status === "FAIL" });
     }
+
+    // 16-minute timeout cap (allows 12+ min generations when GPU OOM restart occurs)
+    const MAX_JOB_AGE_MS = 16 * 60 * 1000;
+    const elapsedMs = job ? Date.now() - new Date(job.createdAt).getTime() : 0;
 
     // For pending/processing jobs or if job doesn't exist, try to fetch from external API
     // But if API is unreachable and we have the job in DB, return the DB version
@@ -1247,9 +1347,28 @@ threeDRouter.get("/status/:jobId", requireAuth, async (req, res) => {
         if (!job) {
           return res.status(404).json({ error: "Job not found" });
         }
-        // If we have it in DB but API says not found, return DB version
+        // If we have it in DB but API says not found, check if it timed out past 16 minutes
         if (denyIfNotJobOwner(job, userId, res)) return;
         
+        if ((job.status === "WAIT" || job.status === "RUN") && elapsedMs >= MAX_JOB_AGE_MS) {
+          const refundAmount = Boolean(job.userId) && (job.creditsUsed ?? 0) > 0 ? job.creditsUsed : 0;
+          const timeoutMessage = "Generation timed out. Your credits have been automatically refunded.";
+          await updateJobStatus(jobId, {
+            status: "FAIL",
+            errorCode: "GENERATION_TIMEOUT",
+            errorMessage: timeoutMessage,
+            creditsUsed: refundAmount > 0 ? 0 : undefined,
+          });
+          if (refundAmount > 0 && job.userId) {
+            const { refundCredit } = await import("../services/credits.js");
+            await refundCredit(job.userId, refundAmount);
+          }
+          job.status = "FAIL";
+          job.errorMessage = timeoutMessage;
+          job.creditsUsed = 0;
+          return res.json({ job, creditsRefunded: true });
+        }
+
         // Normalize URLs to ensure they're direct S3 URLs (not expired signed URLs)
         if (job.resultGlbUrl) {
           job.resultGlbUrl = normalizeGlbUrl(jobId, job.resultGlbUrl);
@@ -1267,7 +1386,31 @@ threeDRouter.get("/status/:jobId", requireAuth, async (req, res) => {
       
       // If we have the job in database, return it
       if (job) {
-        if (denyIfNotJobOwner(job, userId, res)) return;
+        if (denyIfNotJobOwner(job, userId, res)) {
+          return;
+        }
+
+        // 16-minute timeout check:
+        // If GPU gateway is unreachable and job has reached or exceeded 16 minutes, expire and refund it.
+        const ageMs = Date.now() - new Date(job.createdAt).getTime();
+        if ((job.status === "WAIT" || job.status === "RUN") && ageMs >= MAX_JOB_AGE_MS) {
+          const refundAmount = Boolean(job.userId) && (job.creditsUsed ?? 0) > 0 ? job.creditsUsed : 0;
+          const timeoutMessage = "Generation timed out. Your credits have been automatically refunded.";
+          await updateJobStatus(jobId, {
+            status: "FAIL",
+            errorCode: "GENERATION_TIMEOUT",
+            errorMessage: timeoutMessage,
+            creditsUsed: refundAmount > 0 ? 0 : undefined,
+          });
+          if (refundAmount > 0 && job.userId) {
+            const { refundCredit } = await import("../services/credits.js");
+            await refundCredit(job.userId, refundAmount);
+          }
+          job.status = "FAIL";
+          job.errorMessage = timeoutMessage;
+          job.creditsUsed = 0;
+          return res.json({ job, creditsRefunded: true });
+        }
         
         // Normalize URLs to ensure they're direct S3 URLs (not expired signed URLs)
         if (job.resultGlbUrl) {
@@ -1277,7 +1420,7 @@ threeDRouter.get("/status/:jobId", requireAuth, async (req, res) => {
           job.previewImageUrl = normalizePreviewUrl(jobId, job.previewImageUrl);
         }
         
-        return res.json({ job });
+        return res.json({ job, creditsRefunded: job.status === "FAIL" });
       }
       
       // If no job in DB and API is unreachable, return error
@@ -1348,10 +1491,14 @@ threeDRouter.get("/status/:jobId", requireAuth, async (req, res) => {
     if (apiJob.status === "failed" || apiJob.status === "cancelled") {
       const wasInFlight = job.status === "WAIT" || job.status === "RUN" || !job.status;
       const refundAmount = wasInFlight && job.userId ? (job.creditsUsed ?? 0) : 0;
+      const rawError = apiJob.error || (apiJob.status === "cancelled" ? "Job cancelled" : "Job failed");
+      const failureMsg = rawError.includes("refunded")
+        ? rawError
+        : `${rawError}. Your credits have been automatically refunded.`;
       await updateJobStatus(jobId, {
         status,
         errorCode: null,
-        errorMessage: apiJob.error || "Job failed",
+        errorMessage: failureMsg,
         creditsUsed: refundAmount > 0 ? 0 : undefined,
       });
       if (refundAmount > 0 && job.userId) {
@@ -1359,7 +1506,7 @@ threeDRouter.get("/status/:jobId", requireAuth, async (req, res) => {
         await refundCredit(job.userId, refundAmount);
         job.creditsUsed = 0;
       }
-      job.errorMessage = apiJob.error || "Job failed";
+      job.errorMessage = failureMsg;
     }
 
     job.status = status;
@@ -1373,7 +1520,10 @@ threeDRouter.get("/status/:jobId", requireAuth, async (req, res) => {
     }
     
     // Include queue info + live GPU progress for accurate UI updates
-    const response_data: Record<string, unknown> = { job };
+    const response_data: Record<string, unknown> = {
+      job,
+      creditsRefunded: job.status === "FAIL" || apiJob.status === "cancelled",
+    };
     const queue = buildQueueInfoFromApiJob(apiJob as Record<string, unknown>);
     if (queue) {
       response_data.queue = queue;
@@ -1428,11 +1578,12 @@ threeDRouter.post("/cancel/:jobId", requireAuth, async (req, res) => {
 
     // Mark local job cancelled while still in-flight so UI/poll see FAIL immediately.
     const wasInFlight = status === "WAIT" || status === "RUN" || status === "PENDING" || !status;
+    const refundAmount = wasInFlight && userId ? (job.creditsUsed ?? 0) : 0;
     if (wasInFlight) {
-      const refundAmount = userId ? (job.creditsUsed ?? 0) : 0;
+      const cancelMessage = "Cancelled by user. Your credits have been automatically refunded.";
       await updateJobStatus(jobId, {
         status: "FAIL",
-        errorMessage: "Cancelled by user",
+        errorMessage: cancelMessage,
         creditsUsed: refundAmount > 0 ? 0 : undefined,
       });
       if (refundAmount > 0 && userId) {
@@ -1473,7 +1624,12 @@ threeDRouter.post("/cancel/:jobId", requireAuth, async (req, res) => {
       await updateJobStatus(jobId, { status: "FAIL", errorMessage: "Cancelled by user" });
     }
 
-    res.json({ job_id: jobId, status: "cancelled", message: gatewayMessage });
+    res.json({
+      job_id: jobId,
+      status: "cancelled",
+      message: gatewayMessage,
+      creditsRefunded: refundAmount > 0,
+    });
   } catch (err: any) {
     logger.error(err, "cancel job");
     res.status(500).json({ error: gatewayErrorToUserMessage(err) });
@@ -1684,7 +1840,7 @@ threeDRouter.get("/health", async (_req, res) => {
 // ============================================
 // Proxy GLB file from S3 (to avoid CORS issues)
 // ============================================
-threeDRouter.get("/glb/:jobId", requireAuth, async (req, res) => {
+threeDRouter.get("/glb/:jobId", optionalAuth, async (req, res) => {
   const { jobId } = req.params;
   const userId = req.userId;
 
@@ -1692,11 +1848,39 @@ threeDRouter.get("/glb/:jobId", requireAuth, async (req, res) => {
     // Get job to verify ownership and get GLB URL
     const job = await getJob(jobId);
     if (!job) {
+      // Fallback: check S3 directly for this jobId if DB row is missing
+      if (s3Enabled && s3Client) {
+        const candidateKeys = [
+          `image/${jobId}/mesh.glb`,
+          `text/${jobId}/mesh.glb`,
+        ];
+        try {
+          const { key: _resolvedKey, out: s3Response } = await getFirstExistingS3Object(candidateKeys);
+          const contentLength = s3Response.ContentLength || 0;
+          res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
+          res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+          res.setHeader("Content-Type", "model/gltf-binary");
+          res.setHeader("Content-Disposition", 'inline; filename="mesh.glb"');
+          res.setHeader("Cache-Control", "public, max-age=3600");
+          if (contentLength > 0) {
+            res.setHeader("Content-Length", contentLength.toString());
+          }
+          if (s3Response.Body) {
+            const stream = s3Response.Body as Readable;
+            stream.pipe(res);
+            return;
+          }
+        } catch {
+          // continue to 404
+        }
+      }
       return res.status(404).json({ error: "Job not found" });
     }
 
-    // Check ownership
-    if (denyIfNotJobOwner(job, userId, res)) return;
+    // Check ownership if user is authenticated and job has an owner
+    if (job.userId && userId && job.userId !== userId) {
+      return res.status(403).json({ error: "You don't have permission to access this job" });
+    }
 
     if (isWaterJobId(jobId) || isWaterJobRow(job as any)) {
       return res.status(404).json({
@@ -2408,31 +2592,41 @@ threeDRouter.post("/register-job", requireAuth, async (req, res) => {
           : null;
 
     // Deduct credits when creating a new 3D job (WAIT, no preview-only); preview-only jobs use 0 credits
+    const isHighResolution = req.body?.resolution === "ultra1k" || req.body?.resolution === "high" || req.body?.resolution === 1536 || req.body?.resolution === "1536";
+    const resolved3DCredits = isHighResolution ? CREDITS_IMAGE_TO_3D_HIGH : CREDITS_IMAGE_TO_3D;
     const isNew3DJob = initialStatus === "WAIT" && !previewImageUrl;
-    let creditsToSet = 0;
-    if (isNew3DJob && userId) {
+    const shouldDeduct = Boolean(isNew3DJob && userId);
+    const creditsToSet = shouldDeduct ? resolved3DCredits : 0;
+    if (shouldDeduct && userId) {
       const { deductCredit } = await import("../services/credits.js");
-      const deductResult = await deductCredit(userId, CREDITS_IMAGE_TO_3D, true);
+      const deductResult = await deductCredit(userId, resolved3DCredits, true);
       if (!deductResult.ok) {
         return res.status(402).json({ error: deductResult.error });
       }
-      creditsToSet = CREDITS_IMAGE_TO_3D;
     }
 
-    await createJob({
-      id: job_id,
-      userId: userId || null,
-      chatId: finalChatId,
-      workspaceId: workspaceId || null,
-      parentJobId: finalParentJobId,
-      parentJobIds: finalParentJobIds,
-      prompt: finalPrompt,
-      imageUrl: imageUrl || null,
-      sourceImages: resolvedSourceImages,
-      generateType: finalGenerateType,
-      status: initialStatus,
-      creditsUsed: creditsToSet,
-    });
+    try {
+      await createJob({
+        id: job_id,
+        userId: userId || null,
+        chatId: finalChatId,
+        workspaceId: workspaceId || null,
+        parentJobId: finalParentJobId,
+        parentJobIds: finalParentJobIds,
+        prompt: finalPrompt,
+        imageUrl: imageUrl || null,
+        sourceImages: resolvedSourceImages,
+        generateType: finalGenerateType,
+        status: initialStatus,
+        creditsUsed: creditsToSet,
+      });
+    } catch (createErr) {
+      if (shouldDeduct && userId) {
+        const { refundCredit } = await import("../services/credits.js");
+        await refundCredit(userId, resolved3DCredits);
+      }
+      throw createErr;
+    }
     
     if (finalChatId) {
       await updateChatUpdatedAt(finalChatId);
@@ -2604,87 +2798,99 @@ threeDRouter.post("/webhook/job-update", async (req, res) => {
 });
 
 // ============================================
-// Image Upload (with optional auth)
+// File & Model Upload (images and 3D models)
 // ============================================
-threeDRouter.post("/upload-image", requireAuth, upload.single("image"), async (req, res) => {
+const handleFileUpload = async (req: any, res: any) => {
   try {
-    if (!req.file) {
-      return res.status(400).json({ error: "No image file provided" });
+    const uploadedFile = req.file || (req.files && req.files[0]);
+    if (!uploadedFile) {
+      return res.status(400).json({ error: "No file provided" });
     }
 
-    let imageUrl: string;
-    const fileBuffer = req.file.buffer || (req.file.path ? fs.readFileSync(req.file.path) : null);
-
+    const fileBuffer = uploadedFile.buffer || (uploadedFile.path ? fs.readFileSync(uploadedFile.path) : null);
     if (!fileBuffer) {
       return res.status(500).json({ error: "Failed to read uploaded file" });
     }
 
-    if (s3Enabled && s3Client) {
+    const fileExtension = path.extname(uploadedFile.originalname).toLowerCase();
+    const is3D = [".glb", ".gltf", ".obj"].includes(fileExtension);
+    const default3DMime =
+      fileExtension === ".glb"
+        ? "model/gltf-binary"
+        : fileExtension === ".gltf"
+          ? "model/gltf+json"
+          : "model/obj";
+    const contentType =
+      uploadedFile.mimetype && uploadedFile.mimetype !== "application/octet-stream"
+        ? uploadedFile.mimetype
+        : is3D
+          ? default3DMime
+          : `image/${fileExtension.slice(1) || "png"}`;
+
+    const uploadToS3 = async (): Promise<string | null> => {
+      if (!s3Enabled || !s3Client) {
+        return null;
+      }
+      const s3Key = `uploads/${Date.now()}-${Math.round(Math.random() * 1e9)}${fileExtension}`;
+      const putInput: PutObjectCommandInput = {
+        Bucket: config.s3.bucket,
+        Key: s3Key,
+        Body: fileBuffer,
+        ContentType: contentType,
+      };
+      const acl = process.env.S3_PUT_ACL?.trim();
+      if (acl === "public-read" || acl === "private") {
+        putInput.ACL = acl;
+      }
+      await s3Client.send(new PutObjectCommand(putInput));
+      if (uploadedFile.path && fs.existsSync(uploadedFile.path)) {
+        try {
+          fs.unlinkSync(uploadedFile.path);
+        } catch (unlinkErr) {
+          logger.warn({ err: unlinkErr }, "Failed to delete temporary file");
+        }
+      }
+      logger.info({ s3Key }, "File uploaded to S3");
+      return publicUrlForS3Key(s3Key);
+    };
+
+    const getFileUrl = async (): Promise<string> => {
       try {
-        const fileExtension = path.extname(req.file.originalname).toLowerCase();
-        const contentType = req.file.mimetype || `image/${fileExtension.slice(1)}`;
-        const s3Key = `uploads/${Date.now()}-${Math.round(Math.random() * 1e9)}${fileExtension}`;
-
-        // Omit ACL by default: many buckets use "Bucket owner enforced" and reject ACLs (PutObject fails with AccessControlListNotSupported).
-        // Use a bucket policy for s3:GetObject on uploads/* so the GPU can fetch the URL. Set S3_PUT_ACL=public-read only if the bucket allows ACLs.
-        const putInput: PutObjectCommandInput = {
-          Bucket: config.s3.bucket,
-          Key: s3Key,
-          Body: fileBuffer,
-          ContentType: contentType,
-        };
-        const acl = process.env.S3_PUT_ACL?.trim();
-        if (acl === "public-read" || acl === "private") {
-          putInput.ACL = acl;
+        const s3Url = await uploadToS3();
+        if (s3Url) {
+          return s3Url;
         }
-        await s3Client.send(new PutObjectCommand(putInput));
-
-        imageUrl = publicUrlForS3Key(s3Key);
-        
-        // Clean up local file if it exists (disk storage)
-        if (req.file.path && fs.existsSync(req.file.path)) {
-          try {
-            fs.unlinkSync(req.file.path);
-          } catch (unlinkErr) {
-            logger.warn({ err: unlinkErr }, "Failed to delete temporary file");
-          }
-        }
-        
-        logger.info({ s3Key, url: imageUrl }, "Image uploaded to S3");
       } catch (s3Err: any) {
         const code = s3Err?.Code || s3Err?.name;
         logger.error({ err: s3Err, code }, "S3 upload failed");
-        // In serverless, we can't serve local files, so S3 is required
         if (isVercel) {
           const hint =
             code === "AccessControlListNotSupported"
               ? " Bucket has ACLs disabled — do not set S3_PUT_ACL; add a bucket policy for GetObject on uploads/*."
               : " Add AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, S3_BUCKET, S3_REGION on Vercel; IAM user needs s3:PutObject.";
-          return res.status(500).json({
-            error: `S3 upload failed.${hint}`,
-          });
+          throw new Error(`S3 upload failed.${hint}`);
         }
-        const baseUrl = process.env.BACKEND_URL || `${req.protocol}://${req.get("host")}`;
-        imageUrl = `${baseUrl}/uploads/${req.file.filename}`;
       }
-    } else {
-      // In serverless/Vercel, we need S3 for file storage
+
       if (isVercel) {
-        return res.status(500).json({
-          error:
-            "S3 is required on Vercel. Set AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, S3_BUCKET, and S3_REGION on the backend project.",
-        });
+        throw new Error(
+          "S3 is required on Vercel. Set AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, S3_BUCKET, and S3_REGION on the backend project."
+        );
       }
       const baseUrl = process.env.BACKEND_URL || `${req.protocol}://${req.get("host")}`;
-      imageUrl = `${baseUrl}/uploads/${req.file.filename}`;
-    }
+      return `${baseUrl}/uploads/${uploadedFile.filename}`;
+    };
 
-    res.json({ success: true, url: imageUrl });
+    const fileUrl = await getFileUrl();
+    res.json({ success: true, url: fileUrl });
   } catch (err: any) {
-    logger.error(err, "failed to upload image");
-    res.status(500).json({ error: err.message || "Failed to upload image" });
+    logger.error(err, "failed to upload file");
+    res.status(500).json({ error: err.message || "Failed to upload file" });
   }
-});
+};
+
+threeDRouter.post("/upload-image", requireAuth, uploadFlexible, handleFileUpload);
+threeDRouter.post("/upload-model", requireAuth, uploadFlexible, handleFileUpload);
 
 // ============================================
 // Sync User to Database (requires auth)

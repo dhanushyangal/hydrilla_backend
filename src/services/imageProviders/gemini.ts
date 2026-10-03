@@ -37,10 +37,18 @@ export function buildGeminiBody(
   prompt: string,
   quality: ImageQuality,
   aspect: ImageAspect | null,
-  image?: { mime_type: string; data: string }
+  imageOrImages?: { mime_type: string; data: string } | Array<{ mime_type: string; data: string }>
 ) {
-  const input: GeminiInputBlock[] = [{ type: "text", text: prompt }];
-  if (image) input.push({ type: "image", mime_type: image.mime_type, data: image.data });
+  const input: GeminiInputBlock[] = [];
+  const list = Array.isArray(imageOrImages)
+    ? imageOrImages
+    : imageOrImages
+      ? [imageOrImages]
+      : [];
+  list.forEach((img) => {
+    input.push({ type: "image", mime_type: img.mime_type, data: img.data });
+  });
+  input.push({ type: "text", text: prompt });
   return {
     model: geminiImageModel(quality),
     input,
@@ -58,10 +66,17 @@ export function buildVertexGeminiBody(
   prompt: string,
   quality: ImageQuality,
   aspect: ImageAspect | null,
-  image?: { mime_type: string; data: string }
+  imageOrImages?: { mime_type: string; data: string } | Array<{ mime_type: string; data: string }>
 ) {
   const parts: Array<{ text: string } | { inlineData: { mimeType: string; data: string } }> = [];
-  if (image) parts.push({ inlineData: { mimeType: image.mime_type, data: image.data } });
+  const list = Array.isArray(imageOrImages)
+    ? imageOrImages
+    : imageOrImages
+      ? [imageOrImages]
+      : [];
+  list.forEach((img) => {
+    parts.push({ inlineData: { mimeType: img.mime_type, data: img.data } });
+  });
   parts.push({ text: prompt });
   return {
     contents: [{ role: "user", parts }],
@@ -223,10 +238,10 @@ async function callDeveloper(
   prompt: string,
   quality: ImageQuality,
   aspect: ImageAspect | null,
-  image: { mime_type: string; data: string } | undefined,
+  images: Array<{ mime_type: string; data: string }> | undefined,
   signal: AbortSignal
 ): Promise<GeneratedImage> {
-  const body = buildGeminiBody(prompt, quality, aspect, image);
+  const body = buildGeminiBody(prompt, quality, aspect, images);
   const res = await fetch(`${GEMINI_BASE}/interactions`, {
     method: "POST",
     headers: { "x-goog-api-key": apiKey, "Content-Type": "application/json" },
@@ -260,11 +275,11 @@ async function callVertex(
   prompt: string,
   quality: ImageQuality,
   aspect: ImageAspect | null,
-  image: { mime_type: string; data: string } | undefined,
+  images: Array<{ mime_type: string; data: string }> | undefined,
   signal: AbortSignal
 ): Promise<GeneratedImage> {
   const model = geminiImageModel(quality);
-  const body = buildVertexGeminiBody(prompt, quality, aspect, image);
+  const body = buildVertexGeminiBody(prompt, quality, aspect, images);
   const res = await fetch(`${VERTEX_BASE}/${encodeURIComponent(model)}:generateContent`, {
     method: "POST",
     headers: { "x-goog-api-key": apiKey, "Content-Type": "application/json" },
@@ -299,12 +314,22 @@ export async function geminiGenerate(
   prompt: string,
   quality: ImageQuality,
   aspect: ImageAspect | null,
-  image: InputImage | null,
+  imageOrImages: InputImage | InputImage[] | null,
   signal: AbortSignal
 ): Promise<GeneratedImage> {
-  const imageBlock = image ? { mime_type: image.contentType, data: image.buffer.toString("base64") } : undefined;
+  const imagesList = Array.isArray(imageOrImages)
+    ? imageOrImages
+    : imageOrImages
+      ? [imageOrImages]
+      : [];
+  const imageBlocks = imagesList.length > 0
+    ? imagesList.map((img) => ({
+        mime_type: img.contentType,
+        data: img.buffer.toString("base64"),
+      }))
+    : undefined;
   const call = (backend: GeminiBackend) =>
-    (backend === "vertex" ? callVertex : callDeveloper)(apiKey, prompt, quality, aspect, imageBlock, signal);
+    (backend === "vertex" ? callVertex : callDeveloper)(apiKey, prompt, quality, aspect, imageBlocks, signal);
 
   const forced = forcedBackend();
   if (forced) {

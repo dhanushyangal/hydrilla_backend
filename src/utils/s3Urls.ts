@@ -1,5 +1,35 @@
 import { config } from "../config.js";
 
+const LEGACY_S3_BUCKETS = (process.env.LEGACY_S3_BUCKETS || "hydrilla-outputs")
+  .split(",")
+  .map((bucket) => bucket.trim().toLowerCase())
+  .filter(Boolean);
+
+/**
+ * Extract target URL if input is wrapped in backend /api/3d/image-proxy
+ */
+export function unwrapImageProxyUrl(url: string | null | undefined): string | null {
+  if (!url) {
+    return null;
+  }
+  const s = url.trim();
+  if (s.includes("/api/3d/image-proxy")) {
+    try {
+      const parsed = new URL(s, "http://localhost");
+      const real = parsed.searchParams.get("url");
+      if (real) {
+        return real;
+      }
+    } catch {
+      const idx = s.indexOf("?url=");
+      if (idx !== -1) {
+        return decodeURIComponent(s.slice(idx + 5));
+      }
+    }
+  }
+  return s;
+}
+
 /**
  * Construct direct S3 URL for a job's GLB file
  * Structure: image/{jobId}/mesh.glb
@@ -63,7 +93,7 @@ export function normalizeGlbUrl(jobId: string, apiUrl: string | null | undefined
  * If no URL provided, returns preview path (for text-to-image previews)
  */
 export function normalizePreviewUrl(jobId: string, apiUrl: string | null | undefined): string | null {
-  if (!apiUrl) {
+  if (!apiUrl || !apiUrl.trim()) {
     // If no URL provided, try preview path first (for text-to-image previews)
     return getDirectS3PreviewImageUrl(jobId);
   }
@@ -73,15 +103,20 @@ export function normalizePreviewUrl(jobId: string, apiUrl: string | null | undef
     return apiUrl;
   }
 
-  const urlWithoutParams = apiUrl.split("?")[0];
+  const unwrapped = unwrapImageProxyUrl(apiUrl) || apiUrl;
+  const urlWithoutParams = unwrapped.split("?")[0];
 
-  // If the URL points to our S3 bucket with known paths, return as-is (no query params)
-  if (apiUrl.includes(config.s3.bucket)) {
+  // If the URL points to our S3 bucket or legacy buckets
+  const isBucketMatch = [config.s3.bucket, ...LEGACY_S3_BUCKETS].some((b) => {
+    return Boolean(b && unwrapped.toLowerCase().includes(b.toLowerCase()));
+  });
+
+  if (isBucketMatch) {
     if (
-      apiUrl.includes("/preview/") ||
-      apiUrl.includes("/image/") ||
-      apiUrl.includes("/edit/") ||
-      apiUrl.includes("/combined/")
+      unwrapped.includes("/preview/") ||
+      unwrapped.includes("/image/") ||
+      unwrapped.includes("/edit/") ||
+      unwrapped.includes("/combined/")
     ) {
       return urlWithoutParams;
     }
@@ -89,11 +124,16 @@ export function normalizePreviewUrl(jobId: string, apiUrl: string | null | undef
 
   // Gateway output URLs — image lives on the GPU disk; do not rewrite to S3.
   if (
-    apiUrl.includes("/outputs/preview/") ||
-    apiUrl.includes("/outputs/image/") ||
-    apiUrl.includes("/outputs/edit/") ||
-    apiUrl.includes("/outputs/combined/")
+    unwrapped.includes("/outputs/preview/") ||
+    unwrapped.includes("/outputs/image/") ||
+    unwrapped.includes("/outputs/edit/") ||
+    unwrapped.includes("/outputs/combined/")
   ) {
+    return urlWithoutParams;
+  }
+
+  // If it's already an absolute HTTP/HTTPS URL, preserve it
+  if (unwrapped.startsWith("http://") || unwrapped.startsWith("https://")) {
     return urlWithoutParams;
   }
 

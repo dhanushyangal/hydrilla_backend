@@ -52,6 +52,7 @@ export interface JobRecord {
   sculptSpec?: Record<string, unknown> | null;
   /** Wall-clock generate time. Null while running; never inferred from updated_at. */
   durationMs?: number | null;
+  source?: "web" | "api" | string;
   createdAt: Date;
   updatedAt: Date;
 }

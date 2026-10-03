@@ -134,23 +134,34 @@ export async function listWorkspacesForUser(userId: string, limit = 50): Promise
 
     const workspaceIds = activeWorkspaces.map((ws) => ws.id);
 
-    // Single batched query: all jobs in these workspaces, ordered by created_at (for "first job" per workspace)
+    // Single batched query: all jobs in these workspaces, ordered by created_at desc to find latest assets
     const { data: jobsData, error: jobsError } = await supabase
       .from("jobs")
-      .select("workspace_id, preview_image_url, image_url, prompt, created_at")
+      .select("workspace_id, preview_image_url, image_url, prompt, created_at, status")
       .in("workspace_id", workspaceIds)
-      .order("created_at", { ascending: true });
+      .order("created_at", { ascending: false });
 
     if (jobsError) {
       logger.warn({ err: jobsError }, "Error fetching jobs for workspaces batch");
     }
 
-    // First job per workspace (already ordered by created_at asc)
+    // Best preview job per workspace: prioritize jobs that have an actual image
     const firstJobByWorkspace: Record<string, { preview_image_url?: string; image_url?: string; prompt?: string }> = {};
     if (jobsData) {
       for (const job of jobsData) {
         const wid = job.workspace_id;
-        if (wid && !firstJobByWorkspace[wid]) {
+        if (!wid) {
+          continue;
+        }
+        const hasImg = Boolean(job.preview_image_url || job.image_url);
+        const existing = firstJobByWorkspace[wid];
+        if (!existing) {
+          firstJobByWorkspace[wid] = {
+            preview_image_url: job.preview_image_url,
+            image_url: job.image_url,
+            prompt: job.prompt,
+          };
+        } else if (!existing.preview_image_url && !existing.image_url && hasImg) {
           firstJobByWorkspace[wid] = {
             preview_image_url: job.preview_image_url,
             image_url: job.image_url,
@@ -165,22 +176,30 @@ export async function listWorkspacesForUser(userId: string, limit = 50): Promise
     if (jobsData) {
       for (const job of jobsData) {
         const wid = job.workspace_id;
-        if (wid) jobCountByWorkspace[wid] = (jobCountByWorkspace[wid] || 0) + 1;
+        if (wid) {
+          jobCountByWorkspace[wid] = (jobCountByWorkspace[wid] || 0) + 1;
+        }
       }
     }
 
     const workspacesWithPreview = activeWorkspaces.map((ws) => {
       const record = mapRow(ws);
       const firstJob = firstJobByWorkspace[ws.id];
-      let previewImageUrl = firstJob?.preview_image_url || firstJob?.image_url || null;
-      if (previewImageUrl) {
-        const jobIdMatch = previewImageUrl.match(/\/(preview|image|edit|combined)\/([^\/\?]+)/);
-        if (jobIdMatch && jobIdMatch[2]) {
-          previewImageUrl = normalizePreviewUrl(jobIdMatch[2], previewImageUrl);
-        } else if (previewImageUrl.includes("amazonaws.com")) {
-          previewImageUrl = previewImageUrl.split("?")[0];
+      const rawUrl = firstJob?.preview_image_url || firstJob?.image_url || null;
+      const previewImageUrl = (() => {
+        if (!rawUrl) {
+          return null;
         }
-      }
+        const jobIdMatch = rawUrl.match(/\/(preview|image|edit|combined)\/([^\/\?]+)/);
+        if (jobIdMatch && jobIdMatch[2]) {
+          return normalizePreviewUrl(jobIdMatch[2], rawUrl);
+        }
+        if (rawUrl.includes("amazonaws.com")) {
+          return rawUrl.split("?")[0];
+        }
+        return rawUrl;
+      })();
+
       return {
         ...record,
         firstJobPreviewImageUrl: previewImageUrl,

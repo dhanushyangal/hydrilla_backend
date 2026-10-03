@@ -142,8 +142,8 @@ check("quality defaults to low", parseImageQuality("") === "low");
 check("quality rejects unknown", parseImageQuality("ultra") === null);
 check("aspect defaults to 1:1", parseImageAspect(undefined) === "1:1");
 check("aspect rejects unknown", parseImageAspect("16:9") === null);
-check("text-to-image credits 2 / 5", IMAGE_CREDITS["text-to-image"].low === 2 && IMAGE_CREDITS["text-to-image"].high === 5);
-check("edit credits 3 / 6", IMAGE_CREDITS.edit.low === 3 && IMAGE_CREDITS.edit.high === 6);
+check("text-to-image credits 15 / 20", IMAGE_CREDITS["text-to-image"].low === 15 && IMAGE_CREDITS["text-to-image"].high === 20);
+check("edit credits 15 / 20", IMAGE_CREDITS.edit.low === 15 && IMAGE_CREDITS.edit.high === 20);
 
 if (failures > 0) {
   console.error(`\n${failures} check(s) failed`);

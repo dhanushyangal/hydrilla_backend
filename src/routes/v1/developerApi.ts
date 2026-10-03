@@ -16,13 +16,17 @@ import {
   parseImageAspect,
   parseImageProvider,
   parseImageQuality,
+  runWithUsage,
+  summarizeUsage,
   type ImageAspect,
   type ImageProvider,
   type ImageQuality,
   type InputImage,
+  type UsageCall,
 } from "../../services/imageProviders/index.js";
 import { createJob, getJob, updateJobStatus } from "../../repository/jobs.js";
 import { recordDeveloperApiKeyUsage } from "../../repository/developerApiKeys.js";
+import { recordImageUsage, type ImageUsageRecord } from "../../repository/imageUsage.js";
 import { uploadBufferToS3 } from "../../lib/s3Upload.js";
 import { normalizeGlbUrl } from "../../utils/s3Urls.js";
 import { logger } from "../../logger.js";
@@ -33,7 +37,21 @@ const upload = multer({
   limits: { fileSize: 30 * 1024 * 1024 },
 });
 
-const CREDITS_3D = 10;
+const CREDITS_3D = 30;
+
+function saveApiImageUsage(record: Omit<ImageUsageRecord, "usage">, calls: UsageCall[]): void {
+  if (record.status === "failed" && calls.length === 0) {
+    return;
+  }
+  const usage = summarizeUsage(calls);
+  recordImageUsage({ ...record, source: "api", usage }).catch((err: unknown) => {
+    const errMsg = err instanceof Error ? err.message : String(err);
+    logger.warn(
+      { err: errMsg, jobId: record.jobId, userId: record.userId, costUsd: usage.costUsd },
+      "Failed to record API image usage (non-critical)"
+    );
+  });
+}
 
 function trackKeyUsage(
   req: Request,
@@ -167,6 +185,7 @@ developerV1Router.post(
         generateType: "ImageTo3D",
         status: "WAIT",
         creditsUsed: CREDITS_3D,
+        source: "api",
       });
 
       trackKeyUsage(req, "/v1/3d/image-to-3d", 200, CREDITS_3D, {
@@ -257,14 +276,33 @@ developerV1Router.post(
       return;
     }
 
+    const usageCalls: UsageCall[] = [];
     try {
       // Step A: Generate concept reference image
-      const generatedImage = await generateImage({
-        provider,
-        quality,
-        aspect,
-        prompt,
+      const generatedImage = await runWithUsage(usageCalls, async () => {
+        return await generateImage({
+          provider,
+          quality,
+          aspect,
+          prompt,
+        });
       });
+
+      saveApiImageUsage(
+        {
+          userId,
+          jobId: null,
+          operation: "text-to-image",
+          provider,
+          model: generatedImage.model,
+          quality,
+          status: "succeeded",
+          errorCode: null,
+          creditsCharged: imageCredits,
+          source: "api",
+        },
+        usageCalls
+      );
 
       const previewKey = `preview/dev_${randomUUID()}.png`;
       const previewUrl = await uploadBufferToS3(
@@ -297,6 +335,7 @@ developerV1Router.post(
         creditsUsed: totalCredits,
         llmProvider: provider,
         llmModel: generatedImage.model,
+        source: "api",
       });
 
       trackKeyUsage(req, "/v1/3d/text-to-3d", 200, totalCredits, {
@@ -322,6 +361,23 @@ developerV1Router.post(
       });
     } catch (err: unknown) {
       await refundCredit(userId, totalCredits);
+      if (usageCalls.length > 0) {
+        saveApiImageUsage(
+          {
+            userId,
+            jobId: null,
+            operation: "text-to-image",
+            provider,
+            model: usageCalls.filter((c) => c.kind === "image").at(-1)?.model ?? null,
+            quality,
+            status: "failed",
+            errorCode: "GENERATION_FAILED",
+            creditsCharged: 0,
+            source: "api",
+          },
+          usageCalls
+        );
+      }
       const message = err instanceof Error ? err.message : "Failed to execute text-to-3d generation";
       logger.error({ err, userId }, "Developer text-to-3d failed");
       trackKeyUsage(req, "/v1/3d/text-to-3d", 500, 0, {
@@ -377,6 +433,27 @@ async function handleGetTask(req: Request, res: Response) {
       },
     });
     return;
+  }
+
+  // 16-minute timeout check:
+  // If task has been running/waiting for >= 16 minutes, expire it and refund automatically.
+  const ageMs = Date.now() - new Date(job.createdAt).getTime();
+  const isTimedOut = (job.status === "WAIT" || job.status === "RUN") && ageMs >= 16 * 60 * 1000;
+  if (isTimedOut) {
+    const refundAmount = job.creditsUsed > 0 ? job.creditsUsed : CREDITS_3D;
+    const timeoutMsg = "Generation timed out. Credits have been automatically refunded.";
+    await updateJobStatus(taskId, {
+      status: "FAIL",
+      errorCode: "GENERATION_TIMEOUT",
+      errorMessage: timeoutMsg,
+      creditsUsed: 0,
+    });
+    if (refundAmount > 0) {
+      await refundCredit(userId, refundAmount);
+    }
+    job.status = "FAIL";
+    job.errorMessage = timeoutMsg;
+    job.creditsUsed = 0;
   }
 
   // If still in progress, check live GPU status
@@ -460,12 +537,20 @@ async function handleCancelTask(req: Request, res: Response) {
     return;
   }
 
+  const wasInFlight = job.status === "WAIT" || job.status === "RUN" || !job.status;
+  const refundAmount = wasInFlight && job.creditsUsed > 0 ? job.creditsUsed : 0;
+
   await cancelGpuJob(taskId);
   await updateJobStatus(taskId, {
     status: "FAIL",
     errorCode: "CANCELLED",
-    errorMessage: "Job cancelled by user",
+    errorMessage: "Job cancelled by user. Credits have been automatically refunded.",
+    creditsUsed: refundAmount > 0 ? 0 : undefined,
   });
+
+  if (refundAmount > 0) {
+    await refundCredit(userId, refundAmount);
+  }
 
   trackKeyUsage(req, "/v1/3d/tasks", 200, 0, {
     taskId,
@@ -529,17 +614,36 @@ developerV1Router.post(
         };
       }
 
+      const usageCalls: UsageCall[] = [];
       try {
-        const generated = await generateImage({
-          provider,
-          quality,
-          aspect,
-          prompt,
+        const generated = await runWithUsage(usageCalls, async () => {
+          return await generateImage({
+            provider,
+            quality,
+            aspect,
+            prompt,
+          });
         });
 
         const imageId = `img_${randomUUID()}`;
         const s3Key = `preview/${imageId}.png`;
         const imageUrl = await uploadBufferToS3(generated.bytes, s3Key, generated.mime);
+
+        saveApiImageUsage(
+          {
+            userId,
+            jobId: null,
+            operation: "text-to-image",
+            provider,
+            model: generated.model,
+            quality,
+            status: "succeeded",
+            errorCode: null,
+            creditsCharged: credits,
+            source: "api",
+          },
+          usageCalls
+        );
 
         return {
           status: 200,
@@ -557,6 +661,23 @@ developerV1Router.post(
         };
       } catch (err: unknown) {
         await refundCredit(userId, credits);
+        if (usageCalls.length > 0) {
+          saveApiImageUsage(
+            {
+              userId,
+              jobId: null,
+              operation: "text-to-image",
+              provider,
+              model: usageCalls.filter((c) => c.kind === "image").at(-1)?.model ?? null,
+              quality,
+              status: "failed",
+              errorCode: "GENERATION_FAILED",
+              creditsCharged: 0,
+              source: "api",
+            },
+            usageCalls
+          );
+        }
         const message = err instanceof Error ? err.message : "Failed to generate image";
         logger.error({ err, userId }, "Developer image generation failed");
         return {
@@ -642,6 +763,7 @@ developerV1Router.post(
       return;
     }
 
+    const usageCalls: UsageCall[] = [];
     try {
       const inputBufferData = await (async (): Promise<InputImage> => {
         if (file) {
@@ -658,17 +780,35 @@ developerV1Router.post(
         throw new Error("Either an 'image' file upload or 'image_url' is required.");
       })();
 
-      const edited = await generateImage({
-        provider,
-        quality,
-        aspect: "1:1",
-        prompt,
-        inputImage: inputBufferData,
+      const edited = await runWithUsage(usageCalls, async () => {
+        return await generateImage({
+          provider,
+          quality,
+          aspect: "1:1",
+          prompt,
+          inputImage: inputBufferData,
+        });
       });
 
       const imageId = `edit_${randomUUID()}`;
       const s3Key = `edit/${imageId}.png`;
       const imageUrl = await uploadBufferToS3(edited.bytes, s3Key, edited.mime);
+
+      saveApiImageUsage(
+        {
+          userId,
+          jobId: null,
+          operation: "edit",
+          provider,
+          model: edited.model,
+          quality,
+          status: "succeeded",
+          errorCode: null,
+          creditsCharged: credits,
+          source: "api",
+        },
+        usageCalls
+      );
 
       trackKeyUsage(req, "/v1/images/edit", 200, credits, {
         imageId,
@@ -690,6 +830,23 @@ developerV1Router.post(
       });
     } catch (err: unknown) {
       await refundCredit(userId, credits);
+      if (usageCalls.length > 0) {
+        saveApiImageUsage(
+          {
+            userId,
+            jobId: null,
+            operation: "edit",
+            provider,
+            model: usageCalls.filter((c) => c.kind === "image").at(-1)?.model ?? null,
+            quality,
+            status: "failed",
+            errorCode: "EDIT_FAILED",
+            creditsCharged: 0,
+            source: "api",
+          },
+          usageCalls
+        );
+      }
       const message = err instanceof Error ? err.message : "Failed to edit image";
       logger.error({ err, userId }, "Developer image edit failed");
       trackKeyUsage(req, "/v1/images/edit", 500, 0, {

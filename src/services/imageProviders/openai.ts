@@ -160,15 +160,22 @@ export async function openAIEdit(
   apiKey: string,
   prompt: string,
   quality: ImageQuality,
-  image: InputImage,
+  imageOrImages: InputImage | InputImage[],
   signal: AbortSignal
 ): Promise<GeneratedImage> {
+  const images = Array.isArray(imageOrImages) ? imageOrImages : [imageOrImages];
   const fields = buildOpenAIEditFields(prompt, quality);
   const form = new FormData();
   for (const [k, v] of Object.entries(fields)) {
     form.append(k, v);
   }
-  form.append("image", new Blob([new Uint8Array(image.buffer)], { type: image.contentType }), image.filename);
+  for (const img of images) {
+    form.append(
+      "image",
+      new Blob([new Uint8Array(img.buffer)], { type: img.contentType }),
+      img.filename
+    );
+  }
 
   const res = await fetch(`${OPENAI_BASE}/images/edits`, {
     method: "POST",
@@ -177,9 +184,23 @@ export async function openAIEdit(
     signal,
   });
   if (!res.ok) {
+    // If the endpoint strictly expects a single image file (400), fall back to primary front view
+    if (images.length > 1 && res.status === 400) {
+      return await openAIEdit(apiKey, prompt, quality, images[0], signal);
+    }
     throw await toProviderError(res);
   }
   const json = await res.json();
   recordUsage("image", "openai", fields.model, openAIImageUsage(json?.usage));
   return readImage(json, fields.model);
+}
+
+export async function openAIMultiViewEdit(
+  apiKey: string,
+  prompt: string,
+  quality: ImageQuality,
+  images: InputImage[],
+  signal: AbortSignal
+): Promise<GeneratedImage> {
+  return await openAIEdit(apiKey, prompt, quality, images, signal);
 }
