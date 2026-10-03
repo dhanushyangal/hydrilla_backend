@@ -19,6 +19,7 @@ import pinoHttp from "pino-http";
 // (Vercel reads this export statically, so it stays a literal).
 export const config = {
   maxDuration: 60,
+  
 };
 
 // Initialize database connection
