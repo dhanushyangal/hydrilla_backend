@@ -173,8 +173,8 @@ export async function syncJobFromApi(jobId: string): Promise<boolean> {
       
       if (!response.ok) {
         if (response.status === 404) {
-          // If job not found in API but is a preview-only job, that's OK
-          if (dbJob.previewImageUrl && !dbJob.resultGlbUrl) {
+          // If job not found in API but is already completed with only a preview image, that's OK
+          if (dbJob.previewImageUrl && !dbJob.resultGlbUrl && dbJob.status === "DONE") {
             logger.debug({ jobId }, "Preview-only job not in API (expected)");
             return true;
           }
@@ -414,11 +414,7 @@ export async function syncAllJobs(): Promise<{ synced: number; failed: number }>
 
     // Repository filtering excludes Code Sculpt and other non-GPU jobs.
     const jobs = await getJobsToSync();
-    // Filter out preview-only jobs (they don't exist in Python API)
-    const activeJobs = jobs.filter((job) => 
-      (job.status === "WAIT" || job.status === "RUN") && 
-      !(job.previewImageUrl && !job.resultGlbUrl) // Exclude preview-only jobs
-    );
+    const activeJobs = jobs.filter((job) => job.status === "WAIT" || job.status === "RUN");
 
     if (activeJobs.length === 0) {
       return { synced: 0, failed: 0 };

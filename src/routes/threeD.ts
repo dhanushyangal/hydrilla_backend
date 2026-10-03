@@ -1269,6 +1269,7 @@ threeDRouter.post("/edit-image", requireAuth, uploadFlexible, async (req, res) =
 // Get Job Status (optional auth for viewing)
 // ============================================
 threeDRouter.get("/status/:jobId", requireAuth, async (req, res) => {
+  res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate");
   const { jobId } = req.params;
   const userId = req.userId;
 
@@ -1289,14 +1290,13 @@ threeDRouter.get("/status/:jobId", requireAuth, async (req, res) => {
       });
     }
 
-    // If job exists and is completed, return it immediately (no need to check external API)
-    // Also return immediately for preview-only jobs (they don't exist in Python API)
+    // If job exists and is completed or failed, return it immediately (no need to check external API)
+    // Also return immediately for 2D provider image jobs (they don't exist in Python API)
     if (
       job &&
       (job.status === "DONE" ||
         job.status === "FAIL" ||
-        PROVIDER_IMAGE_TYPES.includes(job.generateType as GenerateType) ||
-        (job.previewImageUrl && !job.resultGlbUrl))
+        PROVIDER_IMAGE_TYPES.includes(job.generateType as GenerateType))
     ) {
       // Check ownership
       if (denyIfNotJobOwner(job, userId, res)) {
