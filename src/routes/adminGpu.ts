@@ -104,9 +104,25 @@ adminGpuRouter.post("/trim-memory", async (_req, res) => {
 
 adminGpuRouter.post("/clear-queue", async (_req, res) => {
   try {
-    let clearedCount = 0;
+    const clearedTracker = { count: 0 };
 
-    // 1. Try native VM clear-queue endpoint
+    // 1. Fetch current GPU system info to identify the active generation job (if any)
+    const sysRes = await fetch(
+      `${config.gpuGateway.url}/admin/system`,
+      withInternalSecretHeaders({ signal: AbortSignal.timeout(5000) })
+    ).catch(() => null);
+
+    const currentlyProcessingId = await (async () => {
+      if (!sysRes || !sysRes.ok) {
+        return null;
+      }
+      const sysData = (await sysRes.json().catch(() => ({}))) as {
+        queue?: { processing_job_id?: string | null; waiting_jobs?: number };
+      };
+      return sysData.queue?.processing_job_id || null;
+    })();
+
+    // 2. Call native VM clear-queue endpoint (purges waiting jobs in job_queue only, leaves active job alone)
     const vmRes = await fetch(
       `${config.gpuGateway.url}/admin/clear-queue`,
       withInternalSecretHeaders({
@@ -115,45 +131,40 @@ adminGpuRouter.post("/clear-queue", async (_req, res) => {
       })
     ).catch(() => null);
 
-    if (vmRes && vmRes.ok) {
-      const vmBody = (await vmRes.json().catch(() => ({}))) as { cleared_jobs?: number };
-      clearedCount += vmBody.cleared_jobs || 0;
-    }
-
-    // 2. Fetch current processing job from GPU system info and cancel it if requested/stuck
-    const sysRes = await fetch(
-      `${config.gpuGateway.url}/admin/system`,
-      withInternalSecretHeaders({ signal: AbortSignal.timeout(5000) })
-    ).catch(() => null);
-
-    if (sysRes && sysRes.ok) {
-      const sysData = (await sysRes.json().catch(() => ({}))) as {
-        queue?: { processing_job_id?: string | null; waiting_jobs?: number };
-      };
-      if (sysData.queue?.processing_job_id) {
-        await fetch(
-          `${config.gpuGateway.url}/cancel/${sysData.queue.processing_job_id}`,
-          withInternalSecretHeaders({
-            method: "POST",
-            signal: AbortSignal.timeout(5000),
-          })
-        ).catch(() => null);
-        clearedCount += 1;
+    const vmClearedIds = await (async () => {
+      if (!vmRes || !vmRes.ok) {
+        return [] as string[];
       }
-    }
+      const vmBody = (await vmRes.json().catch(() => ({}))) as {
+        cleared_jobs?: number;
+        cleared_job_ids?: string[];
+      };
+      clearedTracker.count += vmBody.cleared_jobs || 0;
+      if (Array.isArray(vmBody.cleared_job_ids)) {
+        return vmBody.cleared_job_ids;
+      }
+      return [];
+    })();
 
-    // 3. Find any pending/waiting jobs in Supabase database from the last 48 hours
+    // 3. Find any queued/waiting jobs in Supabase from the last 48 hours (ONLY status "WAIT", never active running jobs)
     const cutoff = new Date(Date.now() - 48 * 60 * 60 * 1000).toISOString();
     const { data: pendingJobs } = await supabase
       .from("jobs")
-      .select("id, status, user_id")
-      .in("status", ["WAIT", "RUNNING"])
+      .select("id, status, user_id, credits_used")
+      .eq("status", "WAIT")
       .gte("created_at", cutoff);
 
-    const pendingList = pendingJobs || [];
-    if (pendingList.length > 0) {
+    // Ensure currently running job is strictly excluded
+    const waitingList = (pendingJobs || []).filter((job) => {
+      return job.id !== currentlyProcessingId;
+    });
+
+    if (waitingList.length > 0) {
       await Promise.allSettled(
-        pendingList.map(async (job) => {
+        waitingList.map(async (job) => {
+          if (vmClearedIds.includes(job.id)) {
+            return;
+          }
           return fetch(
             `${config.gpuGateway.url}/cancel/${job.id}`,
             withInternalSecretHeaders({
@@ -174,14 +185,30 @@ adminGpuRouter.post("/clear-queue", async (_req, res) => {
         })
         .in(
           "id",
-          pendingList.map((j) => j.id)
+          waitingList.map((j) => j.id)
         );
 
-      clearedCount += pendingList.length;
+      // Refund credits for cancelled waiting jobs
+      const { refundCredit } = await import("../services/credits.js");
+      await Promise.allSettled(
+        waitingList.map(async (job) => {
+          const creditsToRefund = job.credits_used ?? 0;
+          if (creditsToRefund > 0 && job.user_id) {
+            await refundCredit(job.user_id, creditsToRefund).catch(() => null);
+          }
+        })
+      );
+
+      // Add to tracker if not already counted by vmClearedIds
+      for (const w of waitingList) {
+        if (!vmClearedIds.includes(w.id)) {
+          clearedTracker.count += 1;
+        }
+      }
     }
 
-    // 4. Also scan recent user jobs on GPU gateway to cancel any lingering pending items
-    const userIds = Array.from(new Set(pendingList.map((j) => j.user_id).filter(Boolean)));
+    // 4. Also scan recent user jobs on GPU gateway for any lingering pending (waiting) items
+    const userIds = Array.from(new Set(waitingList.map((j) => j.user_id).filter(Boolean)));
     for (const uid of userIds) {
       const uRes = await fetch(
         `${config.gpuGateway.url}/jobs/user/${uid}`,
@@ -191,31 +218,46 @@ adminGpuRouter.post("/clear-queue", async (_req, res) => {
         const uData = (await uRes.json().catch(() => ({}))) as {
           jobs?: Array<{ job_id: string; status: string }>;
         };
-        const active = (uData.jobs || []).filter(
-          (j) => j.status === "pending" || j.status === "processing"
-        );
-        for (const aj of active) {
-          await fetch(
-            `${config.gpuGateway.url}/cancel/${aj.job_id}`,
-            withInternalSecretHeaders({
-              method: "POST",
-              signal: AbortSignal.timeout(5000),
-            })
-          ).catch(() => null);
-          clearedCount += 1;
+        // ONLY cancel 'pending' waiting jobs; NEVER cancel 'processing' (the active job)
+        const pendingOnVm = (uData.jobs || []).filter((j) => {
+          return j.status === "pending" && j.job_id !== currentlyProcessingId;
+        });
+        for (const pj of pendingOnVm) {
+          if (!vmClearedIds.includes(pj.job_id) && !waitingList.some((w) => w.id === pj.job_id)) {
+            await fetch(
+              `${config.gpuGateway.url}/cancel/${pj.job_id}`,
+              withInternalSecretHeaders({
+                method: "POST",
+                signal: AbortSignal.timeout(5000),
+              })
+            ).catch(() => null);
+            clearedTracker.count += 1;
+          }
         }
       }
     }
 
-    logger.info({ clearedCount }, "Admin cleared GPU queue");
+    const totalCleared = clearedTracker.count;
+    logger.info({ totalCleared, keptRunningJobId: currentlyProcessingId }, "Admin cleared GPU queue (active job preserved)");
+
+    const message = (() => {
+      if (totalCleared > 0) {
+        if (currentlyProcessingId) {
+          return `Successfully cleared ${totalCleared} waiting job(s) from the queue. Currently active generation is still running.`;
+        }
+        return `Successfully cleared ${totalCleared} waiting job(s) from the queue`;
+      }
+      if (currentlyProcessingId) {
+        return "Queue is empty. Active job is currently running on the GPU.";
+      }
+      return "Queue is already empty";
+    })();
 
     return res.json({
       status: "ok",
-      cleared_jobs: clearedCount,
-      message:
-        clearedCount > 0
-          ? `Successfully cleared ${clearedCount} job(s) from the queue`
-          : "Queue is already empty",
+      cleared_jobs: totalCleared,
+      active_job_id: currentlyProcessingId,
+      message,
     });
   } catch (err) {
     logger.error({ err: errorMessage(err) }, "Failed to clear GPU queue");
