@@ -889,7 +889,7 @@ developerV1Router.get("/models", requireDeveloperAuth, async (req: Request, res:
         provider: "openai",
         quality: "high",
         name: "OpenAI Image (High Fidelity)",
-        description: "2048x2048 high-resolution 2D concept generation using gpt-image-2.5-sunburst.",
+        description: "2048x2048 high-resolution 2D concept generation using gpt-image-2.5-flare (high quality).",
         credit_cost: IMAGE_CREDITS["text-to-image"]["high"],
       },
       {
@@ -909,7 +909,7 @@ developerV1Router.get("/models", requireDeveloperAuth, async (req: Request, res:
         provider: "gemini",
         quality: "high",
         name: "Gemini Image (2K Cinematic)",
-        description: "2K resolution concept generation using Google gemini-3-pro-image.",
+        description: "2K resolution concept generation using Google gemini-3.1-flash-image.",
         credit_cost: IMAGE_CREDITS["text-to-image"]["high"],
       },
       {

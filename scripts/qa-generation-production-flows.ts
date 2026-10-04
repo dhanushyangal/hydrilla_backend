@@ -89,7 +89,7 @@ async function runAllQaFlows(): Promise<void> {
     const lowCost = IMAGE_CREDITS["text-to-image"]["low"];
     const highCost = IMAGE_CREDITS["text-to-image"]["high"];
     assert("Cloud T2I Low charges 15 credits", lowCost === 15);
-    assert("Cloud T2I High charges 20 credits", highCost === 20);
+    assert("Cloud T2I High charges 30 credits", highCost === 30);
 
     // OpenAI image size mapping
     const lowSize = OPENAI_SIZES["low"]["1:1"];
@@ -304,13 +304,13 @@ async function runAllQaFlows(): Promise<void> {
     const imageTo3DUltra = 40;
 
     assert("T2I Low cost is 15", t2iLow === 15);
-    assert("T2I High cost is 20", t2iHigh === 20);
+    assert("T2I High cost is 30", t2iHigh === 30);
     assert("Edit Low cost is 15", editLow === 15);
-    assert("Edit High cost is 20", editHigh === 20);
+    assert("Edit High cost is 30", editHigh === 30);
     assert("ImageTo3D Standard cost is 30", imageTo3DStandard === 30);
     assert("ImageTo3D Ultra cost is 40", imageTo3DUltra === 40);
     assert("TextTo3D Standard total cost is 45", t2iLow + imageTo3DStandard === 45);
-    assert("TextTo3D Ultra total cost is 60", t2iHigh + imageTo3DUltra === 60);
+    assert("TextTo3D Ultra total cost is 70", t2iHigh + imageTo3DUltra === 70);
 
     // Credit limit boundary check
     const checkLimit = (total: number, used: number, required: number): boolean => {

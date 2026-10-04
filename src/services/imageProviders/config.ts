@@ -12,8 +12,8 @@ export const DEFAULT_IMAGE_QUALITY: ImageQuality = "low";
 export const DEFAULT_IMAGE_ASPECT: ImageAspect = "1:1";
 
 export const IMAGE_CREDITS: Record<ImageOperation, Record<ImageQuality, number>> = {
-  "text-to-image": { low: 15, high: 20 },
-  edit: { low: 15, high: 20 },
+  "text-to-image": { low: 15, high: 30 },
+  edit: { low: 15, high: 30 },
 };
 
 function envModel(name: string, fallback: string): string {
@@ -22,18 +22,21 @@ function envModel(name: string, fallback: string): string {
 
 export function openAIImageModel(quality: ImageQuality): string {
   return quality === "high"
-    ? envModel("OPENAI_IMAGE_MODEL_HIGH", "gpt-image-2.5-sunburst")
+    ? envModel("OPENAI_IMAGE_MODEL_HIGH", "gpt-image-2.5-flare")
     : envModel("OPENAI_IMAGE_MODEL_LOW", "gpt-image-2.5-flare");
 }
 
 export function geminiImageModel(quality: ImageQuality): string {
   return quality === "high"
-    ? envModel("GEMINI_IMAGE_MODEL_HIGH", "gemini-3-pro-image")
+    ? envModel("GEMINI_IMAGE_MODEL_HIGH", "gemini-3.1-flash-image")
     : envModel("GEMINI_IMAGE_MODEL_LOW", "gemini-3.1-flash-image");
 }
 
 /** OpenAI `quality` per tier (gpt-image-2.5 accepts low|medium|high|xhigh|max|auto). */
-export const OPENAI_QUALITY: Record<ImageQuality, string> = { low: "medium", high: "high" };
+export const OPENAI_QUALITY: Record<ImageQuality, string> = {
+  low: process.env.OPENAI_IMAGE_QUALITY_LOW?.trim() || "medium",
+  high: process.env.OPENAI_IMAGE_QUALITY_HIGH?.trim() || "medium",
+};
 
 /** OpenAI sizes must be multiples of 16, ratio within 1:3..3:1, 655,360..8,294,400 px, edge <= 3840. */
 export const OPENAI_SIZES: Record<ImageQuality, Record<ImageAspect, string>> = {

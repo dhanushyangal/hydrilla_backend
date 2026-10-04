@@ -19,14 +19,22 @@ function errorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
-async function fetchVmSystem(): Promise<{ reachable: boolean; data: unknown; error: string | null }> {
+async function fetchVmSystem(): Promise<{
+  reachable: boolean;
+  data: unknown;
+  error: string | null;
+}> {
   try {
     const res = await fetch(
       `${config.gpuGateway.url}/admin/system`,
-      withInternalSecretHeaders({ signal: AbortSignal.timeout(8000) })
+      withInternalSecretHeaders({ signal: AbortSignal.timeout(8000) }),
     );
     if (!res.ok) {
-      return { reachable: false, data: null, error: `GPU service returned ${res.status}` };
+      return {
+        reachable: false,
+        data: null,
+        error: `GPU service returned ${res.status}`,
+      };
     }
     return { reachable: true, data: await res.json(), error: null };
   } catch (err) {
@@ -34,7 +42,11 @@ async function fetchVmSystem(): Promise<{ reachable: boolean; data: unknown; err
   }
 }
 
-async function fetchInstance(): Promise<{ configured: boolean; data: unknown; error: string | null }> {
+async function fetchInstance(): Promise<{
+  configured: boolean;
+  data: unknown;
+  error: string | null;
+}> {
   if (!isGcpComputeConfigured()) {
     return { configured: false, data: null, error: null };
   }
@@ -67,18 +79,28 @@ adminGpuRouter.post("/restart", async (req, res) => {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ mode }),
         signal: AbortSignal.timeout(10_000),
-      })
+      }),
     );
-    const body = (await vmRes.json().catch(() => ({}))) as { detail?: string; message?: string; status?: string };
+    const body = (await vmRes.json().catch(() => ({}))) as {
+      detail?: string;
+      message?: string;
+      status?: string;
+    };
     if (!vmRes.ok) {
-      return res.status(502).json({ error: body.detail || `GPU service returned ${vmRes.status}` });
+      return res
+        .status(502)
+        .json({ error: body.detail || `GPU service returned ${vmRes.status}` });
     }
-    logger.info({ mode, result: body.status }, "Admin requested GPU service restart");
+    logger.info(
+      { mode, result: body.status },
+      "Admin requested GPU service restart",
+    );
     return res.json(body);
   } catch (err) {
     logger.warn({ err: errorMessage(err) }, "Admin GPU restart failed");
     return res.status(502).json({
-      error: "GPU service is not reachable. If the instance is stopped, start it first.",
+      error:
+        "GPU service is not reachable. If the instance is stopped, start it first.",
     });
   }
 });
@@ -90,11 +112,19 @@ adminGpuRouter.post("/trim-memory", async (_req, res) => {
       withInternalSecretHeaders({
         method: "POST",
         signal: AbortSignal.timeout(10_000),
-      })
+      }),
     );
-    const body = (await vmRes.json().catch(() => ({}))) as Record<string, unknown>;
+    const body = (await vmRes.json().catch(() => ({}))) as Record<
+      string,
+      unknown
+    >;
     if (!vmRes.ok) {
-      return res.status(502).json({ error: (body.detail as string) || `GPU service returned ${vmRes.status}` });
+      return res
+        .status(502)
+        .json({
+          error:
+            (body.detail as string) || `GPU service returned ${vmRes.status}`,
+        });
     }
     return res.json(body);
   } catch (err) {
@@ -109,7 +139,7 @@ adminGpuRouter.post("/clear-queue", async (_req, res) => {
     // 1. Fetch current GPU system info to identify the active generation job (if any)
     const sysRes = await fetch(
       `${config.gpuGateway.url}/admin/system`,
-      withInternalSecretHeaders({ signal: AbortSignal.timeout(5000) })
+      withInternalSecretHeaders({ signal: AbortSignal.timeout(5000) }),
     ).catch(() => null);
 
     const currentlyProcessingId = await (async () => {
@@ -128,7 +158,7 @@ adminGpuRouter.post("/clear-queue", async (_req, res) => {
       withInternalSecretHeaders({
         method: "POST",
         signal: AbortSignal.timeout(8000),
-      })
+      }),
     ).catch(() => null);
 
     const vmClearedIds = await (async () => {
@@ -170,9 +200,9 @@ adminGpuRouter.post("/clear-queue", async (_req, res) => {
             withInternalSecretHeaders({
               method: "POST",
               signal: AbortSignal.timeout(5000),
-            })
+            }),
           ).catch(() => null);
-        })
+        }),
       );
 
       await supabase
@@ -185,7 +215,7 @@ adminGpuRouter.post("/clear-queue", async (_req, res) => {
         })
         .in(
           "id",
-          waitingList.map((j) => j.id)
+          waitingList.map((j) => j.id),
         );
 
       // Refund credits for cancelled waiting jobs
@@ -196,7 +226,7 @@ adminGpuRouter.post("/clear-queue", async (_req, res) => {
           if (creditsToRefund > 0 && job.user_id) {
             await refundCredit(job.user_id, creditsToRefund).catch(() => null);
           }
-        })
+        }),
       );
 
       // Add to tracker if not already counted by vmClearedIds
@@ -208,11 +238,13 @@ adminGpuRouter.post("/clear-queue", async (_req, res) => {
     }
 
     // 4. Also scan recent user jobs on GPU gateway for any lingering pending (waiting) items
-    const userIds = Array.from(new Set(waitingList.map((j) => j.user_id).filter(Boolean)));
+    const userIds = Array.from(
+      new Set(waitingList.map((j) => j.user_id).filter(Boolean)),
+    );
     for (const uid of userIds) {
       const uRes = await fetch(
         `${config.gpuGateway.url}/jobs/user/${uid}`,
-        withInternalSecretHeaders({ signal: AbortSignal.timeout(5000) })
+        withInternalSecretHeaders({ signal: AbortSignal.timeout(5000) }),
       ).catch(() => null);
       if (uRes && uRes.ok) {
         const uData = (await uRes.json().catch(() => ({}))) as {
@@ -223,13 +255,16 @@ adminGpuRouter.post("/clear-queue", async (_req, res) => {
           return j.status === "pending" && j.job_id !== currentlyProcessingId;
         });
         for (const pj of pendingOnVm) {
-          if (!vmClearedIds.includes(pj.job_id) && !waitingList.some((w) => w.id === pj.job_id)) {
+          if (
+            !vmClearedIds.includes(pj.job_id) &&
+            !waitingList.some((w) => w.id === pj.job_id)
+          ) {
             await fetch(
               `${config.gpuGateway.url}/cancel/${pj.job_id}`,
               withInternalSecretHeaders({
                 method: "POST",
                 signal: AbortSignal.timeout(5000),
-              })
+              }),
             ).catch(() => null);
             clearedTracker.count += 1;
           }
@@ -238,7 +273,10 @@ adminGpuRouter.post("/clear-queue", async (_req, res) => {
     }
 
     const totalCleared = clearedTracker.count;
-    logger.info({ totalCleared, keptRunningJobId: currentlyProcessingId }, "Admin cleared GPU queue (active job preserved)");
+    logger.info(
+      { totalCleared, keptRunningJobId: currentlyProcessingId },
+      "Admin cleared GPU queue (active job preserved)",
+    );
 
     const message = (() => {
       if (totalCleared > 0) {
@@ -268,17 +306,26 @@ adminGpuRouter.post("/clear-queue", async (_req, res) => {
 adminGpuRouter.post("/instance/:action", async (req, res) => {
   const action = String(req.params.action) as GcpInstanceAction;
   if (!INSTANCE_ACTIONS.includes(action)) {
-    return res.status(400).json({ error: "action must be start, stop, or reset" });
+    return res
+      .status(400)
+      .json({ error: "action must be start, stop, or reset" });
   }
   if (!isGcpComputeConfigured()) {
-    return res.status(400).json({ error: "GCP_SERVICE_ACCOUNT_KEY is not configured on the backend" });
+    return res
+      .status(400)
+      .json({
+        error: "GCP_SERVICE_ACCOUNT_KEY is not configured on the backend",
+      });
   }
   try {
     const operation = await runGpuInstanceAction(action);
     logger.info({ action, operation }, "Admin GPU instance action");
     return res.json({ ok: true, action, operation });
   } catch (err) {
-    logger.error({ err: errorMessage(err), action }, "Admin GPU instance action failed");
+    logger.error(
+      { err: errorMessage(err), action },
+      "Admin GPU instance action failed",
+    );
     return res.status(502).json({ error: errorMessage(err) });
   }
 });

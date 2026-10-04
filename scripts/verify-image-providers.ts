@@ -79,7 +79,7 @@ for (const quality of IMAGE_QUALITIES) {
   );
   check(`${quality} edit fields are strings (multipart)`, Object.values(edit).every((v) => typeof v === "string"));
 }
-check("low and high use different models", buildOpenAIGenerateBody("x", "low", "1:1").model !== buildOpenAIGenerateBody("x", "high", "1:1").model);
+check("high uses 2K size while low uses 1K size", buildOpenAIGenerateBody("x", "high", "1:1").size === "2048x2048" && buildOpenAIGenerateBody("x", "low", "1:1").size === "1024x1024");
 
 console.log("Gemini");
 for (const quality of IMAGE_QUALITIES) {
@@ -92,9 +92,9 @@ for (const quality of IMAGE_QUALITIES) {
   }
   const edit = buildGeminiBody("make it blue", quality, null, { mime_type: "image/png", data: "AAAA" });
   check(`${quality} edit omits aspect_ratio`, !("aspect_ratio" in edit.response_format));
-  check(`${quality} edit sends text + image blocks`, edit.input.length === 2 && edit.input[1].type === "image");
+  check(`${quality} edit sends text + image blocks`, edit.input.length === 2 && edit.input.some((b) => b.type === "image") && edit.input.some((b) => b.type === "text"));
 }
-check("low and high use different models", buildGeminiBody("x", "low", "1:1").model !== buildGeminiBody("x", "high", "1:1").model);
+check("high uses 2K while low uses 1K", buildGeminiBody("x", "high", "1:1").response_format.image_size === "2K" && buildGeminiBody("x", "low", "1:1").response_format.image_size === "1K");
 
 const sample = {
   steps: [
@@ -142,8 +142,8 @@ check("quality defaults to low", parseImageQuality("") === "low");
 check("quality rejects unknown", parseImageQuality("ultra") === null);
 check("aspect defaults to 1:1", parseImageAspect(undefined) === "1:1");
 check("aspect rejects unknown", parseImageAspect("16:9") === null);
-check("text-to-image credits 15 / 20", IMAGE_CREDITS["text-to-image"].low === 15 && IMAGE_CREDITS["text-to-image"].high === 20);
-check("edit credits 15 / 20", IMAGE_CREDITS.edit.low === 15 && IMAGE_CREDITS.edit.high === 20);
+check("text-to-image credits 15 / 30", IMAGE_CREDITS["text-to-image"].low === 15 && IMAGE_CREDITS["text-to-image"].high === 30);
+check("edit credits 15 / 30", IMAGE_CREDITS.edit.low === 15 && IMAGE_CREDITS.edit.high === 30);
 
 if (failures > 0) {
   console.error(`\n${failures} check(s) failed`);
