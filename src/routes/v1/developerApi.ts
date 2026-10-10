@@ -123,7 +123,7 @@ developerV1Router.post(
     const body = (req.body || {}) as Record<string, unknown>;
     const file = req.file;
 
-    const requestedResolution = Number(body.resolution) === 1024 ? 1024 : 1536;
+    const requestedResolution = Number(body.resolution) === 1536 ? 1024 : (Number(body.resolution) || 1024);
     const requestedSeed = typeof body.seed === "number" ? body.seed : 42;
 
     const deductResult = await deductCredit(userId, CREDITS_3D, true);
@@ -255,7 +255,7 @@ developerV1Router.post(
     const provider: ImageProvider = parseImageProvider(imageModelOpts.provider || body.provider) || "openai";
     const quality: ImageQuality = parseImageQuality(imageModelOpts.quality || body.quality) || "high";
     const aspect: ImageAspect = parseImageAspect(imageModelOpts.aspect || body.aspect) || "1:1";
-    const requestedResolution = Number(body.resolution) === 1024 ? 1024 : 1536;
+    const requestedResolution = Number(body.resolution) === 1536 ? 1024 : (Number(body.resolution) || 1024);
     const requestedSeed = typeof body.seed === "number" ? body.seed : 42;
 
     const imageCredits = IMAGE_CREDITS["text-to-image"][quality];
@@ -435,10 +435,10 @@ async function handleGetTask(req: Request, res: Response) {
     return;
   }
 
-  // 16-minute timeout check:
-  // If task has been running/waiting for >= 16 minutes, expire it and refund automatically.
+  // 20-minute timeout check:
+  // If task has been running/waiting for >= 20 minutes, expire it and refund automatically.
   const ageMs = Date.now() - new Date(job.createdAt).getTime();
-  const isTimedOut = (job.status === "WAIT" || job.status === "RUN") && ageMs >= 16 * 60 * 1000;
+  const isTimedOut = (job.status === "WAIT" || job.status === "RUN") && ageMs >= 20 * 60 * 1000;
   if (isTimedOut) {
     const refundAmount = job.creditsUsed > 0 ? job.creditsUsed : CREDITS_3D;
     const timeoutMsg = "Generation timed out. Credits have been automatically refunded.";

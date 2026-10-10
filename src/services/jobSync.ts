@@ -16,8 +16,8 @@ let circuitBreakerState = {
 const CIRCUIT_BREAKER_THRESHOLD = 6; // Open after 6 failures so brief gateway busy doesn't trip
 const CIRCUIT_BREAKER_RESET_TIME = 60000; // Try again after 60 seconds
 const CIRCUIT_BREAKER_SUCCESS_RESET = 1; // Close circuit after 1 successful call
-const MAX_JOB_AGE_MS = 16 * 60 * 1000; // 16 minutes timeout cap (allows 12+ min generations when GPU OOM restart occurs)
-const HARD_ABORT_MAX_AGE_MS = 25 * 60 * 1000; // 25 minutes absolute hard cap even if gateway still reports pending
+const MAX_JOB_AGE_MS = 20 * 60 * 1000; // 20 minutes timeout cap (allows 15+ min high-poly generations)
+const HARD_ABORT_MAX_AGE_MS = 30 * 60 * 1000; // 30 minutes absolute hard cap even if gateway still reports pending
 
 /**
  * Check if API is available (circuit breaker closed)
