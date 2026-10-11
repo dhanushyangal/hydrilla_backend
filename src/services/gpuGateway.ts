@@ -60,7 +60,7 @@ export async function submitImageTo3dGpu(params: {
   seed?: number;
   userId: string;
 }): Promise<{ jobId: string; jobsAhead?: number }> {
-  const resolution = params.resolution ?? 1536;
+  const resolution = params.resolution ?? 1024;
   const seed = params.seed ?? 42;
 
   const submitFn = async (): Promise<{ jobId: string; jobsAhead?: number }> => {

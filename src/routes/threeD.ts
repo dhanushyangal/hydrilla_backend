@@ -710,7 +710,7 @@ function buildQueueInfoFromApiJob(apiJob: Record<string, unknown>): Record<strin
       ? apiJob.estimated_seconds
       : typeof apiJob.estimated_total_seconds === "number"
         ? apiJob.estimated_total_seconds
-        : 300;
+        : DEFAULT_ESTIMATED_3D_SECONDS;
   const waitSec = jobsAhead * estimatedTotal;
   return {
     position,
@@ -1323,8 +1323,8 @@ threeDRouter.get("/status/:jobId", requireAuth, async (req, res) => {
       return res.json({ job, creditsRefunded: job.status === "FAIL" });
     }
 
-    // 16-minute timeout cap (allows 12+ min generations when GPU OOM restart occurs)
-    const MAX_JOB_AGE_MS = 16 * 60 * 1000;
+    // 20-minute timeout cap (allows 15+ min high-poly generations)
+    const MAX_JOB_AGE_MS = 20 * 60 * 1000;
     const elapsedMs = job ? Date.now() - new Date(job.createdAt).getTime() : 0;
 
     // For pending/processing jobs or if job doesn't exist, try to fetch from external API
@@ -1347,7 +1347,7 @@ threeDRouter.get("/status/:jobId", requireAuth, async (req, res) => {
         if (!job) {
           return res.status(404).json({ error: "Job not found" });
         }
-        // If we have it in DB but API says not found, check if it timed out past 16 minutes
+        // If we have it in DB but API says not found, check if it timed out past 20 minutes
         if (denyIfNotJobOwner(job, userId, res)) return;
         
         if ((job.status === "WAIT" || job.status === "RUN") && elapsedMs >= MAX_JOB_AGE_MS) {
@@ -1390,8 +1390,8 @@ threeDRouter.get("/status/:jobId", requireAuth, async (req, res) => {
           return;
         }
 
-        // 16-minute timeout check:
-        // If GPU gateway is unreachable and job has reached or exceeded 16 minutes, expire and refund it.
+        // 20-minute timeout check:
+        // If GPU gateway is unreachable and job has reached or exceeded 20 minutes, expire and refund it.
         const ageMs = Date.now() - new Date(job.createdAt).getTime();
         if ((job.status === "WAIT" || job.status === "RUN") && ageMs >= MAX_JOB_AGE_MS) {
           const refundAmount = Boolean(job.userId) && (job.creditsUsed ?? 0) > 0 ? job.creditsUsed : 0;
@@ -1710,7 +1710,7 @@ threeDRouter.get("/result/:jobId", requireAuth, async (req, res) => {
 // ============================================
 // Fallback queue info when Python API is unavailable (avoids duplication)
 // Default 3D job time (seconds) - should match gateway ESTIMATED_3D_TIME for consistent ETA
-const DEFAULT_ESTIMATED_3D_SECONDS = 300; // 5 min - conservative so progress/ETA don't overshoot
+const DEFAULT_ESTIMATED_3D_SECONDS = 840; // ~14 min - matches Pixal3D 1024 1M decimation time
 const QUEUE_INFO_FALLBACK = {
   error: "GPU API is currently unavailable",
   api_available: false,
