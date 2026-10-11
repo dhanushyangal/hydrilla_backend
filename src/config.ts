@@ -104,22 +104,23 @@ export const config = {
     webhookSecret: process.env.DODO_PAYMENT_WEBHOOK_SECRET || "",
     baseUrl: (process.env.DODO_PAYMENT_MODE || "test") === "live" ? "https://live.dodopayments.com" : "https://test.dodopayments.com",
     environment: ((process.env.DODO_PAYMENT_MODE || "test") === "live" ? "live_mode" : "test_mode") as "live_mode" | "test_mode",
-    // Subscription plan product IDs (created in Dodo dashboard)
-    creatorProductId: process.env.DODO_PAYMENT_CREATOR_PRODUCT_ID || "",
-    studioProductId: process.env.DODO_PAYMENT_STUDIO_PRODUCT_ID || "",
+    // Subscription plan product IDs (set in .env.local only)
+    starterProductId: process.env.DODO_PAYMENT_STARTER_PRODUCT_ID || "",
+    /** Pro product. Env key stays DODO_PAYMENT_STUDIO_PRODUCT_ID. */
+    proProductId: process.env.DODO_PAYMENT_STUDIO_PRODUCT_ID || "",
     returnUrl: process.env.DODO_PAYMENTS_RETURN_URL || "",
   },
   // Map product IDs to plan names and credit limits
   planConfig: {
-    creator: {
-      productId: process.env.DODO_PAYMENT_CREATOR_PRODUCT_ID || "",
-      credits: 1000,
-      label: "Creator",
+    starter: {
+      productId: process.env.DODO_PAYMENT_STARTER_PRODUCT_ID || "",
+      credits: 900,
+      label: "Starter",
     },
-    studio: {
+    pro: {
       productId: process.env.DODO_PAYMENT_STUDIO_PRODUCT_ID || "",
-      credits: 4000,
-      label: "Studio",
+      credits: 3000,
+      label: "Pro",
     },
   } as Record<string, { productId: string; credits: number; label: string }>,
 };
@@ -150,12 +151,12 @@ if (!config.dodoPayment.apiKey) {
   console.warn("[config] DODO_PAYMENT_API_KEY is missing. Payment functionality will be disabled.");
 }
 
-if (!config.dodoPayment.creatorProductId) {
-  console.warn("[config] DODO_PAYMENT_CREATOR_PRODUCT_ID is missing. Creator plan checkout will not work.");
+if (!config.dodoPayment.starterProductId) {
+  console.warn("[config] DODO_PAYMENT_STARTER_PRODUCT_ID is missing. Starter plan checkout will not work.");
 }
 
-if (!config.dodoPayment.studioProductId) {
-  console.warn("[config] DODO_PAYMENT_STUDIO_PRODUCT_ID is missing. Studio plan checkout will not work.");
+if (!config.dodoPayment.proProductId) {
+  console.warn("[config] DODO_PAYMENT_STUDIO_PRODUCT_ID is missing. Pro plan checkout will not work.");
 }
 
 if (!config.dodoPayment.returnUrl) {
