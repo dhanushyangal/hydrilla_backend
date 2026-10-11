@@ -1,7 +1,7 @@
 import { supabase } from "../db.js";
 import { logger } from "../logger.js";
 
-const FREE_TIER_CREDITS = 200;
+const FREE_TIER_CREDITS = 100;
 
 /**
  * Get user_credits row for a user (by user_id only).
@@ -12,7 +12,7 @@ export async function getCreditsRow(userId: string): Promise<{ id: string; credi
 }
 
 /**
- * Ensure a user has a credits row. Creates free-tier (200 credits) if missing.
+ * Ensure a user has a credits row. Creates free-tier (100 credits) if missing.
  * Returns the row (existing or newly created). Uses user_id only (no email).
  */
 export async function ensureCreditsRow(userId: string): Promise<{ id: string; credits_used: number; credits_total: number; plan: string | null } | null> {
@@ -21,7 +21,7 @@ export async function ensureCreditsRow(userId: string): Promise<{ id: string; cr
     return row;
   }
 
-  logger.info({ userId }, "Creating free-tier credits row (200 credits)");
+  logger.info({ userId }, "Creating free-tier credits row (100 credits)");
   const { data: newRow, error: insertErr } = await supabase
     .from("user_credits")
     .insert({
