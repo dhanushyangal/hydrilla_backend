@@ -141,3 +141,178 @@ export async function refundCredit(userId: string, amount: number): Promise<void
   }
   logger.info({ userId, amount, newUsed }, "Credits refunded");
 }
+
+export interface CreditLedgerRow {
+  id: string;
+  user_id: string;
+  delta: number;
+  balance_total_after: number;
+  balance_used_after: number;
+  source: "admin_grant" | "admin_remove" | "claim_link" | "system";
+  reason: string | null;
+  admin_user_id: string | null;
+  admin_email: string | null;
+  claim_link_id: string | null;
+  metadata: Record<string, unknown> | null;
+  created_at: string;
+}
+
+export interface GrantCreditsOptions {
+  reason?: string;
+  adminUserId?: string;
+  adminEmail?: string;
+  source?: "admin_grant" | "claim_link" | "system";
+  claimLinkId?: string;
+  metadata?: Record<string, unknown>;
+}
+
+export interface RemoveCreditsOptions {
+  reason?: string;
+  adminUserId?: string;
+  adminEmail?: string;
+  metadata?: Record<string, unknown>;
+}
+
+/**
+ * Grant credits to a user, incrementing credits_total and logging to credit_ledger.
+ */
+export async function grantCredits(
+  userId: string,
+  amount: number,
+  meta: GrantCreditsOptions = {}
+): Promise<{ ok: true; remaining: number; total: number; used: number } | { ok: false; error: string }> {
+  if (amount <= 0) {
+    return { ok: false, error: "Grant amount must be greater than zero." };
+  }
+
+  const row = await ensureCreditsRow(userId);
+  if (!row) {
+    return { ok: false, error: "Failed to load user credits row." };
+  }
+
+  const newTotal = row.credits_total + amount;
+  const { error: updateErr } = await supabase
+    .from("user_credits")
+    .update({
+      credits_total: newTotal,
+      updated_at: new Date().toISOString(),
+    })
+    .eq("id", row.id);
+
+  if (updateErr) {
+    logger.error({ error: updateErr, userId }, "Failed to update user_credits on grant");
+    return { ok: false, error: updateErr.message || "Failed to update user credits." };
+  }
+
+  const { error: ledgerErr } = await supabase
+    .from("credit_ledger")
+    .insert({
+      user_id: userId,
+      delta: amount,
+      balance_total_after: newTotal,
+      balance_used_after: row.credits_used,
+      source: meta.source || "admin_grant",
+      reason: meta.reason || null,
+      admin_user_id: meta.adminUserId || null,
+      admin_email: meta.adminEmail || null,
+      claim_link_id: meta.claimLinkId || null,
+      metadata: meta.metadata || {},
+    });
+
+  if (ledgerErr) {
+    logger.warn({ error: ledgerErr, userId }, "[Credits] Failed to record credit_ledger row");
+  }
+
+  const remaining = Math.max(0, newTotal - row.credits_used);
+  return {
+    ok: true,
+    remaining,
+    total: newTotal,
+    used: row.credits_used,
+  };
+}
+
+/**
+ * Deduct credits from a user's total balance, never letting total drop below used.
+ */
+export async function removeCredits(
+  userId: string,
+  amount: number,
+  meta: RemoveCreditsOptions = {}
+): Promise<{ ok: true; remaining: number; total: number; used: number; removed: number } | { ok: false; error: string }> {
+  if (amount <= 0) {
+    return { ok: false, error: "Remove amount must be greater than zero." };
+  }
+
+  const row = await ensureCreditsRow(userId);
+  if (!row) {
+    return { ok: false, error: "Failed to load user credits row." };
+  }
+
+  const newTotal = Math.max(row.credits_used, row.credits_total - amount);
+  const actualRemoved = row.credits_total - newTotal;
+
+  if (actualRemoved <= 0) {
+    return { ok: false, error: "Cannot remove credits below used balance." };
+  }
+
+  const { error: updateErr } = await supabase
+    .from("user_credits")
+    .update({
+      credits_total: newTotal,
+      updated_at: new Date().toISOString(),
+    })
+    .eq("id", row.id);
+
+  if (updateErr) {
+    logger.error({ error: updateErr, userId }, "Failed to update user_credits on remove");
+    return { ok: false, error: updateErr.message || "Failed to update user credits." };
+  }
+
+  const { error: ledgerErr } = await supabase
+    .from("credit_ledger")
+    .insert({
+      user_id: userId,
+      delta: -actualRemoved,
+      balance_total_after: newTotal,
+      balance_used_after: row.credits_used,
+      source: "admin_remove",
+      reason: meta.reason || null,
+      admin_user_id: meta.adminUserId || null,
+      admin_email: meta.adminEmail || null,
+      metadata: meta.metadata || {},
+    });
+
+  if (ledgerErr) {
+    logger.warn({ error: ledgerErr, userId }, "[Credits] Failed to record credit_ledger row");
+  }
+
+  const remaining = Math.max(0, newTotal - row.credits_used);
+  return {
+    ok: true,
+    remaining,
+    total: newTotal,
+    used: row.credits_used,
+    removed: actualRemoved,
+  };
+}
+
+/**
+ * List credit ledger audit rows for a specific user.
+ */
+export async function listCreditLedger(userId: string): Promise<CreditLedgerRow[]> {
+  const { data, error } = await supabase
+    .from("credit_ledger")
+    .select("*")
+    .eq("user_id", userId)
+    .order("created_at", { ascending: false })
+    .limit(100);
+
+  if (error) {
+    logger.warn({ error, userId }, "[Credits] Failed to fetch credit_ledger");
+    return [];
+  }
+
+  return (data || []) as CreditLedgerRow[];
+}
+

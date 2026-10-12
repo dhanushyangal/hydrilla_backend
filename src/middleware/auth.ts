@@ -123,6 +123,7 @@ export async function requireAdmin(req: Request, res: Response, next: NextFuncti
     const role = user.publicMetadata?.role;
 
     if (role === "admin" || isAdminEmail(email)) {
+      req.userEmail = email || undefined;
       return next();
     }
 

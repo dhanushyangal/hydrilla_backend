@@ -424,3 +424,105 @@ export async function sendGpuOfflineNotification(
   return false;
 }
 
+/**
+ * Send email when credits are granted or claimed (HYD-47)
+ */
+export async function sendCreditGrantEmail(
+  userEmail: string,
+  userName: string | null,
+  amount: number,
+  reason?: string | null,
+  newRemaining?: number
+): Promise<boolean> {
+  try {
+    if (!userEmail) {
+      logger.warn("Cannot send credit grant email: no email provided");
+      return false;
+    }
+
+    const displayName = userName || "there";
+    const reasonSection = reason
+      ? `<div style="background-color: #f5f5f5; border-radius: 8px; padding: 16px; margin: 24px 0;">
+          <p style="margin: 0; font-size: 14px; color: #555;"><strong>Reason:</strong> ${reason}</p>
+        </div>`
+      : "";
+
+    const balanceSection = typeof newRemaining === "number"
+      ? `<p style="font-size: 16px; color: #333; margin-bottom: 24px;">Your current balance is now <strong>${newRemaining} credits</strong>.</p>`
+      : "";
+
+    const htmlBody = `
+      <!DOCTYPE html>
+      <html>
+        <head>
+          <meta charset="utf-8">
+          <meta name="viewport" content="width=device-width, initial-scale=1.0">
+          <title>Credits Added to Your Account</title>
+        </head>
+        <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif; line-height: 1.6; color: #333; max-width: 600px; margin: 0 auto; padding: 20px;">
+          <div style="background-color: #ffffff; border-radius: 12px; padding: 40px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); border: 1px solid #eaeaea;">
+            <div style="text-align: center; margin-bottom: 30px;">
+              <h1 style="color: #000000; font-size: 26px; font-weight: 700; margin: 0 0 10px 0;">Credits Added!</h1>
+              <p style="font-size: 18px; color: #10b981; font-weight: 600; margin: 0;">+${amount} Credits</p>
+            </div>
+            
+            <p style="font-size: 16px; color: #333; margin-bottom: 20px;">
+              Hi ${displayName},
+            </p>
+            
+            <p style="font-size: 16px; color: #333; margin-bottom: 20px;">
+              Great news! <strong>${amount} credits</strong> have been added to your Hydrilla account.
+            </p>
+            
+            ${reasonSection}
+            ${balanceSection}
+            
+            <div style="text-align: center; margin: 35px 0;">
+              <a href="${config.email.frontendUrl}/generate" 
+                 style="display: inline-block; background-color: #000000; color: #ffffff; text-decoration: none; padding: 14px 32px; border-radius: 8px; font-weight: 600; font-size: 16px;">
+                Start Generating 3D Models
+              </a>
+            </div>
+            
+            <p style="font-size: 14px; color: #666; margin-top: 40px; margin-bottom: 0;">
+              If you have any questions or feedback, reach out to us at <a href="mailto:founders@hydrilla.co" style="color: #000000;">founders@hydrilla.co</a>
+            </p>
+            
+            <p style="font-size: 14px; color: #666; margin-top: 20px; margin-bottom: 0;">
+              Best regards,<br>
+              The Hydrilla Team
+            </p>
+          </div>
+        </body>
+      </html>
+    `;
+
+    await emailClient.sendMail({
+      from: {
+        address: config.email.fromAddress,
+        name: config.email.fromName,
+      },
+      to: [
+        {
+          email_address: {
+            address: userEmail,
+            name: userName || userEmail.split("@")[0] || "User",
+          },
+        },
+      ],
+      subject: `You received ${amount} Hydrilla credits! 🎁`,
+      htmlbody: htmlBody,
+    });
+
+    logger.info({ userEmail, amount, reason }, "Credit grant notification email sent successfully");
+    return true;
+  } catch (err: any) {
+    logger.error(
+      { err: err.message, stack: err.stack, userEmail, amount },
+      "Failed to send credit grant notification email"
+    );
+    return false;
+  }
+}
+
+

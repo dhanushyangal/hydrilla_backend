@@ -4,10 +4,13 @@ import { threeDRouter } from "../src/routes/threeD.js";
 import { paymentsRouter } from "../src/routes/payments.js";
 import { userRouter } from "../src/routes/user.js";
 import { adminRouter } from "../src/routes/admin.js";
+import { contactRouter } from "../src/routes/contact.js";
+import { supportRouter } from "../src/routes/support.js";
 import { blogRouter } from "../src/routes/blog.js";
 import { codeSculptRouter } from "../src/routes/codeSculpt.js";
 import { createToolsRouter } from "../src/routes/createTools.js";
 import { developerV1Router } from "../src/routes/v1/developerApi.js";
+import { publicCreditClaimsRouter } from "../src/routes/creditClaims.js";
 import { logger } from "../src/logger.js";
 import { initDb } from "../src/db.js";
 import { config as appConfig } from "../src/config.js";
@@ -86,9 +89,12 @@ app.use("/api/3d", initDbMiddleware, threeDRouter);
 
 // Payments routes
 app.use("/api/payments", initDbMiddleware, paymentsRouter);
+app.use("/api/contact", initDbMiddleware, contactRouter);
+app.use("/api/support", initDbMiddleware, supportRouter);
 
 // BYOK keys + Water engine (legacy alias: /api/code-sculpt)
 app.use("/api/user", initDbMiddleware, userRouter);
+app.use("/api/credits/claim", initDbMiddleware, publicCreditClaimsRouter);
 app.use("/api/admin", initDbMiddleware, adminRouter);
 app.use("/api/blog", initDbMiddleware, blogRouter);
 app.use("/api/water", initDbMiddleware, codeSculptRouter);

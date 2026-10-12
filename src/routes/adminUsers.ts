@@ -3,6 +3,8 @@ import { config } from "../config.js";
 import { supabase } from "../db.js";
 import { logger } from "../logger.js";
 import { clerk } from "../middleware/auth.js";
+import { grantCredits, removeCredits, listCreditLedger } from "../services/credits.js";
+import { sendCreditGrantEmail } from "../services/email.js";
 
 export const adminUsersRouter = Router();
 
@@ -198,21 +200,134 @@ adminUsersRouter.get("/:userId", async (req, res) => {
     const userId = String(req.params.userId || "");
     const { users, payments, subs, credits } = await loadBillingTables();
     const localIds = await localClerkUserIds();
-    if (localIds.has(userId)) return res.status(404).json({ error: "User not found" });
+    if (localIds.has(userId)) {
+      return res.status(404).json({ error: "User not found" });
+    }
     const user = users.find((row) => row.id === userId);
-    if (!user) return res.status(404).json({ error: "User not found" });
+    if (!user) {
+      return res.status(404).json({ error: "User not found" });
+    }
     const visiblePayments = payments.filter((row) => !row.user_id || !localIds.has(row.user_id));
     const credit = credits.find((row) => row.user_id === userId);
     const summary = summarize(user, visiblePayments, subs, credit);
     const history = paymentsForUser(user, visiblePayments).map(publicPayment);
     const subscriptions = subs.filter((row) => row.user_id === userId).map(publicSubscription);
-    res.json({
+
+    const [jobsRes, creditLedger] = await Promise.all([
+      supabase
+        .from("jobs")
+        .select("id, status, generate_type, credits_used, created_at, prompt, engine")
+        .eq("user_id", userId)
+        .order("created_at", { ascending: false })
+        .limit(25),
+      listCreditLedger(userId),
+    ]);
+
+    const jobs = (jobsRes.data || []).map((job) => ({
+      id: job.id,
+      status: job.status,
+      generateType: job.generate_type,
+      creditsUsed: job.credits_used ?? 0,
+      createdAt: job.created_at,
+      prompt: job.prompt || null,
+      engine: job.engine || null,
+    }));
+
+    return res.json({
       user: summary,
       subscriptions,
       payments: history,
+      jobs,
+      creditLedger,
     });
   } catch (err: any) {
     logger.error({ err }, "GET /api/admin/users/:userId failed");
-    res.status(500).json({ error: "Failed to load user" });
+    return res.status(500).json({ error: "Failed to load user" });
+  }
+});
+
+adminUsersRouter.post("/:userId/credits", async (req, res) => {
+  try {
+    const userId = String(req.params.userId || "");
+    const amount = Number(req.body.amount);
+    const reason = typeof req.body.reason === "string" ? req.body.reason.trim() : "";
+    const action = req.body.action === "remove" ? "remove" : "add";
+    const sendEmail = req.body.sendEmail !== false;
+
+    if (!userId) {
+      return res.status(400).json({ error: "User ID is required" });
+    }
+    if (!Number.isFinite(amount) || amount <= 0) {
+      return res.status(400).json({ error: "Amount must be a positive number" });
+    }
+
+    const { data: userRow } = await supabase
+      .from("users")
+      .select("id, email, first_name, last_name")
+      .eq("id", userId)
+      .maybeSingle();
+
+    if (action === "remove") {
+      const result = await removeCredits(userId, amount, {
+        reason: reason || undefined,
+        adminUserId: req.userId,
+        adminEmail: req.userEmail,
+      });
+
+      if (!result.ok) {
+        return res.status(400).json({ error: result.error });
+      }
+
+      return res.json({
+        success: true,
+        action: "remove",
+        amount: result.removed,
+        remaining: result.remaining,
+        total: result.total,
+        used: result.used,
+      });
+    }
+
+    const result = await grantCredits(userId, amount, {
+      reason: reason || undefined,
+      adminUserId: req.userId,
+      adminEmail: req.userEmail,
+      source: "admin_grant",
+    });
+
+    if (!result.ok) {
+      return res.status(400).json({ error: result.error });
+    }
+
+    if (sendEmail && userRow?.email) {
+      const fullName = [userRow.first_name, userRow.last_name].filter(Boolean).join(" ").trim() || null;
+      await sendCreditGrantEmail(userRow.email, fullName, amount, reason || null, result.remaining);
+    }
+
+    return res.json({
+      success: true,
+      action: "add",
+      amount,
+      remaining: result.remaining,
+      total: result.total,
+      used: result.used,
+    });
+  } catch (err: any) {
+    logger.error({ err, userId: req.params.userId }, "POST /api/admin/users/:userId/credits failed");
+    return res.status(500).json({ error: "Failed to update user credits" });
+  }
+});
+
+adminUsersRouter.get("/:userId/credits/history", async (req, res) => {
+  try {
+    const userId = String(req.params.userId || "");
+    if (!userId) {
+      return res.status(400).json({ error: "User ID is required" });
+    }
+    const history = await listCreditLedger(userId);
+    return res.json({ history });
+  } catch (err: any) {
+    logger.error({ err, userId: req.params.userId }, "GET /api/admin/users/:userId/credits/history failed");
+    return res.status(500).json({ error: "Failed to fetch credit history" });
   }
 });
