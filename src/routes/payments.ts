@@ -525,11 +525,13 @@ paymentsRouter.get("/credits", requireAuth, async (req: Request, res: Response) 
       });
     }
 
+    const used = Number(credits.credits_used) || 0;
+    const total = Number(credits.credits_total) || 0;
     res.json({
       credits: {
-        used: credits.credits_used,
-        total: credits.credits_total,
-        remaining: Math.max(0, credits.credits_total - credits.credits_used),
+        used,
+        total,
+        remaining: Math.max(0, total - used),
         plan: subscriptionPlan,
         resetAt: credits.reset_at,
       },
