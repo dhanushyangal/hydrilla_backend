@@ -5,6 +5,7 @@ import { supabase } from "../db.js";
 import { requireAuth, requireAdmin } from "../middleware/auth.js";
 import { getDodoPaymentsClient } from "../lib/dodopayments.js";
 import { captureServerEvent, flushPostHog } from "../lib/posthog.js";
+import { listCreditLedger } from "../services/credits.js";
 
 // ============================================================================
 // DODO PAYMENTS - Subscription Integration
@@ -538,6 +539,33 @@ paymentsRouter.get("/credits", requireAuth, async (req: Request, res: Response) 
     });
   } catch (error: any) {
     logger.error({ error: error?.message }, "Error fetching credits");
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// ============================================================================
+// GET USER CREDIT REWARDS HISTORY
+// GET /api/payments/credits/history
+// Positive ledger additions: claim links, admin grants, system grants.
+// ============================================================================
+const USER_REWARD_SOURCES = new Set(["claim_link", "admin_grant", "system"]);
+
+paymentsRouter.get("/credits/history", requireAuth, async (req: Request, res: Response) => {
+  try {
+    const userId = (req as any).userId as string;
+    const rows = await listCreditLedger(userId);
+    const rewards = rows
+      .filter((row) => row.delta > 0 && USER_REWARD_SOURCES.has(row.source))
+      .map((row) => ({
+        id: row.id,
+        amount: row.delta,
+        reason: row.reason,
+        source: row.source,
+        createdAt: row.created_at,
+      }));
+    res.json({ rewards });
+  } catch (error: any) {
+    logger.error({ error: error?.message }, "Error fetching credit rewards history");
     res.status(500).json({ error: "Internal server error" });
   }
 });
