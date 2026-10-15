@@ -108,7 +108,16 @@ export const config = {
     starterProductId: process.env.DODO_PAYMENT_STARTER_PRODUCT_ID || "",
     /** Pro product. Env key stays DODO_PAYMENT_STUDIO_PRODUCT_ID. */
     proProductId: process.env.DODO_PAYMENT_STUDIO_PRODUCT_ID || "",
+    slotProductId: process.env.DODO_PAYMENT_SLOT_PRODUCT_ID || "",
+    slotProProductId: process.env.DODO_PAYMENT_SLOT_PRO_PRODUCT_ID || "",
     returnUrl: process.env.DODO_PAYMENTS_RETURN_URL || "",
+  },
+  /** Seat limits for Slot plans only. Free, Starter, and Pro are not counted here. */
+  slot: {
+    /** People who may book the same 1-hour Slot. */
+    seats: 2,
+    /** People who may book the same 2-hour Slot Pro window. */
+    proSeats: 4,
   },
   // Map product IDs to plan names and credit limits
   planConfig: {
