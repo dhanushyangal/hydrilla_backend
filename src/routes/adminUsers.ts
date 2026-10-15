@@ -3,6 +3,7 @@ import { config } from "../config.js";
 import { supabase } from "../db.js";
 import { logger } from "../logger.js";
 import { clerk } from "../middleware/auth.js";
+import { coversHour, isValidTimeZone, rangeInZone } from "../services/slotClock.js";
 
 export const adminUsersRouter = Router();
 
@@ -46,6 +47,15 @@ type CreditRow = {
   credits_used: number | null;
   reset_at: string | null;
   subscription_id: string | null;
+};
+
+type SlotBookingRow = {
+  user_id: string;
+  plan: string;
+  timezone: string;
+  start_hour: number;
+  duration_hours: number;
+  changed_on: string | null;
 };
 
 function emailKey(email: string | null | undefined): string {
@@ -145,7 +155,61 @@ async function loadBillingTables() {
   };
 }
 
-function summarize(user: UserRow, payments: PaymentRow[], subs: SubRow[], credit: CreditRow | undefined) {
+function isSlotPlan(plan: string | null | undefined): boolean {
+  return plan === "slot" || plan === "slot_pro";
+}
+
+/** Slot hour for admin. Null for every other plan. Missing table returns an empty map so the user list still loads. */
+async function loadSlotBookings(): Promise<Map<string, SlotBookingRow>> {
+  try {
+    const { data, error } = await supabase
+      .from("slot_bookings")
+      .select("user_id, plan, timezone, start_hour, duration_hours, changed_on");
+    if (error) {
+      logger.warn({ err: error }, "slot_bookings unavailable; admin users omit hours");
+      return new Map();
+    }
+    return new Map(((data || []) as SlotBookingRow[]).map((row) => [row.user_id, row]));
+  } catch (err) {
+    logger.warn({ err }, "slot_bookings unavailable; admin users omit hours");
+    return new Map();
+  }
+}
+
+function publicSlot(plan: string | null, booking: SlotBookingRow | undefined) {
+  const slotPlan = isSlotPlan(plan) ? plan : isSlotPlan(booking?.plan) ? booking?.plan : null;
+  if (!slotPlan) return null;
+  if (!booking) {
+    return {
+      plan: slotPlan,
+      timezone: null,
+      startHour: null,
+      durationHours: slotPlan === "slot_pro" ? 2 : 1,
+      label: null,
+      open: false,
+      changedOn: null,
+    };
+  }
+  const zone = isValidTimeZone(booking.timezone) ? booking.timezone : "UTC";
+  const now = new Date();
+  return {
+    plan: booking.plan,
+    timezone: zone,
+    startHour: booking.start_hour,
+    durationHours: booking.duration_hours,
+    label: rangeInZone(booking.start_hour, booking.duration_hours, zone, now),
+    open: coversHour(booking.start_hour, booking.duration_hours, now.getUTCHours()),
+    changedOn: booking.changed_on,
+  };
+}
+
+function summarize(
+  user: UserRow,
+  payments: PaymentRow[],
+  subs: SubRow[],
+  credit: CreditRow | undefined,
+  booking: SlotBookingRow | undefined
+) {
   const mine = paymentsForUser(user, payments);
   const ownSubs = subs.filter((row) => row.user_id === user.id);
   const latest = ownSubs[0] || null;
@@ -168,19 +232,20 @@ function summarize(user: UserRow, payments: PaymentRow[], subs: SubRow[], credit
     lastPaymentCurrency: last?.currency || null,
     lastPaymentStatus: last?.status || null,
     paymentCount: mine.length,
+    slot: publicSlot(latest?.plan || credit?.plan || null, booking),
   };
 }
 
 adminUsersRouter.get("/", async (req, res) => {
   try {
     const payingOnly = req.query.filter === "paying";
-    const { users, payments, subs, credits } = await loadBillingTables();
+    const [{ users, payments, subs, credits }, slots] = await Promise.all([loadBillingTables(), loadSlotBookings()]);
     const localIds = await localClerkUserIds();
     const people = users.filter((user) => !localIds.has(user.id));
     const visiblePayments = payments.filter((row) => !row.user_id || !localIds.has(row.user_id));
     const creditByUser = new Map(credits.map((row) => [row.user_id, row]));
     const rows = people
-      .map((user) => summarize(user, visiblePayments, subs, creditByUser.get(user.id)))
+      .map((user) => summarize(user, visiblePayments, subs, creditByUser.get(user.id), slots.get(user.id)))
       .filter((row) => (payingOnly ? row.paying : true));
     res.json({
       filter: payingOnly ? "paying" : "all",
@@ -196,14 +261,14 @@ adminUsersRouter.get("/", async (req, res) => {
 adminUsersRouter.get("/:userId", async (req, res) => {
   try {
     const userId = String(req.params.userId || "");
-    const { users, payments, subs, credits } = await loadBillingTables();
+    const [{ users, payments, subs, credits }, slots] = await Promise.all([loadBillingTables(), loadSlotBookings()]);
     const localIds = await localClerkUserIds();
     if (localIds.has(userId)) return res.status(404).json({ error: "User not found" });
     const user = users.find((row) => row.id === userId);
     if (!user) return res.status(404).json({ error: "User not found" });
     const visiblePayments = payments.filter((row) => !row.user_id || !localIds.has(row.user_id));
     const credit = credits.find((row) => row.user_id === userId);
-    const summary = summarize(user, visiblePayments, subs, credit);
+    const summary = summarize(user, visiblePayments, subs, credit, slots.get(userId));
     const history = paymentsForUser(user, visiblePayments).map(publicPayment);
     const subscriptions = subs.filter((row) => row.user_id === userId).map(publicSubscription);
     res.json({

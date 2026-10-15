@@ -5,6 +5,7 @@ import { supabase } from "../db.js";
 import { requireAuth, requireAdmin } from "../middleware/auth.js";
 import { getDodoPaymentsClient } from "../lib/dodopayments.js";
 import { captureServerEvent, flushPostHog } from "../lib/posthog.js";
+import { bookSlot, isSlotPlan, releaseSlot, slotOverview } from "../services/slotAccess.js";
 
 // ============================================================================
 // DODO PAYMENTS - Subscription Integration
@@ -14,50 +15,69 @@ import { captureServerEvent, flushPostHog } from "../lib/posthog.js";
 
 export const paymentsRouter = Router();
 
-const PAID_PLANS = ["starter", "pro"] as const;
-type PaidPlan = (typeof PAID_PLANS)[number];
+const CREDIT_PLANS = ["starter", "pro"] as const;
+const CATALOG_PLANS = ["starter", "pro", "slot", "slot_pro"] as const;
+type CreditPlan = (typeof CREDIT_PLANS)[number];
+type CatalogPlan = (typeof CATALOG_PLANS)[number];
 
-function isPaidPlan(plan: unknown): plan is PaidPlan {
-  return typeof plan === "string" && (PAID_PLANS as readonly string[]).includes(plan);
+function isCreditPlan(plan: unknown): plan is CreditPlan {
+  return plan === "starter" || plan === "pro";
+}
+
+/** Monthly credits for a paid plan. Slot matches Starter. Slot Pro matches Pro. */
+function creditAllotment(plan: CatalogPlan | null): number | null {
+  if (plan === "starter" || plan === "pro" || plan === "slot" || plan === "slot_pro") return PLAN_CREDITS[plan];
+  return null;
 }
 
 /** Current catalog only. Legacy creator/studio rows are not Starter or Pro. */
-function canonicalizePlan(plan: unknown): PaidPlan | null {
-  if (plan === "starter" || plan === "pro") return plan;
+function canonicalizePlan(plan: unknown): CatalogPlan | null {
+  if (plan === "starter" || plan === "pro" || plan === "slot" || plan === "slot_pro") return plan;
   return null;
 }
 
-/** Checkout links may still send the previous names. */
-function parseCheckoutPlan(plan: unknown): PaidPlan | null {
+/** Checkout links may still send the previous names. "pro" stays the $12 plan. */
+function parseCheckoutPlan(plan: unknown): CatalogPlan | null {
   if (plan === "creator" || plan === "starter") return "starter";
   if (plan === "studio" || plan === "pro") return "pro";
+  if (plan === "slot" || plan === "slot_pro") return plan;
   return null;
 }
 
-/** Get the plan name ('starter' | 'pro') from a Dodo product_id */
-function getPlanFromProductId(productId: string): PaidPlan | null {
+function getPlanFromProductId(productId: string): CatalogPlan | null {
   if (productId && productId === config.dodoPayment.starterProductId) return "starter";
   if (productId && productId === config.dodoPayment.proProductId) return "pro";
+  if (productId && productId === config.dodoPayment.slotProductId) return "slot";
+  if (productId && productId === config.dodoPayment.slotProProductId) return "slot_pro";
   return null;
 }
 
-function resolvePaidPlan(data: any, productId?: string): PaidPlan | null {
+function productIdForPlan(plan: CatalogPlan): string {
+  if (plan === "starter") return config.dodoPayment.starterProductId;
+  if (plan === "pro") return config.dodoPayment.proProductId;
+  if (plan === "slot") return config.dodoPayment.slotProductId;
+  return config.dodoPayment.slotProProductId;
+}
+
+function resolvePaidPlan(data: any, productId?: string): CatalogPlan | null {
   const fromProduct = productId ? getPlanFromProductId(productId) : null;
   if (fromProduct) return fromProduct;
   return parseCheckoutPlan(data?.metadata?.plan);
 }
 
 /** Paid access stays while the subscription is active, or past_due during a grace period. on_hold does not. */
-function entitledPlan(subscription: { status?: string; product_id?: string | null } | null): PaidPlan | null {
+function entitledPlan(subscription: { status?: string; product_id?: string | null } | null): CatalogPlan | null {
   if (!subscription) return null;
   if (subscription.status !== "active" && subscription.status !== "past_due") return null;
   return getPlanFromProductId(subscription.product_id || "");
 }
 
-/** Credits granted per plan per billing cycle */
-const PLAN_CREDITS: Record<PaidPlan, number> = {
+/** Credits granted per plan per billing cycle. The slot plans add a time limit on top. */
+const PLAN_CREDITS: Record<CatalogPlan, number> = {
   starter: 900,
   pro: 3000,
+  slot: 900,
+  slot_pro: 3000,
 };
 
 const FREE_CREDITS = 100;
@@ -172,15 +192,26 @@ paymentsRouter.post("/create-checkout", requireAuth, async (req: Request, res: R
 
     const paidPlan = parseCheckoutPlan(plan);
     if (!paidPlan) {
-      return res.status(400).json({ error: "plan must be 'starter' or 'pro'" });
+      return res.status(400).json({ error: "Choose Starter, Pro, Slot, or Slot Pro." });
     }
     if (!email || typeof email !== "string" || !email.includes("@")) {
       return res.status(400).json({ error: "Valid email is required" });
     }
 
-    const productId = paidPlan === "starter"
-      ? config.dodoPayment.starterProductId
-      : config.dodoPayment.proProductId;
+    if (userId) {
+      const existing = entitledPlan(await getActiveSubscription(userId));
+      const slotInvolved = isSlotPlan(existing) || isSlotPlan(paidPlan);
+      if (existing && slotInvolved && existing !== paidPlan) {
+        return res.status(409).json({
+          error: "Cancel your current plan before you start another one. Only one paid plan can be active.",
+        });
+      }
+      if (existing && existing === paidPlan && isSlotPlan(paidPlan)) {
+        return res.status(409).json({ error: "This plan is already active on your account." });
+      }
+    }
+
+    const productId = productIdForPlan(paidPlan);
 
     if (!productId) {
       logger.error({ plan: paidPlan }, "Product ID not configured for plan");
@@ -270,6 +301,36 @@ paymentsRouter.get("/billing", requireAuth, async (req: Request, res: Response) 
   } catch (error: any) {
     logger.error({ error: error?.message }, "Error fetching billing");
     res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+paymentsRouter.get("/slot", requireAuth, async (req: Request, res: Response) => {
+  try {
+    const userId = (req as any).userId;
+    const timezone = typeof req.query.timezone === "string" ? req.query.timezone : null;
+    res.json(await slotOverview(userId, timezone));
+  } catch (error: any) {
+    const status = error?.status || 500;
+    logger.error({ error: error?.message, userId: (req as any).userId }, "GET /slot failed");
+    res.status(status).json({ error: error?.message || "Could not load your hours. Try again.", code: error?.code || "slot_load_failed" });
+  }
+});
+
+paymentsRouter.post("/slot", requireAuth, async (req: Request, res: Response) => {
+  try {
+    const userId = (req as any).userId;
+    const startHour = Number(req.body?.startHour);
+    const timezone = typeof req.body?.timezone === "string" ? req.body.timezone : "";
+    const result = await bookSlot(userId, startHour, timezone);
+    if ("error" in result) {
+      const status =
+        result.code === "slot_not_ready" ? 503 : result.code === "not_slot_plan" ? 403 : result.code === "timezone" ? 400 : 409;
+      return res.status(status).json(result);
+    }
+    res.json(await slotOverview(userId, timezone));
+  } catch (error: any) {
+    logger.error({ error: error?.message, userId: (req as any).userId }, "POST /slot failed");
+    res.status(error?.status || 500).json({ error: error?.message || "Could not save these hours. Try again.", code: error?.code || "slot_book_failed" });
   }
 });
 
@@ -449,14 +510,15 @@ paymentsRouter.get("/credits", requireAuth, async (req: Request, res: Response) 
     const subscriptionPlan = entitledPlan(subscription);
 
     if (!credits) {
-      if (subscriptionPlan) {
+      const allotment = creditAllotment(subscriptionPlan);
+      if (subscriptionPlan && allotment != null) {
         logger.info({ userId, plan: subscriptionPlan }, "No credits row but active subscription – creating paid credits row");
         const { data: newRow, error: insertErr } = await supabase
           .from("user_credits")
           .insert({
             user_id: userId,
             plan: subscriptionPlan,
-            credits_total: PLAN_CREDITS[subscriptionPlan],
+            credits_total: allotment,
             credits_used: 0,
             subscription_id: subscription?.dodo_subscription_id || null,
             reset_at: subscription?.current_period_end || null,
@@ -489,7 +551,21 @@ paymentsRouter.get("/credits", requireAuth, async (req: Request, res: Response) 
         .eq("id", credits.id);
       if (clearErr) logger.error({ error: clearErr, userId }, "Failed to clear stale credits plan");
       else credits.plan = null;
-    } else if (!canonicalizePlan(credits.plan) && subscriptionPlan) {
+    } else if (isSlotPlan(subscriptionPlan) && (credits.plan !== subscriptionPlan || credits.credits_total === FREE_CREDITS)) {
+      const allotment = creditAllotment(subscriptionPlan);
+      const updateData: Record<string, unknown> = {
+        plan: subscriptionPlan,
+        subscription_id: credits.subscription_id || subscription?.dodo_subscription_id || null,
+        updated_at: new Date().toISOString(),
+      };
+      if (allotment != null && credits.credits_total === FREE_CREDITS) updateData.credits_total = allotment;
+      const { error: labelErr } = await supabase.from("user_credits").update(updateData).eq("id", credits.id);
+      if (labelErr) logger.error({ error: labelErr, userId }, "Failed to grant slot credits");
+      else {
+        credits.plan = subscriptionPlan;
+        if (typeof updateData.credits_total === "number") credits.credits_total = updateData.credits_total;
+      }
+    } else if (isCreditPlan(subscriptionPlan) && !isCreditPlan(credits.plan)) {
       // Backfill plan from the existing subscription row. Do not delete usage.
       // If the credits row is still the free-tier 100, restore paid allotment.
       const updateData: Record<string, unknown> = {
@@ -518,9 +594,9 @@ paymentsRouter.get("/credits", requireAuth, async (req: Request, res: Response) 
       return res.json({
         credits: {
           used: 0,
-          total: subscriptionPlan ? PLAN_CREDITS[subscriptionPlan] : FREE_CREDITS,
+          total: creditAllotment(subscriptionPlan) ?? FREE_CREDITS,
           plan: subscriptionPlan,
-          remaining: subscriptionPlan ? PLAN_CREDITS[subscriptionPlan] : FREE_CREDITS,
+          remaining: creditAllotment(subscriptionPlan) ?? FREE_CREDITS,
         },
       });
     }
@@ -826,7 +902,7 @@ async function handleSubscriptionActive(data: any, webhookId: string) {
     const recurringAmount: number = data.recurring_pre_tax_amount ?? data.recurring_amount ?? 0;
 
     const plan = resolvePaidPlan(data, productId);
-    const credits = plan ? PLAN_CREDITS[plan] : 0;
+    const credits = creditAllotment(plan) ?? 0;
     if (!plan && (productId || subscriptionId)) {
       logger.info({ subscriptionId, productId }, "subscription.active: unknown product_id, skipping credit grant");
     }
@@ -880,7 +956,6 @@ async function handleSubscriptionActive(data: any, webhookId: string) {
       logger.info({ subscriptionId, email, plan, userId }, "✅ user_subscriptions upserted");
     }
 
-    // --- Upsert user_credits ---
     if (plan && credits > 0) {
       await upsertUserCredits({
         userId,
@@ -915,7 +990,7 @@ async function handleSubscriptionRenewed(data: any, webhookId: string) {
     const currentPeriodEnd = data.current_period_end || data.next_billing_date;
 
     const plan = resolvePaidPlan(data, productId);
-    const credits = plan ? PLAN_CREDITS[plan] : 0;
+    const credits = creditAllotment(plan) ?? 0;
 
     logger.info({ subscriptionId, plan, email }, "Subscription renewed");
 
@@ -933,7 +1008,6 @@ async function handleSubscriptionRenewed(data: any, webhookId: string) {
       logger.error({ error: renewErr, subscriptionId, plan }, "Failed to update user_subscriptions on renew");
     }
 
-    // Reset credits for new cycle (resolve user_id from subscription, then email from users)
     if (plan && credits > 0) {
       const { data: subRow } = await supabase
         .from("user_subscriptions")
@@ -1015,6 +1089,7 @@ async function handleSubscriptionCancelled(data: any, eventType: string) {
       .maybeSingle();
     if (subRow?.user_id) {
       await endPaidAccess(subRow.user_id, subscriptionId);
+      if (isSlotPlan(subRow.plan)) await releaseSlot(subRow.user_id);
     }
     captureServerEvent(subRow?.user_id, "subscription_cancelled", {
       status,
@@ -1042,7 +1117,7 @@ async function handleSubscriptionOnHold(data: any) {
 
     const { data: subRow } = await supabase
       .from("user_subscriptions")
-      .select("user_id")
+      .select("user_id, plan")
       .eq("dodo_subscription_id", subscriptionId)
       .maybeSingle();
     if (subRow?.user_id) {
@@ -1050,6 +1125,7 @@ async function handleSubscriptionOnHold(data: any) {
         .from("user_credits")
         .update({ plan: null, updated_at: new Date().toISOString() })
         .eq("user_id", subRow.user_id);
+      if (isSlotPlan(subRow.plan)) await releaseSlot(subRow.user_id);
     }
   } catch (error: any) {
     logger.error({ error: error?.message }, "Error in handleSubscriptionOnHold");
@@ -1072,10 +1148,11 @@ async function handleSubscriptionFailed(data: any) {
 
     const { data: subRow } = await supabase
       .from("user_subscriptions")
-      .select("user_id")
+      .select("user_id, plan")
       .eq("dodo_subscription_id", subscriptionId)
       .maybeSingle();
     if (subRow?.user_id) {
+      if (isSlotPlan(subRow.plan)) await releaseSlot(subRow.user_id);
       await supabase
         .from("user_credits")
         .update({ plan: null, updated_at: new Date().toISOString() })
@@ -1163,16 +1240,17 @@ async function resetCreditsForNewPaidPeriod(
 ) {
   if (!userId) return;
   const plan = resolvePaidPlan(data, data.product_id);
-  if (!plan) return;
+  const allotment = creditAllotment(plan);
+  if (!plan || allotment == null) return;
   const alreadyOnThisPlan =
     before?.subscription_id === data.subscription_id &&
-    canonicalizePlan(before?.plan) === plan &&
-    before?.credits_total === PLAN_CREDITS[plan];
+    before?.plan === plan &&
+    before?.credits_total === allotment;
   if (alreadyOnThisPlan) return;
   await upsertUserCredits({
     userId,
     plan,
-    creditsTotal: PLAN_CREDITS[plan],
+    creditsTotal: allotment,
     subscriptionId: data.subscription_id,
     resetAt: data.current_period_end || data.next_billing_date || null,
     resetUsed: true,
@@ -1188,7 +1266,8 @@ async function endPaidAccess(userId: string, subscriptionId: string) {
     .maybeSingle();
   if (!credits) return;
   if (credits.subscription_id && credits.subscription_id !== subscriptionId) return;
-  const paid = canonicalizePlan(credits.plan);
+  const slot = isSlotPlan(credits.plan);
+  const paid = isCreditPlan(credits.plan) || slot;
   const update: Record<string, unknown> = { plan: null, updated_at: new Date().toISOString() };
   if (paid) {
     update.credits_total = FREE_CREDITS;
@@ -1198,6 +1277,7 @@ async function endPaidAccess(userId: string, subscriptionId: string) {
   }
   const { error } = await supabase.from("user_credits").update(update).eq("id", credits.id);
   if (error) logger.error({ error, userId, subscriptionId }, "Failed to end paid credits");
+  if (slot) await releaseSlot(userId);
 }
 
 /** refund.succeeded / payment.refunded — mark the existing payment row. Does not delete it. */

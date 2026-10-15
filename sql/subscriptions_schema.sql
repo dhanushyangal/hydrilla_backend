@@ -12,7 +12,7 @@ CREATE TABLE IF NOT EXISTS user_subscriptions (
   user_id               TEXT        REFERENCES users(id),
   email                 TEXT        NOT NULL,
   customer_name         TEXT,
-  plan                  TEXT        NOT NULL CHECK (plan IN ('starter', 'pro', 'creator', 'studio', 'unknown')),
+  plan                  TEXT        NOT NULL CHECK (plan IN ('starter', 'pro', 'slot', 'slot_pro', 'creator', 'studio', 'unknown')),
   status                TEXT        NOT NULL DEFAULT 'pending'
                                     CHECK (status IN ('pending', 'active', 'on_hold', 'past_due', 'paused', 'cancelled', 'expired', 'failed')),
   dodo_subscription_id  TEXT        UNIQUE NOT NULL,

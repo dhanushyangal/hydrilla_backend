@@ -74,6 +74,17 @@ function trackKeyUsage(
   });
 }
 
+async function developerSlotClosed(req: Request, path: string, userId: string, res: Response): Promise<boolean> {
+  const { slotGenerationBlock } = await import("../../services/slotAccess.js");
+  const block = await slotGenerationBlock(userId);
+  if (!block) return false;
+  trackKeyUsage(req, path, 403, 0, { error: block.error });
+  res.status(403).json({
+    error: { message: block.error, type: "slot_closed", code: block.code },
+  });
+  return true;
+}
+
 function parseTimestamp(dateStr?: string | null): number {
   if (!dateStr) {
     return Math.floor(Date.now() / 1000);
@@ -120,6 +131,7 @@ developerV1Router.post(
   upload.single("image"),
   async (req: Request, res: Response) => {
     const userId = req.developerUserId!;
+    if (await developerSlotClosed(req, "/v1/3d/image-to-3d", userId, res)) return;
     const body = (req.body || {}) as Record<string, unknown>;
     const file = req.file;
 
@@ -231,6 +243,7 @@ developerV1Router.post(
   requireDeveloperAuth,
   async (req: Request, res: Response) => {
     const userId = req.developerUserId!;
+    if (await developerSlotClosed(req, "/v1/3d/text-to-3d", userId, res)) return;
     const body = (req.body || {}) as Record<string, unknown>;
 
     const prompt = typeof body.prompt === "string" ? body.prompt.trim() : "";
@@ -575,6 +588,7 @@ developerV1Router.post(
   requireDeveloperAuth,
   async (req: Request, res: Response) => {
     const userId = req.developerUserId!;
+    if (await developerSlotClosed(req, "/v1/images/generate", userId, res)) return;
     const body = (req.body || {}) as Record<string, unknown>;
 
     const promptValidation = validateImagePrompt(body.prompt);
@@ -725,6 +739,7 @@ developerV1Router.post(
   upload.single("image"),
   async (req: Request, res: Response) => {
     const userId = req.developerUserId!;
+    if (await developerSlotClosed(req, "/v1/images/edit", userId, res)) return;
     const body = (req.body || {}) as Record<string, unknown>;
     const file = req.file;
 

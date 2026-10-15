@@ -89,6 +89,9 @@ codeSculptRouter.post("/generate", requireAuth, async (req, res) => {
   try {
     const userId = req.userId!;
     await syncUserToDatabase(userId);
+    const { slotGenerationBlock } = await import("../services/slotAccess.js");
+    const slotBlock = await slotGenerationBlock(userId);
+    if (slotBlock) return res.status(403).json({ error: slotBlock.error, code: slotBlock.code });
 
     // Text → 3D is the primary path. An image is an optional extra reference.
     const imageUrl = String(req.body?.imageUrl || "").trim() || null;
@@ -830,6 +833,9 @@ codeSculptRouter.post("/chat", requireAuth, async (req, res) => {
   try {
     const userId = req.userId!;
     await syncUserToDatabase(userId);
+    const { slotGenerationBlock } = await import("../services/slotAccess.js");
+    const slotBlock = await slotGenerationBlock(userId);
+    if (slotBlock) return res.status(403).json({ error: slotBlock.error, code: slotBlock.code });
     const jobId = String(req.body?.jobId || "").trim();
     const message = String(req.body?.message || "").trim();
     const modelId = String(req.body?.modelId || "").trim();

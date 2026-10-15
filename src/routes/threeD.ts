@@ -779,6 +779,7 @@ threeDRouter.post("/generate", requireAuth, async (req, res) => {
 
       const isHighResolution = body.resolution === "ultra1k" || body.resolution === "high" || body.resolution === 1536 || body.resolution === "1536";
       const creditsToCharge = isHighResolution ? CREDITS_IMAGE_TO_3D_HIGH : CREDITS_IMAGE_TO_3D;
+      if (await rejectIfSlotClosed(res, userId)) return;
 
       const { jobId } = await runDeduplicated3DSubmission(userId, imageUrl, async () => {
         const deductResult = await deductCredit(userId, creditsToCharge, true);
@@ -967,6 +968,14 @@ function saveImageUsage(record: Omit<ImageUsageRecord, "usage">, calls: UsageCal
   });
 }
 
+async function rejectIfSlotClosed(res: any, userId: string): Promise<boolean> {
+  const { slotGenerationBlock } = await import("../services/slotAccess.js");
+  const block = await slotGenerationBlock(userId);
+  if (!block) return false;
+  res.status(403).json({ error: block.error, code: block.code });
+  return true;
+}
+
 /** Charge the tier, call the provider, store the result in S3, record a DONE job. Refunds on failure. */
 async function runProviderImageJob(
   res: any,
@@ -978,6 +987,7 @@ async function runProviderImageJob(
   inputImage: InputImage | null,
   inputImages?: InputImage[] | null
 ) {
+  if (await rejectIfSlotClosed(res, userId)) return;
   const executeGeneration = async () => {
     const credits = IMAGE_CREDITS[op][options.quality];
     const { deductCredit, refundCredit } = await import("../services/credits.js");
@@ -2597,6 +2607,7 @@ threeDRouter.post("/register-job", requireAuth, async (req, res) => {
     const isNew3DJob = initialStatus === "WAIT" && !previewImageUrl;
     const shouldDeduct = Boolean(isNew3DJob && userId);
     const creditsToSet = shouldDeduct ? resolved3DCredits : 0;
+    if (shouldDeduct && userId && (await rejectIfSlotClosed(res, userId))) return;
     if (shouldDeduct && userId) {
       const { deductCredit } = await import("../services/credits.js");
       const deductResult = await deductCredit(userId, resolved3DCredits, true);
