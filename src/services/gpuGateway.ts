@@ -176,3 +176,62 @@ export async function fetchGpuQueueInfo(): Promise<Record<string, unknown> | nul
     return null;
   }
 }
+
+export class GpuOfflineError extends Error {
+  status = 503;
+  constructor(
+    message = "GPU is currently offline or restarting. Please try again in a moment."
+  ) {
+    super(message);
+    this.name = "GpuOfflineError";
+  }
+}
+
+export function isGpuPipelineReady(body: any): boolean {
+  if (!body) {
+    return false;
+  }
+  if (body.features && typeof body.features === "object" && body.features.image_to_3d === false) {
+    return false;
+  }
+  return !!(
+    body.pipeline_loaded === true ||
+    body.model_loaded === true ||
+    body.trellis_loaded === true ||
+    body.trellis2_pipeline_loaded === true
+  );
+}
+
+export async function probeGpuVm(): Promise<{ reachable: boolean; ready: boolean; raw: any }> {
+  try {
+    const res = await fetch(
+      `${config.gpuGateway.url}/health`,
+      withInternalSecretHeaders({ signal: AbortSignal.timeout(5000) })
+    );
+    if (!res.ok) {
+      return { reachable: false, ready: false, raw: null };
+    }
+    const raw = await res.json().catch(() => null);
+    return { reachable: !!raw, ready: isGpuPipelineReady(raw), raw };
+  } catch {
+    return { reachable: false, ready: false, raw: null };
+  }
+}
+
+/**
+ * Fail before image generation / credit spend when image→3D will be needed next.
+ */
+export async function assertGpuReadyFor3d(): Promise<void> {
+  const gpu = await probeGpuVm();
+  if (gpu.ready) {
+    return;
+  }
+  if (gpu.reachable) {
+    throw new GpuOfflineError(
+      "3D GPU is warming up or not ready. Try again in a moment — no image was generated and no 3D credits were charged."
+    );
+  }
+  throw new GpuOfflineError(
+    "3D GPU is currently offline or restarting. Try again in a moment — no image was generated and no 3D credits were charged."
+  );
+}

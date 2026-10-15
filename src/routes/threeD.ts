@@ -37,6 +37,11 @@ import {
 import { recordImageUsage, type ImageUsageRecord } from "../repository/imageUsage.js";
 import { MULTI_VIEW_3D_SYSTEM_PROMPT, buildMultiView3DEditPrompt } from "../services/imageProviders/editPrompts.js";
 import { runDeduplicated3DSubmission } from "../services/inFlight3d.js";
+import {
+  assertGpuReadyFor3d,
+  GpuOfflineError,
+  probeGpuVm,
+} from "../services/gpuGateway.js";
 import { JobStatus, JobRecord, ChatRecord, WorkspaceRecord, GenerateType } from "../types.js";
 
 export const threeDRouter = Router();
@@ -634,6 +639,14 @@ function gatewayErrorToUserMessage(err: unknown): string {
   return msg || "GPU is currently offline or restarting. Please try again in a moment.";
 }
 
+function wantsTextTo3dGpuGate(body: Record<string, unknown>): boolean {
+  if (body.for3d === true || body.require_gpu === true) {
+    return true;
+  }
+  const intent = typeof body.intent === "string" ? body.intent.trim().toLowerCase() : "";
+  return intent === "3d" || intent === "text-to-3d" || intent === "text_to_3d";
+}
+
 // Credits for 3D generation. Standard image-to-3d is 30 credits; high / ultra1k is 40 credits; full text-to-3d / chained edit is 65 credits.
 const CREDITS_IMAGE_TO_3D = 30;
 const CREDITS_IMAGE_TO_3D_HIGH = 40;
@@ -741,6 +754,9 @@ threeDRouter.post("/generate", requireAuth, async (req, res) => {
 
     // Sync user to database on first request
     await syncUserToDatabase(userId);
+
+    // Gate before credit deduct / multipart work — GPU must be ready for image-to-3d
+    await assertGpuReadyFor3d();
 
     const { deductCredit } = await import("../services/credits.js");
 
@@ -878,6 +894,13 @@ threeDRouter.post("/generate", requireAuth, async (req, res) => {
     logger.error(err, "failed to submit job");
     if (err?.status === 402) {
       return res.status(402).json({ error: err.message });
+    }
+    if (err instanceof GpuOfflineError || err?.name === "GpuOfflineError") {
+      return res.status(503).json({
+        error: err.message,
+        creditsRefunded: false,
+        code: "gpu_offline",
+      });
     }
     const userMsg = gatewayErrorToUserMessage(err);
     const statusCode = err?.status && err.status >= 400 && err.status < 500 ? err.status : 503;
@@ -1137,6 +1160,11 @@ threeDRouter.post("/text-to-image", requireAuth, async (req, res) => {
       return;
     }
 
+    // Text→3D clients set for3d/intent so we do not burn image credits when GPU is down
+    if (wantsTextTo3dGpuGate(body)) {
+      await assertGpuReadyFor3d();
+    }
+
     await runProviderImageJob(res, userId, "text-to-image", prompt, options, {
       chatId: typeof body.chatId === "string" ? body.chatId : null,
       workspaceId: typeof body.workspaceId === "string" ? body.workspaceId : null,
@@ -1148,6 +1176,13 @@ threeDRouter.post("/text-to-image", requireAuth, async (req, res) => {
   } catch (err: any) {
     logger.error({ err: err.message }, "text-to-image failed");
     if (!res.headersSent) {
+      if (err instanceof GpuOfflineError || err?.name === "GpuOfflineError") {
+        return res.status(503).json({
+          error: err.message,
+          code: "gpu_offline",
+          creditsRefunded: false,
+        });
+      }
       res.status(500).json({ error: err.message || "Image generation failed" });
     }
   }
@@ -1780,30 +1815,6 @@ type GpuFeatures = {
   image_to_3d: boolean;
   edit_image: boolean;
 };
-
-function isGpuPipelineReady(body: any): boolean {
-  if (!body) return false;
-  if (body.features && typeof body.features === "object" && body.features.image_to_3d === false) {
-    return false;
-  }
-  return !!(
-    body.pipeline_loaded === true ||
-    body.model_loaded === true ||
-    body.trellis_loaded === true ||
-    body.trellis2_pipeline_loaded === true
-  );
-}
-
-async function probeGpuVm(): Promise<{ reachable: boolean; ready: boolean; raw: any }> {
-  try {
-    const res = await fetch(`${GPU_GATEWAY}/health`, withInternalSecretHeaders({ signal: AbortSignal.timeout(5000) }));
-    if (!res.ok) return { reachable: false, ready: false, raw: null };
-    const raw = await res.json().catch(() => null);
-    return { reachable: !!raw, ready: isGpuPipelineReady(raw), raw };
-  } catch {
-    return { reachable: false, ready: false, raw: null };
-  }
-}
 
 threeDRouter.get("/health", async (_req, res) => {
   const [providers, gpu] = await Promise.all([imageProviderAvailability(), probeGpuVm()]);

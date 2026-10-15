@@ -7,6 +7,8 @@ import {
   submitImageTo3dGpu,
   fetchGpuJobStatus,
   cancelGpuJob,
+  assertGpuReadyFor3d,
+  GpuOfflineError,
 } from "../../services/gpuGateway.js";
 import {
   generateImage,
@@ -125,6 +127,28 @@ developerV1Router.post(
 
     const requestedResolution = Number(body.resolution) === 1536 ? 1024 : (Number(body.resolution) || 1024);
     const requestedSeed = typeof body.seed === "number" ? body.seed : 42;
+
+    try {
+      await assertGpuReadyFor3d();
+    } catch (err: unknown) {
+      const message =
+        err instanceof GpuOfflineError
+          ? err.message
+          : err instanceof Error
+            ? err.message
+            : "GPU is currently offline or restarting.";
+      trackKeyUsage(req, "/v1/3d/image-to-3d", 503, 0, {
+        error: "gpu_offline",
+      });
+      res.status(503).json({
+        error: {
+          message,
+          type: "api_error",
+          code: "gpu_offline",
+        },
+      });
+      return;
+    }
 
     const deductResult = await deductCredit(userId, CREDITS_3D, true);
     if (!deductResult.ok) {
@@ -260,6 +284,29 @@ developerV1Router.post(
 
     const imageCredits = IMAGE_CREDITS["text-to-image"][quality];
     const totalCredits = CREDITS_3D + imageCredits;
+
+    // Check 3D GPU before spending image credits on a concept that cannot be meshed
+    try {
+      await assertGpuReadyFor3d();
+    } catch (err: unknown) {
+      const message =
+        err instanceof GpuOfflineError
+          ? err.message
+          : err instanceof Error
+            ? err.message
+            : "GPU is currently offline or restarting.";
+      trackKeyUsage(req, "/v1/3d/text-to-3d", 503, 0, {
+        error: "gpu_offline",
+      });
+      res.status(503).json({
+        error: {
+          message,
+          type: "api_error",
+          code: "gpu_offline",
+        },
+      });
+      return;
+    }
 
     const deductResult = await deductCredit(userId, totalCredits, true);
     if (!deductResult.ok) {
