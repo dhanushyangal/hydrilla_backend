@@ -650,7 +650,7 @@ function wantsTextTo3dGpuGate(body: Record<string, unknown>): boolean {
 // Credits for 3D generation. Standard image-to-3d is 30 credits; high / ultra1k is 40 credits; full text-to-3d / chained edit is 65 credits.
 const CREDITS_IMAGE_TO_3D = 30;
 const CREDITS_IMAGE_TO_3D_HIGH = 40;
-const CREDITS_TEXT_TO_3D = 65;
+// Text→3D is billed as image credits + image→3D credits (see IMAGE_CREDITS + 30/40), not a single flat fee.
 
 // Initialize S3 client (Vercel/serverless has no writable disk — uploads must use S3 with valid AWS creds)
 let s3Client: S3Client | null = null;

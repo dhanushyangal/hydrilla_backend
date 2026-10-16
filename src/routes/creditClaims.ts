@@ -4,7 +4,6 @@ import { supabase } from "../db.js";
 import { logger } from "../logger.js";
 import { config } from "../config.js";
 import { clerk, optionalAuth, requireAuth } from "../middleware/auth.js";
-import { grantCredits } from "../services/credits.js";
 import { sendCreditGrantEmail } from "../services/email.js";
 
 export const adminCreditClaimsRouter = Router();
@@ -283,86 +282,73 @@ publicCreditClaimsRouter.post("/:token", requireAuth, async (req: Request, res: 
       return res.status(401).json({ error: "Authentication required" });
     }
 
-    const { data: link, error } = await supabase
-      .from("credit_claim_links")
-      .select("*")
-      .eq("token", token)
-      .maybeSingle();
-
-    if (error || !link) {
-      return res.status(404).json({ error: "Claim link not found", status: "not_found" });
-    }
-
-    if (link.status === "disabled") {
-      return res.status(400).json({ error: "This claim link has been disabled", status: "disabled" });
-    }
-
-    if (link.expires_at && new Date(link.expires_at).getTime() <= Date.now()) {
-      return res.status(400).json({ error: "This claim link has expired", status: "expired" });
-    }
-
-    if (link.claims_used >= link.max_claims) {
-      return res.status(400).json({ error: "This claim link has reached its maximum claims", status: "exhausted" });
-    }
-
-    const { data: alreadyClaimed } = await supabase
-      .from("credit_ledger")
-      .select("id")
-      .eq("claim_link_id", link.id)
-      .eq("user_id", userId)
-      .maybeSingle();
-
-    if (alreadyClaimed) {
-      return res.status(400).json({ error: "You have already claimed this credit link", status: "exhausted" });
-    }
-
     const userDetails = await getUserDetails(userId);
-    if (link.allowed_email) {
-      const linkEmail = link.allowed_email.trim().toLowerCase();
-      const userEmail = (userDetails.email || "").trim().toLowerCase();
 
-      if (!userEmail || userEmail !== linkEmail) {
+    // Atomic claim: lock link, increment claims_used, grant into credits_bonus, ledger — one RPC.
+    const { data: rpcData, error: rpcError } = await supabase.rpc("claim_credit_link", {
+      p_token: token,
+      p_user_id: userId,
+      p_user_email: userDetails.email || null,
+    });
+
+    if (rpcError) {
+      logger.error({ error: rpcError, token, userId }, "claim_credit_link RPC failed");
+      return res.status(500).json({ error: "Failed to claim credits" });
+    }
+
+    const row = Array.isArray(rpcData) ? rpcData[0] : rpcData;
+    if (!row) {
+      return res.status(500).json({ error: "Failed to claim credits" });
+    }
+
+    if (!row.success) {
+      const code = String(row.error_code || "failed");
+      if (code === "not_found") {
+        return res.status(404).json({ error: "Claim link not found", status: "not_found" });
+      }
+      if (code === "disabled") {
+        return res.status(400).json({ error: "This claim link has been disabled", status: "disabled" });
+      }
+      if (code === "expired") {
+        return res.status(400).json({ error: "This claim link has expired", status: "expired" });
+      }
+      if (code === "exhausted" || code === "already_claimed") {
+        return res.status(400).json({
+          error:
+            code === "already_claimed"
+              ? "You have already claimed this credit link"
+              : "This claim link has reached its maximum claims",
+          status: "exhausted",
+        });
+      }
+      if (code === "email_mismatch") {
         return res.status(403).json({
-          error: `This credit link is restricted to ${link.allowed_email}`,
+          error: "This credit link is restricted to a different email",
           status: "email_mismatch",
         });
       }
+      return res.status(400).json({ error: "Unable to claim this credit link", status: code });
     }
 
-    const grantRes = await grantCredits(userId, link.amount, {
-      reason: link.reason || "Credit claim link",
-      source: "claim_link",
-      claimLinkId: link.id,
-      metadata: { token: link.token },
-    });
-
-    if (!grantRes.ok) {
-      return res.status(500).json({ error: grantRes.error });
-    }
-
-    await supabase
-      .from("credit_claim_links")
-      .update({
-        claims_used: link.claims_used + 1,
-        updated_at: new Date().toISOString(),
-      })
-      .eq("id", link.id);
+    const amount = Number(row.amount) || 0;
+    const remaining = Number(row.remaining) || 0;
 
     if (userDetails.email) {
       await sendCreditGrantEmail(
         userDetails.email,
         userDetails.name,
-        link.amount,
-        link.reason,
-        grantRes.remaining
+        amount,
+        null,
+        remaining
       );
     }
 
     return res.json({
       success: true,
-      amount: link.amount,
-      remaining: grantRes.remaining,
-      total: grantRes.total,
+      amount,
+      remaining,
+      total: Number(row.total) || 0,
+      bonus: Number(row.bonus) || 0,
     });
   } catch (err: any) {
     logger.error({ err, token: req.params.token }, "POST /api/credits/claim/:token failed");

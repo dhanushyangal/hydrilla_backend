@@ -47,6 +47,7 @@ type CreditRow = {
   plan: string | null;
   credits_total: number | null;
   credits_used: number | null;
+  credits_bonus?: number | null;
   reset_at: string | null;
   subscription_id: string | null;
 };
@@ -143,7 +144,7 @@ async function loadBillingTables() {
       .select("user_id, plan, status, product_id, dodo_subscription_id, current_period_end, cancelled_at, metadata, created_at")
       .order("created_at", { ascending: false })
       .limit(500),
-    supabase.from("user_credits").select("user_id, plan, credits_total, credits_used, reset_at, subscription_id").limit(1000),
+    supabase.from("user_credits").select("user_id, plan, credits_total, credits_used, credits_bonus, reset_at, subscription_id").limit(1000),
   ]);
   if (users.error) throw users.error;
   if (payments.error) throw payments.error;
@@ -229,6 +230,7 @@ function summarize(
     periodEnd: latest?.current_period_end || null,
     creditsUsed: credit?.credits_used ?? 0,
     creditsTotal: credit?.credits_total ?? 0,
+    creditsBonus: credit?.credits_bonus ?? 0,
     lastPaymentAt: last?.created_at || null,
     lastPaymentAmount: last?.amount_cents ?? null,
     lastPaymentCurrency: last?.currency || null,
@@ -350,6 +352,7 @@ adminUsersRouter.post("/:userId/credits", async (req, res) => {
         remaining: result.remaining,
         total: result.total,
         used: result.used,
+        bonus: result.bonus,
       });
     }
 
@@ -376,6 +379,7 @@ adminUsersRouter.post("/:userId/credits", async (req, res) => {
       remaining: result.remaining,
       total: result.total,
       used: result.used,
+      bonus: result.bonus,
     });
   } catch (err: any) {
     logger.error({ err, userId: req.params.userId }, "POST /api/admin/users/:userId/credits failed");

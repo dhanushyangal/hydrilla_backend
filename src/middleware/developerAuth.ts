@@ -83,7 +83,9 @@ export async function requireDeveloperAuth(
     await syncUserToDatabase(verified.userId);
     const credits = await ensureCreditsRow(verified.userId);
 
-    const remainingCredits = (credits?.credits_total ?? 0) - (credits?.credits_used ?? 0);
+    const remainingCredits =
+      Math.max(0, (credits?.credits_total ?? 0) - (credits?.credits_used ?? 0)) +
+      Math.max(0, credits?.credits_bonus ?? 0);
     if (remainingCredits <= 0) {
       res.status(402).json({
         error: {

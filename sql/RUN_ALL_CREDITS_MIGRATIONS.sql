@@ -1,6 +1,10 @@
+-- LEGACY bootstrap script (older installs). Live free allotment is 100 credits.
+-- For current bonus bucket + atomic claim + ledger sources, also run:
+--   025_credits_bonus_and_breaches.sql
+--
 -- Run this entire script in Supabase SQL Editor once to:
 -- 1. Add credits_used to jobs
--- 2. Backfill user_credits for every user in "users" who doesn't have a row (200 free credits)
+-- 2. Backfill user_credits for every user in "users" who doesn't have a row (100 free credits)
 -- 3. Create the atomic deduct_user_credits function for high concurrency
 -- Safe to run multiple times (idempotent).
 
@@ -14,7 +18,7 @@ COMMENT ON COLUMN jobs.credits_used IS 'Number of credits consumed for this job 
 
 -- =============================================================================
 -- 2. Backfill user_credits: one row per user in "users" who doesn't have one
---    (200 free credits, 0 used). Uses ON CONFLICT (email) for table with
+--    (100 free credits, 0 used). Uses ON CONFLICT (email) for table with
 --    user_credits_email_unique: no duplicate key errors; backfills user_id if missing.
 -- =============================================================================
 INSERT INTO user_credits (user_id, email, plan, credits_total, credits_used, created_at, updated_at)
@@ -22,7 +26,7 @@ SELECT
   u.id,
   u.email,
   NULL,
-  200,
+  100,
   0,
   NOW(),
   NOW()

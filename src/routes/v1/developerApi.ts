@@ -2,7 +2,7 @@ import { Router, type Request, type Response } from "express";
 import { randomUUID } from "crypto";
 import multer from "multer";
 import { requireDeveloperAuth } from "../../middleware/developerAuth.js";
-import { deductCredit, refundCredit, getCreditsRow } from "../../services/credits.js";
+import { availableCredits, deductCredit, refundCredit, getCreditsRow } from "../../services/credits.js";
 import {
   submitImageTo3dGpu,
   fetchGpuJobStatus,
@@ -997,7 +997,10 @@ developerV1Router.get("/user/me", requireDeveloperAuth, async (req: Request, res
 
   const total = creditsRow?.credits_total ?? 0;
   const used = creditsRow?.credits_used ?? 0;
-  const remaining = Math.max(0, total - used);
+  const bonus = creditsRow?.credits_bonus ?? 0;
+  const remaining = creditsRow
+    ? availableCredits(creditsRow)
+    : 0;
 
   trackKeyUsage(req, "/v1/user/me", 200, 0);
 
@@ -1008,6 +1011,7 @@ developerV1Router.get("/user/me", requireDeveloperAuth, async (req: Request, res
     credits: {
       total,
       used,
+      bonus,
       remaining,
     },
     active_key: {

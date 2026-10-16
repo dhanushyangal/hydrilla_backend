@@ -5,7 +5,13 @@ import { supabase } from "../db.js";
 import { requireAuth, requireAdmin } from "../middleware/auth.js";
 import { getDodoPaymentsClient } from "../lib/dodopayments.js";
 import { captureServerEvent, flushPostHog } from "../lib/posthog.js";
-import { listCreditLedger } from "../services/credits.js";
+import {
+  applyFreePeriodResetIfDue,
+  availableCredits,
+  FREE_TIER_CREDITS,
+  grantCredits,
+  listCreditLedger,
+} from "../services/credits.js";
 import { bookSlot, isSlotPlan, releaseSlot, slotOverview } from "../services/slotAccess.js";
 
 // ============================================================================
@@ -111,7 +117,7 @@ const PLAN_CREDITS: Record<CatalogPlan, number> = {
   slot_pro: 3000,
 };
 
-const FREE_CREDITS = 100;
+const FREE_CREDITS = FREE_TIER_CREDITS;
 
 function nonEmptyString(value: unknown): string | null {
   return typeof value === "string" && value.trim() ? value.trim() : null;
@@ -551,6 +557,7 @@ paymentsRouter.get("/credits", requireAuth, async (req: Request, res: Response) 
             plan: subscriptionPlan,
             credits_total: allotment,
             credits_used: 0,
+            credits_bonus: 0,
             subscription_id: subscription?.dodo_subscription_id || null,
             reset_at: subscription?.current_period_end || null,
           })
@@ -560,6 +567,8 @@ paymentsRouter.get("/credits", requireAuth, async (req: Request, res: Response) 
         else if (insertErr?.code === "23505") credits = (await supabase.from("user_credits").select("*").eq("user_id", userId).maybeSingle()).data;
         else if (insertErr) logger.error({ error: insertErr, userId }, "Failed to create paid credits row");
       } else {
+        const freeResetAt = new Date();
+        freeResetAt.setUTCMonth(freeResetAt.getUTCMonth() + 1);
         logger.info({ userId }, "No credits row – creating free tier (100 credits)");
         const { data: newRow, error: insertErr } = await supabase
           .from("user_credits")
@@ -568,6 +577,8 @@ paymentsRouter.get("/credits", requireAuth, async (req: Request, res: Response) 
             plan: null,
             credits_total: FREE_CREDITS,
             credits_used: 0,
+            credits_bonus: 0,
+            reset_at: freeResetAt.toISOString(),
           })
           .select()
           .single();
@@ -621,24 +632,52 @@ paymentsRouter.get("/credits", requireAuth, async (req: Request, res: Response) 
       }
     }
 
+    // Free monthly hard-reset when period is due (preserves bonus).
+    // applyFreePeriodResetIfDue also skips users with on_hold/paused/failed subs.
+    if (credits && !subscriptionPlan && !credits.plan) {
+      const resetRow = await applyFreePeriodResetIfDue(userId);
+      if (resetRow) {
+        credits = {
+          ...credits,
+          credits_total: resetRow.credits_total,
+          credits_used: resetRow.credits_used,
+          credits_bonus: resetRow.credits_bonus,
+          reset_at: resetRow.reset_at,
+          plan: resetRow.plan,
+        };
+      }
+    }
+
     if (!credits) {
+      const fallbackTotal = creditAllotment(subscriptionPlan) ?? FREE_CREDITS;
       return res.json({
         credits: {
           used: 0,
-          total: creditAllotment(subscriptionPlan) ?? FREE_CREDITS,
+          total: fallbackTotal,
+          periodUsed: 0,
+          periodTotal: fallbackTotal,
+          bonus: 0,
           plan: subscriptionPlan,
-          remaining: creditAllotment(subscriptionPlan) ?? FREE_CREDITS,
+          remaining: fallbackTotal,
         },
       });
     }
 
     const used = Number(credits.credits_used) || 0;
     const total = Number(credits.credits_total) || 0;
+    const bonus = Number(credits.credits_bonus) || 0;
     res.json({
       credits: {
         used,
         total,
-        remaining: Math.max(0, total - used),
+        periodUsed: used,
+        periodTotal: total,
+        bonus,
+        remaining: availableCredits({
+          credits_total: total,
+          credits_used: used,
+          credits_bonus: bonus,
+        }),
         plan: subscriptionPlan,
         resetAt: credits.reset_at,
       },
@@ -921,20 +960,24 @@ paymentsRouter.post("/webhook/dodo", async (req: Request, res: Response) => {
           await handleCreditAdded(eventData, webhookId);
           break;
         default:
+          // Unknown types: ack so Dodo does not retry forever.
           logger.info({ eventType }, "Unhandled webhook event type – ignored");
       }
     } catch (handlerErr: any) {
-      // Log handler errors but ALWAYS return 200 so Dodo does not retry
-      logger.error({ eventType, webhookId, error: handlerErr?.message, stack: handlerErr?.stack }, "Webhook handler error");
+      // Return 500 so Dodo retries failed grant/renew handlers. Handlers are upsert-idempotent.
+      logger.error(
+        { eventType, webhookId, error: handlerErr?.message, stack: handlerErr?.stack },
+        "Webhook handler error – returning 500 for retry"
+      );
+      return res.status(500).json({ received: false, eventType, error: "Handler failed" });
     }
 
-    // --- ACK DODO AFTER PROCESSING ---
     return res.status(200).json({ received: true, eventType });
 
   } catch (error: any) {
-    logger.error({ error: error?.message, stack: error?.stack }, "Webhook processing error");
+    logger.error({ error: error?.message, stack: error?.stack }, "Webhook processing error – returning 500 for retry");
     if (!res.headersSent) {
-      res.status(200).json({ received: true, error: "Processing error" });
+      res.status(500).json({ received: false, error: "Processing error" });
     }
   }
 });
@@ -1037,10 +1080,11 @@ async function handleSubscriptionActive(data: any, webhookId: string) {
     void flushPostHog();
   } catch (error: any) {
     logger.error({ error: error?.message }, "Error in handleSubscriptionActive");
+    throw error;
   }
 }
 
-/** subscription.renewed - Billing cycle renewed, reset credits */
+/** subscription.renewed - Billing cycle renewed, reset period allotment; credits_bonus is preserved. */
 async function handleSubscriptionRenewed(data: any, webhookId: string) {
   try {
     const subscriptionId = data.subscription_id;
@@ -1107,6 +1151,7 @@ async function handleSubscriptionRenewed(data: any, webhookId: string) {
     void flushPostHog();
   } catch (error: any) {
     logger.error({ error: error?.message }, "Error in handleSubscriptionRenewed");
+    throw error;
   }
 }
 
@@ -1317,7 +1362,7 @@ async function resetCreditsForNewPaidPeriod(
   });
 }
 
-/** Paid term ended. Plan label goes back to Free and the monthly allotment returns to 100. */
+/** Paid term ended. Plan label goes back to Free and the monthly allotment returns to 100. Bonus is preserved. */
 async function endPaidAccess(userId: string, subscriptionId: string) {
   const { data: credits } = await supabase
     .from("user_credits")
@@ -1328,12 +1373,14 @@ async function endPaidAccess(userId: string, subscriptionId: string) {
   if (credits.subscription_id && credits.subscription_id !== subscriptionId) return;
   const slot = isSlotPlan(credits.plan);
   const paid = isCreditPlan(credits.plan) || slot;
+  const freeResetAt = new Date();
+  freeResetAt.setUTCMonth(freeResetAt.getUTCMonth() + 1);
   const update: Record<string, unknown> = { plan: null, updated_at: new Date().toISOString() };
   if (paid) {
     update.credits_total = FREE_CREDITS;
     update.credits_used = 0;
     update.subscription_id = null;
-    update.reset_at = null;
+    update.reset_at = freeResetAt.toISOString();
   }
   const { error } = await supabase.from("user_credits").update(update).eq("id", credits.id);
   if (error) logger.error({ error, userId, subscriptionId }, "Failed to end paid credits");
@@ -1507,7 +1554,7 @@ async function handlePaymentFailed(data: any, webhookId: string) {
   }
 }
 
-/** credit.added - Credits granted (from Dodo Credit-Based Billing); ensure user_credits is set */
+/** credit.added - Dodo incremental credits go into credits_bonus so renewals do not wipe them. */
 async function handleCreditAdded(data: any, webhookId: string) {
   try {
     const subscriptionId = data.subscription_id || data.subscription?.id;
@@ -1518,67 +1565,61 @@ async function handleCreditAdded(data: any, webhookId: string) {
       data.email ||
       "";
     const amountIncremental = Number(data.amount ?? data.quantity ?? data.credits_added ?? 0);
-    const balanceAfter = data.balance_after != null ? Number(data.balance_after) : null;
-    const totalBalance = data.total_balance != null ? Number(data.total_balance) : (data.available_balance != null ? Number(data.available_balance) : null);
 
-    logger.info({ subscriptionId, customerId, email, amountIncremental, balanceAfter, totalBalance, dataKeys: Object.keys(data || {}) }, "Credit added");
+    logger.info(
+      { subscriptionId, customerId, email, amountIncremental, webhookId, dataKeys: Object.keys(data || {}) },
+      "Credit added"
+    );
 
     let resolvedEmail = email;
-    let plan: string | null = null;
+    let userId: string | null = null;
 
-    if (!resolvedEmail && subscriptionId) {
+    if (subscriptionId) {
       const { data: sub } = await supabase
         .from("user_subscriptions")
         .select("user_id, plan")
         .eq("dodo_subscription_id", subscriptionId)
         .maybeSingle();
       if (sub?.user_id) {
-        plan = sub.plan;
-        const { data: user } = await supabase.from("users").select("email").eq("id", sub.user_id).maybeSingle();
-        resolvedEmail = user?.email ?? "";
+        userId = sub.user_id;
+        if (!resolvedEmail) {
+          const { data: user } = await supabase.from("users").select("email").eq("id", sub.user_id).maybeSingle();
+          resolvedEmail = user?.email ?? "";
+        }
       }
     }
 
-    if (!resolvedEmail) {
-      logger.warn({ data }, "credit.added: no email and could not resolve from subscription");
+    if (!userId && resolvedEmail) {
+      userId = await findUserIdByEmail(resolvedEmail);
+    }
+
+    if (!userId) {
+      logger.warn({ data }, "credit.added: could not resolve user_id");
       return;
     }
 
-    const userId = await findUserIdByEmail(resolvedEmail);
-
-    let creditsTotal: number;
-    if (totalBalance != null && totalBalance >= 0) {
-      creditsTotal = Math.round(totalBalance);
-    } else if (balanceAfter != null && balanceAfter >= 0) {
-      creditsTotal = Math.round(balanceAfter);
-    } else if (amountIncremental > 0) {
-      const existing = userId
-        ? (await supabase.from("user_credits").select("credits_total, credits_used").eq("user_id", userId).maybeSingle()).data
-        : null;
-      const currentTotal = existing?.credits_total ?? 0;
-      creditsTotal = Math.max(currentTotal, currentTotal + Math.round(amountIncremental));
-    } else {
-      logger.info({ data }, "credit.added: no usable amount/balance, skipping");
+    const amount = Math.round(amountIncremental);
+    if (!(amount > 0)) {
+      logger.info({ data }, "credit.added: no usable incremental amount, skipping");
       return;
     }
 
-    if (creditsTotal < 0) {
-      logger.info({ creditsTotal, data }, "credit.added: negative total, skipping");
-      return;
-    }
-
-    await upsertUserCredits({
-      userId,
-      email: resolvedEmail,
-      plan: canonicalizePlan(plan) || "starter",
-      creditsTotal,
-      subscriptionId: subscriptionId || "",
-      resetAt: data.reset_at || data.period_end || undefined,
+    const grantRes = await grantCredits(userId, amount, {
+      source: "system",
+      reason: "Dodo credit.added",
+      metadata: { webhook_id: webhookId, subscription_id: subscriptionId || null },
     });
+    if (!grantRes.ok) {
+      throw new Error(grantRes.error || "credit.added grant failed");
+    }
 
-    logger.info({ email: resolvedEmail, creditsTotal, subscriptionId }, "✅ credit.added applied to user_credits");
+    logger.info(
+      { email: resolvedEmail, userId, amount, bonus: grantRes.bonus, subscriptionId },
+      "✅ credit.added applied to credits_bonus"
+    );
   } catch (error: any) {
     logger.error({ error: error?.message, stack: error?.stack }, "Error in handleCreditAdded");
+    throw error;
   }
 }
 
@@ -1676,7 +1717,7 @@ async function findUserIdByEmail(email: string): Promise<string | null> {
   return data?.[0]?.id || null;
 }
 
-/** Upsert user_credits by user_id only (no email). */
+/** Upsert period allotment by user_id. Never touches credits_bonus. Clamps used on mid-cycle downgrade. */
 async function upsertUserCredits(params: {
   userId: string | null;
   email?: string;
@@ -1696,34 +1737,65 @@ async function upsertUserCredits(params: {
 
   const { data: existing, error: selectErr } = await supabase
     .from("user_credits")
-    .select("id, credits_used")
+    .select("id, credits_used, credits_bonus, credits_total")
     .eq("user_id", userId)
     .maybeSingle();
 
   if (selectErr) {
     logger.error({ error: selectErr, userId }, "user_credits select failed");
-    return;
+    throw selectErr;
   }
+
+  const nextUsed = (prevUsed: number) => {
+    if (resetUsed) {
+      return 0;
+    }
+    // Mid-cycle downgrade: never leave used > total.
+    return Math.min(prevUsed, creditsTotal);
+  };
 
   if (existing) {
     const updateData: Record<string, unknown> = {
       plan,
       credits_total: creditsTotal,
-      credits_used: resetUsed ? 0 : existing.credits_used,
+      credits_used: nextUsed(Number(existing.credits_used) || 0),
       reset_at: resetAt || null,
       updated_at: new Date().toISOString(),
     };
     if (subId) updateData.subscription_id = subId;
 
     const { error: updateErr } = await supabase.from("user_credits").update(updateData).eq("id", existing.id);
-    if (updateErr) logger.error({ error: updateErr, userId }, "user_credits update failed");
-    else logger.info({ userId, plan, creditsTotal }, "user_credits updated");
+    if (updateErr) {
+      logger.error({ error: updateErr, userId }, "user_credits update failed");
+      throw updateErr;
+    }
+    logger.info(
+      { userId, plan, creditsTotal, bonus: existing.credits_bonus, resetUsed: !!resetUsed },
+      "user_credits updated (bonus preserved)"
+    );
+
+    if (resetUsed) {
+      await supabase.from("credit_ledger").insert({
+        user_id: userId,
+        delta: 0,
+        balance_total_after: creditsTotal,
+        balance_used_after: 0,
+        source: "period_reset",
+        reason: "Paid billing period reset",
+        metadata: {
+          plan,
+          credits_bonus: existing.credits_bonus ?? 0,
+          reset_at: resetAt || null,
+        },
+      });
+    }
   } else {
     const insertPayload: Record<string, unknown> = {
       user_id: userId,
       plan,
       credits_total: creditsTotal,
       credits_used: 0,
+      credits_bonus: 0,
       reset_at: resetAt || null,
     };
     if (subId) insertPayload.subscription_id = subId;
@@ -1731,20 +1803,28 @@ async function upsertUserCredits(params: {
     const { error: insertErr } = await supabase.from("user_credits").insert(insertPayload);
     if (insertErr) {
       if (insertErr.code === "23505") {
-        const { data: raceRow } = await supabase.from("user_credits").select("id, credits_used").eq("user_id", userId).maybeSingle();
+        const { data: raceRow } = await supabase
+          .from("user_credits")
+          .select("id, credits_used, credits_bonus")
+          .eq("user_id", userId)
+          .maybeSingle();
         if (raceRow) {
           const retryData: Record<string, unknown> = {
             plan,
             credits_total: creditsTotal,
-            credits_used: resetUsed ? 0 : raceRow.credits_used,
+            credits_used: nextUsed(Number(raceRow.credits_used) || 0),
             reset_at: resetAt || null,
             updated_at: new Date().toISOString(),
           };
           if (subId) retryData.subscription_id = subId;
-          await supabase.from("user_credits").update(retryData).eq("id", raceRow.id);
+          const { error: retryErr } = await supabase.from("user_credits").update(retryData).eq("id", raceRow.id);
+          if (retryErr) {
+            throw retryErr;
+          }
         }
       } else {
         logger.error({ error: insertErr, userId }, "user_credits insert failed");
+        throw insertErr;
       }
     } else {
       logger.info({ userId, plan, creditsTotal }, "user_credits inserted (new row)");

@@ -45,11 +45,12 @@ CREATE TABLE IF NOT EXISTS user_credits (
   id               UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
   user_id          TEXT        REFERENCES users(id),
   email            TEXT        NOT NULL,
-  plan             TEXT,       -- 'creator' | 'studio' | null (free tier)
-  credits_total    INTEGER     NOT NULL DEFAULT 0,  -- credits granted for this cycle
-  credits_used     INTEGER     NOT NULL DEFAULT 0,  -- credits consumed this cycle
+  plan             TEXT,       -- 'starter' | 'pro' | 'slot' | 'slot_pro' | null (free)
+  credits_total    INTEGER     NOT NULL DEFAULT 0,  -- period allotment (100 / 900 / 3000)
+  credits_used     INTEGER     NOT NULL DEFAULT 0,  -- period consumption this cycle
+  credits_bonus    INTEGER     NOT NULL DEFAULT 0,  -- promo/admin/claim; survives renewals (see 025_*)
   subscription_id  TEXT        REFERENCES user_subscriptions(dodo_subscription_id),
-  reset_at         TIMESTAMPTZ,                     -- when credits next reset (period end)
+  reset_at         TIMESTAMPTZ,                     -- next period renewal (free + paid)
   created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   -- One credits row per user

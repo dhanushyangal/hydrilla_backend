@@ -7,7 +7,7 @@ This document describes how **Dodo Payments** is integrated for subscriptions, t
 ## Overview
 
 - **Provider:** [Dodo Payments](https://dodopayments.com) (hosted checkout, subscriptions, webhooks).
-- **Plans:** **Creator** (1,000 credits/month) and **Studio** (4,000 credits/month).
+- **Plans:** **Free** (100 credits/month), **Starter** / **Slot** (900), **Pro** / **Slot Pro** (3,000). Bonus/promo credits live in `credits_bonus` and survive renewals.
 - **Backend:** Node.js/Express in `src/routes/payments.ts`; config in `src/config.ts`; client in `src/lib/dodopayments.ts`.
 - **Frontend:** Next.js app; checkout at `/checkout`, success at `/checkout/success`; credits/subscription shown in workspace and app sidebar.
 
@@ -66,14 +66,14 @@ The Dodo client (`src/lib/dodopayments.ts`) is created with:
 1. **Deduplication:** Check `webhook_events` by `webhook_id`; if already processed, return `200` and skip.
 2. **Verification:** Verify signature with `dodo.webhooks.unwrap(payload, { headers })` using `DODO_PAYMENT_WEBHOOK_SECRET`. (Can be skipped in dev with `SKIP_WEBHOOK_VERIFICATION=true`.)
 3. **Store event:** Insert into `webhook_events` (webhook_id, event_type, payload).
-4. **Handle event** (synchronously), then return `200` so Dodo does not retry:
-   - `subscription.active` → create/update `user_subscriptions`, grant credits in `user_credits`.
-   - `subscription.renewed` → reset credits for the new period.
-   - `subscription.cancelled` / `subscription.expired` → mark subscription inactive; optionally zero or keep credits until period end.
-   - `subscription.on_hold` / `subscription.failed` → update status.
+4. **Handle event** (synchronously):
+   - `subscription.active` / `plan_changed` → create/update `user_subscriptions`, set period allotment in `user_credits` (bonus untouched).
+   - `subscription.renewed` → reset period allotment + `credits_used = 0`; **preserve `credits_bonus`**.
+   - `subscription.cancelled` / `subscription.expired` → mark inactive; revert period to free 100 (bonus preserved).
+   - `subscription.on_hold` / `paused` / `failed` → update status; generation spend is blocked while held.
    - `payment.succeeded` / `payment.failed` → record and optionally update state.
-   - `credit.added` → apply one-off credit changes if used.
-5. **Response:** Always `200` with `{ received: true, eventType }` so Dodo does not retry even if an internal handler fails (errors are only logged).
+   - `credit.added` → grant into `credits_bonus` (survives renewals).
+5. **Response:** `200` on success / unknown events. **`500` if a handler throws** so Dodo retries (handlers are upsert-idempotent).
 
 ### 5. Sync (When Webhook Has Not Yet Fired)
 
