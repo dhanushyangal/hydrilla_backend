@@ -1,5 +1,11 @@
 import { supabase } from "../db.js";
+import { logger } from "../logger.js";
 import type { UsageSummary } from "../services/imageProviders/index.js";
+
+function isMissingColumnError(message: string | undefined): boolean {
+  const msg = message || "";
+  return /schema cache|column .* does not exist|could not find the .* column/i.test(msg);
+}
 
 export type ImageUsageRecord = {
   userId: string;
@@ -180,34 +186,40 @@ export async function getUnifiedUsageReport(params: {
   const shouldFetchImages = type === "all" || type === "image";
   const imageRowsPromise = shouldFetchImages
     ? (async () => {
-        const fetchImagesWithSource = async () => {
-          let q: any = supabase
-            .from("image_generation_usage")
-            .select("id,user_id,job_id,operation,provider,model,quality,status,error_code,input_tokens,output_tokens,total_tokens,cost_usd,credits_charged,source,created_at");
-          if (since) q = q.gte("created_at", since);
-          if (userId) q = q.eq("user_id", userId);
-          if (source !== "all") q = q.eq("source", source);
-          return await q.order("created_at", { ascending: false });
+        const run = async (select: string, applySourceFilter: boolean) => {
+          let q: any = supabase.from("image_generation_usage").select(select);
+          if (since) {
+            q = q.gte("created_at", since);
+          }
+          if (userId) {
+            q = q.eq("user_id", userId);
+          }
+          if (applySourceFilter && source !== "all") {
+            q = q.eq("source", source);
+          }
+          return await q.order("created_at", { ascending: false }).limit(5000);
         };
 
-        const fetchImagesLegacy = async () => {
-          let q: any = supabase
-            .from("image_generation_usage")
-            .select("id,user_id,job_id,operation,provider,model,quality,status,error_code,input_tokens,output_tokens,total_tokens,cost_usd,credits_charged,created_at");
-          if (since) q = q.gte("created_at", since);
-          if (userId) q = q.eq("user_id", userId);
-          return await q.order("created_at", { ascending: false });
-        };
+        const withSource =
+          "id,user_id,job_id,operation,provider,model,quality,status,error_code,input_tokens,output_tokens,total_tokens,cost_usd,credits_charged,source,created_at";
+        const withoutSource =
+          "id,user_id,job_id,operation,provider,model,quality,status,error_code,input_tokens,output_tokens,total_tokens,cost_usd,credits_charged,created_at";
 
-        const res = await fetchImagesWithSource();
-        if (res.error && /source.*schema cache|column.*source/i.test(res.error.message || "")) {
-          const fallback = await fetchImagesLegacy();
-          return ((fallback.data || []) as Record<string, any>[]);
+        const res = await run(withSource, true);
+        if (!res.error) {
+          return (res.data || []) as Record<string, any>[];
         }
-        if (res.error) {
-          return [];
+        if (isMissingColumnError(res.error.message)) {
+          logger.warn({ err: res.error.message }, "image usage select missing column; retrying without source");
+          const fallback = await run(withoutSource, false);
+          if (fallback.error) {
+            logger.error({ err: fallback.error.message }, "image usage legacy select failed");
+            throw new Error(fallback.error.message || "Failed to load image usage");
+          }
+          return (fallback.data || []) as Record<string, any>[];
         }
-        return ((res.data || []) as Record<string, any>[]);
+        logger.error({ err: res.error.message }, "image usage select failed");
+        throw new Error(res.error.message || "Failed to load image usage");
       })()
     : Promise.resolve([]);
 
@@ -215,36 +227,54 @@ export async function getUnifiedUsageReport(params: {
   const shouldFetch3D = type === "all" || type === "3d";
   const threeDRowsPromise = shouldFetch3D
     ? (async () => {
-        const fetch3DWithSource = async () => {
+        const run = async (select: string, applySourceFilter: boolean) => {
           let q: any = supabase
             .from("jobs")
-            .select("id,user_id,status,generate_type,credits_used,llm_model,llm_provider,duration_ms,error_code,error_message,source,created_at")
+            .select(select)
             .in("generate_type", THREE_D_TYPES);
-          if (since) q = q.gte("created_at", since);
-          if (userId) q = q.eq("user_id", userId);
-          if (source !== "all") q = q.eq("source", source);
-          return await q.order("created_at", { ascending: false });
+          if (since) {
+            q = q.gte("created_at", since);
+          }
+          if (userId) {
+            q = q.eq("user_id", userId);
+          }
+          if (applySourceFilter && source !== "all") {
+            q = q.eq("source", source);
+          }
+          return await q.order("created_at", { ascending: false }).limit(5000);
         };
 
-        const fetch3DLegacy = async () => {
-          let q: any = supabase
-            .from("jobs")
-            .select("id,user_id,status,generate_type,credits_used,llm_model,llm_provider,duration_ms,error_code,error_message,created_at")
-            .in("generate_type", THREE_D_TYPES);
-          if (since) q = q.gte("created_at", since);
-          if (userId) q = q.eq("user_id", userId);
-          return await q.order("created_at", { ascending: false });
-        };
+        const withExtras =
+          "id,user_id,status,generate_type,credits_used,llm_model,llm_provider,duration_ms,error_code,error_message,source,created_at";
+        const withoutSource =
+          "id,user_id,status,generate_type,credits_used,llm_model,llm_provider,duration_ms,error_code,error_message,created_at";
+        const minimal =
+          "id,user_id,status,generate_type,credits_used,error_code,error_message,created_at";
 
-        const res = await fetch3DWithSource();
-        if (res.error && /source.*schema cache|column.*source/i.test(res.error.message || "")) {
-          const fallback = await fetch3DLegacy();
-          return ((fallback.data || []) as Record<string, any>[]);
+        const res = await run(withExtras, true);
+        if (!res.error) {
+          return (res.data || []) as Record<string, any>[];
         }
-        if (res.error) {
-          return [];
+        if (isMissingColumnError(res.error.message)) {
+          logger.warn({ err: res.error.message }, "3D usage select missing column; retrying without source");
+          const fallback = await run(withoutSource, false);
+          if (!fallback.error) {
+            return (fallback.data || []) as Record<string, any>[];
+          }
+          if (isMissingColumnError(fallback.error.message)) {
+            logger.warn({ err: fallback.error.message }, "3D usage select missing column; retrying minimal");
+            const minimalRes = await run(minimal, false);
+            if (minimalRes.error) {
+              logger.error({ err: minimalRes.error.message }, "3D usage minimal select failed");
+              throw new Error(minimalRes.error.message || "Failed to load 3D usage");
+            }
+            return (minimalRes.data || []) as Record<string, any>[];
+          }
+          logger.error({ err: fallback.error.message }, "3D usage legacy select failed");
+          throw new Error(fallback.error.message || "Failed to load 3D usage");
         }
-        return ((res.data || []) as Record<string, any>[]);
+        logger.error({ err: res.error.message }, "3D usage select failed");
+        throw new Error(res.error.message || "Failed to load 3D usage");
       })()
     : Promise.resolve([]);
 
