@@ -241,8 +241,10 @@ const uploadFlexible = (req: any, res: any, next: any) => {
   });
 };
 
-/** GPU VM gateway (no trailing slash) — BlueFox3D image-to-3d on api.hydrilla.co */
-const GPU_GATEWAY = config.gpuGateway.url;
+/** GPU VM gateway (no trailing slash) — dynamic, updated by Admin Panel */
+function getGpuGatewayUrl(): string {
+  return config.gpuGateway.url || "";
+}
 
 /** Image jobs are produced by OpenAI/Gemini in-request; they never exist on the VM. */
 const PROVIDER_IMAGE_TYPES: GenerateType[] = ["TextToImage", "EditImage"];
@@ -253,9 +255,16 @@ const LEGACY_S3_BUCKETS = (process.env.LEGACY_S3_BUCKETS || "hydrilla-outputs")
   .filter(Boolean);
 
 /** Resolve a relative gateway image URL (e.g. /outputs/...) to a full URL. */
-function resolveGatewayImageUrl(url: string | undefined | null, baseUrl: string = GPU_GATEWAY): string | null {
-  if (!url || typeof url !== "string") return null;
-  if (url.startsWith("http://") || url.startsWith("https://")) return url;
+function resolveGatewayImageUrl(url: string | undefined | null, baseUrl: string = getGpuGatewayUrl()): string | null {
+  if (!url || typeof url !== "string") {
+    return null;
+  }
+  if (url.startsWith("http://") || url.startsWith("https://")) {
+    return url;
+  }
+  if (!baseUrl) {
+    return url;
+  }
   const base = baseUrl.replace(/\/$/, "");
   return url.startsWith("/") ? `${base}${url}` : `${base}/${url}`;
 }
@@ -265,13 +274,17 @@ async function fetchGateway(
   path: string,
   init: RequestInit = {}
 ): Promise<{ response: Response; baseUrl: string }> {
+  const currentGateway = getGpuGatewayUrl();
+  if (!currentGateway) {
+    throw new Error("GPU gateway is not configured. Please set the active GPU gateway in the Admin Panel.");
+  }
   const pathStr = path.startsWith("/") ? path : `/${path}`;
   const signal = init.signal || AbortSignal.timeout(10000);
-  const response = await fetch(`${GPU_GATEWAY}${pathStr}`, {
+  const response = await fetch(`${currentGateway}${pathStr}`, {
     ...withInternalSecretHeaders(init),
     signal,
   });
-  return { response, baseUrl: GPU_GATEWAY };
+  return { response, baseUrl: currentGateway };
 }
 
 /** Fetch /queue/info from the GPU gateway. */
@@ -477,16 +490,19 @@ function gatewayOutputUrlCandidates(imageUrl: string): string[] {
   if (!trimmed) return urls;
 
   if (isGatewayOutputImageUrl(trimmed)) {
-    urls.push(trimmed.startsWith("http") ? trimmed : resolveGatewayImageUrl(trimmed, GPU_GATEWAY) || trimmed);
+    urls.push(trimmed.startsWith("http") ? trimmed : resolveGatewayImageUrl(trimmed, getGpuGatewayUrl()) || trimmed);
   }
 
   const key = extractOwnedS3KeyFromUrl(trimmed);
   if (key) {
-    const gatewayBase = GPU_GATEWAY.replace(/\/$/, "");
-    for (const candidateKey of imageKeyCandidates(key)) {
-      const match = candidateKey.match(/^(preview|image|edit)\/([^/]+)\/(.+)$/);
-      if (match) {
-        urls.push(`${gatewayBase}/outputs/${match[1]}/${match[2]}/${match[3]}`);
+    const currentGateway = getGpuGatewayUrl();
+    if (currentGateway) {
+      const gatewayBase = currentGateway.replace(/\/$/, "");
+      for (const candidateKey of imageKeyCandidates(key)) {
+        const match = candidateKey.match(/^(preview|image|edit)\/([^/]+)\/(.+)$/);
+        if (match) {
+          urls.push(`${gatewayBase}/outputs/${match[1]}/${match[2]}/${match[3]}`);
+        }
       }
     }
   }
@@ -551,7 +567,7 @@ async function loadImageBytesFor3dSubmission(
     }
   }
 
-  const resolved = resolveGatewayImageUrl(imageUrl, GPU_GATEWAY) || imageUrl;
+  const resolved = resolveGatewayImageUrl(imageUrl, getGpuGatewayUrl()) || imageUrl;
   if (resolved.startsWith("http") && !extractOwnedS3KeyFromUrl(resolved)) {
     try {
       const res = await fetch(resolved);
@@ -1780,7 +1796,15 @@ threeDRouter.get("/queue/info", async (_req, res) => {
     const timeoutId = setTimeout(() => controller.abort(), 1500);
 
     const init = { signal: controller.signal };
-    const queueInfo = await fetchQueueInfoFromGateway(GPU_GATEWAY, init);
+    const currentGateway = getGpuGatewayUrl();
+    if (!currentGateway) {
+      clearTimeout(timeoutId);
+      if (!res.headersSent) {
+        return res.status(200).json({ ...QUEUE_INFO_FALLBACK, api_available: false });
+      }
+      return;
+    }
+    const queueInfo = await fetchQueueInfoFromGateway(currentGateway, init);
     clearTimeout(timeoutId);
 
     if (queueInfo && Object.keys(queueInfo).length > 0) {

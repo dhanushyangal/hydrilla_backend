@@ -2,22 +2,11 @@ import dotenv from "dotenv";
 import crypto from "crypto";
 
 // Load .env then .env.local (local overrides — matches Next.js convention)
-dotenv.config();
+dotenv.config({ override: true });
 dotenv.config({ path: ".env.local", override: true });
-
-/** Single production GPU runtime (hydrilla_runtime on :8000) */
-const GATEWAY_URL = "https://api.hydrilla.co";
 
 function stripTrailingSlash(url: string): string {
   return url.replace(/\/$/, "");
-}
-
-function gatewayUrl(...envKeys: string[]): string {
-  for (const key of envKeys) {
-    const v = process.env[key]?.trim();
-    if (v) return stripTrailingSlash(v);
-  }
-  return GATEWAY_URL;
 }
 
 function requireEnv(name: string): string {
@@ -52,15 +41,15 @@ export const config = {
     publishableKey: process.env.NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY || "",
     secretKey: process.env.CLERK_SECRET_KEY || "",
   },
-  /** GPU VM (hydrilla_runtime, BlueFox3D image-to-3d). Images come from OpenAI/Gemini, not the VM. */
+  /** GPU VM (hydrilla_runtime, BlueFox3D image-to-3d). Loaded dynamically from DB / Admin Panel. */
   gpuGateway: {
-    url: gatewayUrl("HYDRILLA_GPU_API_URL", "TRELLIS_GATEWAY_URL", "TRELLIS_API_URL", "HUNYUAN_API_URL"),
+    url: "",
   },
-  /** GCP Compute instance behind the GPU gateway (admin status / start / stop). Key is optional. */
+  /** GCP Compute instance behind the GPU gateway (admin status / start / stop). Loaded dynamically from DB. */
   gcpGpuInstance: {
     projectId: process.env.GCP_PROJECT_ID?.trim() || "hydrilla-486606",
     zone: process.env.GCP_GPU_ZONE?.trim() || "asia-south1-c",
-    instance: process.env.GCP_GPU_INSTANCE?.trim() || "hydrilla",
+    instance: "",
     /** Service account JSON (raw or base64) with compute.instances.get/start/stop. */
     serviceAccountKey: process.env.GCP_SERVICE_ACCOUNT_KEY?.trim() || "",
   },

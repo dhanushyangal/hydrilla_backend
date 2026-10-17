@@ -13,6 +13,7 @@ import { developerV1Router } from "../src/routes/v1/developerApi.js";
 import { publicCreditClaimsRouter } from "../src/routes/creditClaims.js";
 import { logger } from "../src/logger.js";
 import { initDb } from "../src/db.js";
+import { syncAppSettingsFromDb } from "../src/services/appSettings.js";
 import { config as appConfig } from "../src/config.js";
 import pinoHttp from "pino-http";
 
@@ -26,11 +27,12 @@ export const config = {
 };
 
 // Initialize database connection
-let dbInitialized = false;
+const dbState = { initialized: false };
 async function ensureDb() {
-  if (!dbInitialized) {
+  if (!dbState.initialized) {
     await initDb();
-    dbInitialized = true;
+    await syncAppSettingsFromDb();
+    dbState.initialized = true;
   }
 }
 
@@ -73,7 +75,7 @@ app.get("/", (_req, res) => {
 
 // Initialize database middleware
 async function initDbMiddleware(req: express.Request, res: express.Response, next: express.NextFunction) {
-  if (!dbInitialized) {
+  if (!dbState.initialized) {
     try {
       await ensureDb();
     } catch (dbErr: any) {

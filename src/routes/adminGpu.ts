@@ -4,10 +4,14 @@ import { supabase } from "../db.js";
 import { logger } from "../logger.js";
 import {
   getGpuInstanceInfo,
+  getStaticIpInfo,
   isGcpComputeConfigured,
+  listGpuInstances,
   runGpuInstanceAction,
+  shiftStaticIp,
   type GcpInstanceAction,
 } from "../services/gcpCompute.js";
+import { setAppSetting, syncAppSettingsFromDb } from "../services/appSettings.js";
 import { withInternalSecretHeaders } from "./threeD.js";
 
 /** Mounted under /api/admin (already requireAuth + requireAdmin). */
@@ -24,10 +28,17 @@ async function fetchVmSystem(): Promise<{
   data: unknown;
   error: string | null;
 }> {
+  if (!config.gpuGateway.url) {
+    return {
+      reachable: false,
+      data: null,
+      error: "No GPU gateway configured. Select an instance below or enter a gateway URL.",
+    };
+  }
   try {
     const res = await fetch(
       `${config.gpuGateway.url}/admin/system`,
-      withInternalSecretHeaders({ signal: AbortSignal.timeout(8000) }),
+      withInternalSecretHeaders({ signal: AbortSignal.timeout(4000) }),
     );
     if (!res.ok) {
       return {
@@ -38,33 +49,51 @@ async function fetchVmSystem(): Promise<{
     }
     return { reachable: true, data: await res.json(), error: null };
   } catch (err) {
-    return { reachable: false, data: null, error: errorMessage(err) };
+    const msg = errorMessage(err);
+    const friendlyMsg = /abort|timeout|failed to fetch/i.test(msg)
+      ? "GPU service unreachable (offline or booting up)"
+      : msg;
+    return { reachable: false, data: null, error: friendlyMsg };
   }
 }
 
 async function fetchInstance(): Promise<{
   configured: boolean;
   data: unknown;
+  instances: unknown[];
+  staticIp: unknown;
   error: string | null;
 }> {
   if (!isGcpComputeConfigured()) {
-    return { configured: false, data: null, error: null };
+    return { configured: false, data: null, instances: [], staticIp: null, error: null };
   }
   try {
-    return { configured: true, data: await getGpuInstanceInfo(), error: null };
+    const [instance, instances, staticIp] = await Promise.all([
+      getGpuInstanceInfo(),
+      listGpuInstances().catch(() => []),
+      getStaticIpInfo().catch(() => null),
+    ]);
+    return { configured: true, data: instance, instances, staticIp, error: null };
   } catch (err) {
-    return { configured: true, data: null, error: errorMessage(err) };
+    return { configured: true, data: null, instances: [], staticIp: null, error: errorMessage(err) };
   }
 }
 
 adminGpuRouter.get("/", async (_req, res) => {
-  const [vm, instance] = await Promise.all([fetchVmSystem(), fetchInstance()]);
+  await syncAppSettingsFromDb();
+  const [vm, instanceResult] = await Promise.all([fetchVmSystem(), fetchInstance()]);
   res.json({
     gateway: config.gpuGateway.url,
     instanceName: config.gcpGpuInstance.instance,
     zone: config.gcpGpuInstance.zone,
     vm,
-    instance,
+    instance: {
+      configured: instanceResult.configured,
+      data: instanceResult.data,
+      error: instanceResult.error,
+    },
+    instances: instanceResult.instances,
+    staticIp: instanceResult.staticIp,
     checkedAt: new Date().toISOString(),
   });
 });
@@ -314,18 +343,81 @@ adminGpuRouter.post("/instance/:action", async (req, res) => {
     return res
       .status(400)
       .json({
-        error: "GCP_SERVICE_ACCOUNT_KEY is not configured on the backend",
+        error: "GCP Compute is not configured on the backend",
       });
   }
+  const target = typeof req.body?.instance === "string" ? req.body.instance.trim() : undefined;
+  const instanceToActOn = target || config.gcpGpuInstance.instance;
+  if (!instanceToActOn) {
+    return res.status(400).json({ error: "No target instance specified. Please select a VM in the Admin Panel." });
+  }
   try {
-    const operation = await runGpuInstanceAction(action);
-    logger.info({ action, operation }, "Admin GPU instance action");
+    const operation = await runGpuInstanceAction(action, instanceToActOn);
+    logger.info({ action, target: instanceToActOn, operation }, "Admin GPU instance action");
     return res.json({ ok: true, action, operation });
   } catch (err) {
     logger.error(
-      { err: errorMessage(err), action },
+      { err: errorMessage(err), action, target: instanceToActOn },
       "Admin GPU instance action failed",
     );
     return res.status(502).json({ error: errorMessage(err) });
   }
 });
+
+adminGpuRouter.post("/gateway", async (req, res) => {
+  const rawUrl = typeof req.body?.url === "string" ? req.body.url.trim() : "";
+  if (!rawUrl) {
+    return res.status(400).json({ error: "url is required" });
+  }
+
+  const normalized = (() => {
+    const withProto = rawUrl.startsWith("http://") || rawUrl.startsWith("https://") ? rawUrl : `http://${rawUrl}`;
+    const parsed = new URL(withProto);
+    if (!parsed.port && !parsed.hostname.includes("hydrilla.co") && !parsed.hostname.includes("hydrilla.ai")) {
+      parsed.port = "8000";
+    }
+    return parsed.origin;
+  })();
+
+  config.gpuGateway.url = normalized;
+  process.env.HYDRILLA_GPU_API_URL = normalized;
+  process.env.HUNYUAN_API_URL = normalized;
+  await setAppSetting("gpu_gateway_url", normalized);
+
+  logger.info({ gateway: normalized }, "Admin updated GPU gateway URL");
+  return res.json({ ok: true, gateway: normalized });
+});
+
+adminGpuRouter.post("/target-instance", async (req, res) => {
+  const target = typeof req.body?.instance === "string" ? req.body.instance.trim() : "";
+  if (!target) {
+    return res.status(400).json({ error: "instance name is required" });
+  }
+
+  config.gcpGpuInstance.instance = target;
+  process.env.GCP_GPU_INSTANCE = target;
+  await setAppSetting("gpu_target_instance", target);
+
+  logger.info({ instance: target }, "Admin switched GPU target instance");
+  return res.json({ ok: true, instance: target });
+});
+
+adminGpuRouter.post("/shift-static-ip", async (req, res) => {
+  const targetInstance = typeof req.body?.targetInstance === "string" ? req.body.targetInstance.trim() : "";
+  if (!targetInstance) {
+    return res.status(400).json({ error: "targetInstance is required" });
+  }
+  if (!isGcpComputeConfigured()) {
+    return res.status(400).json({ error: "GCP Compute is not configured" });
+  }
+
+  try {
+    const result = await shiftStaticIp(targetInstance);
+    logger.info({ targetInstance, result }, "Admin shifted permanent static IP");
+    return res.json({ ok: true, ...result });
+  } catch (err) {
+    logger.error({ err: errorMessage(err), targetInstance }, "Failed to shift permanent static IP");
+    return res.status(502).json({ error: errorMessage(err) });
+  }
+});
+

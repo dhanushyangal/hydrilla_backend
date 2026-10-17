@@ -17,11 +17,13 @@ import { publicCreditClaimsRouter } from "./routes/creditClaims.js";
 import { logger } from "./logger.js";
 import { config } from "./config.js";
 import { initDb } from "./db.js";
+import { syncAppSettingsFromDb } from "./services/appSettings.js";
 import pinoHttp from "pino-http";
 import { syncAllJobs } from "./services/jobSync.js";
 
 async function main() {
   await initDb();
+  await syncAppSettingsFromDb();
   const app = express();
   app.use(
     cors({

@@ -60,6 +60,9 @@ export async function submitImageTo3dGpu(params: {
   seed?: number;
   userId: string;
 }): Promise<{ jobId: string; jobsAhead?: number }> {
+  if (!config.gpuGateway.url) {
+    throw new GpuOfflineError("No GPU gateway configured. An administrator must set the active GPU in the Admin Panel.");
+  }
   const resolution = params.resolution ?? 1024;
   const seed = params.seed ?? 42;
 
@@ -125,6 +128,9 @@ export async function submitImageTo3dGpu(params: {
 export async function fetchGpuJobStatus(
   jobId: string
 ): Promise<Record<string, unknown> | null> {
+  if (!config.gpuGateway.url) {
+    return null;
+  }
   try {
     const res = await fetch(
       `${config.gpuGateway.url}/status/${jobId}`,
@@ -145,6 +151,9 @@ export async function fetchGpuJobStatus(
 }
 
 export async function cancelGpuJob(jobId: string): Promise<boolean> {
+  if (!config.gpuGateway.url) {
+    return false;
+  }
   try {
     const res = await fetch(
       `${config.gpuGateway.url}/cancel/${jobId}`,
@@ -161,6 +170,9 @@ export async function cancelGpuJob(jobId: string): Promise<boolean> {
 }
 
 export async function fetchGpuQueueInfo(): Promise<Record<string, unknown> | null> {
+  if (!config.gpuGateway.url) {
+    return null;
+  }
   try {
     const res = await fetch(
       `${config.gpuGateway.url}/queue/info`,
@@ -203,6 +215,9 @@ export function isGpuPipelineReady(body: any): boolean {
 }
 
 export async function probeGpuVm(): Promise<{ reachable: boolean; ready: boolean; raw: any }> {
+  if (!config.gpuGateway.url) {
+    return { reachable: false, ready: false, raw: null };
+  }
   try {
     const res = await fetch(
       `${config.gpuGateway.url}/health`,
